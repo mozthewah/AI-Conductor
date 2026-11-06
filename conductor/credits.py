@@ -24,6 +24,8 @@ log = logging.getLogger("conductor.credits")
 KEY_URL = "https://openrouter.ai/api/v1/key"
 CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 TOP_UP_URL = "https://openrouter.ai/settings/credits"
+IDLE_MAX_AGE = 15 * 60       # seconds a cached balance is good for while nothing is running
+PAUSED_MAX_POLL = 15 * 60    # longest wait between balance checks while work is paused
 
 
 class CreditError(Exception):
@@ -150,10 +152,12 @@ class CreditMonitor:
         return {"available": available, "source": source, "checked": time.time(), "error": err,
                 "spent_today": spent_today}
 
-    async def check(self, force: bool = False) -> dict:
+    async def check(self, force: bool = False, max_age: float | None = None) -> dict:
+        """Balance, re-read from OpenRouter only when the cached value is older than max_age
+        (default: check_every). Callers pass a long max_age when nothing is running."""
         if not self.fetch or not self.key:
             return self.status()
-        if force or time.time() - self.state["checked"] > self.check_every:
+        if force or time.time() - self.state["checked"] > (self.check_every if max_age is None else max_age):
             fresh = await asyncio.to_thread(self._check_sync)
             out = self.state.get("out", False)
             if fresh["available"] is not None:
@@ -203,6 +207,9 @@ class CreditMonitor:
                 return "user"
             except asyncio.TimeoutError:
                 pass
+            # Credits rarely come back on their own minutes later; check less and less often
+            # (up to every 15 minutes) so a task paused overnight doesn't poll all night.
+            poll = min(poll * 1.6, PAUSED_MAX_POLL)
             st = await self.check(force=True)
             if st["available"] is None:
                 return "probe"  # can't see the balance: retrying the step is free (rejected before any model runs)

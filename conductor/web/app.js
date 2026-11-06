@@ -172,15 +172,38 @@ function navigate(path) {
 window.addEventListener("popstate", route);
 document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-nav]");
-  if (a) { e.preventDefault(); navigate(a.dataset.nav); $("#sidebar").classList.remove("open"); }
+  if (a) { e.preventDefault(); navigate(a.dataset.nav); $("#sidebar").classList.remove("open"); syncScrim(); }
 });
-$("#menuBtn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
+$("#menuBtn").addEventListener("click", () => { $("#sidebar").classList.toggle("open"); syncScrim(); });
+
+// On a phone the menu and the computer panel slide over the page; a dimmed backdrop (tap to close),
+// an x in each, and Escape all close them.
+$("#sidebarClose").addEventListener("click", () => closeOverlays());
+const scrim = h("div", { class: "scrim", hidden: true, onclick: () => closeOverlays() });
+document.body.append(scrim);
+function overlayOpen() {
+  const menu = window.innerWidth <= 760 && $("#sidebar").classList.contains("open");
+  const panel = window.innerWidth < 1100 && state.computer && document.body.contains(state.computer)
+    && !state.computer.classList.contains("hidden");
+  return menu || panel;
+}
+function syncScrim() { scrim.hidden = !overlayOpen(); }
+function closeOverlays() {
+  $("#sidebar").classList.remove("open");
+  if (state.computer && window.innerWidth < 1100) state.computer.classList.add("hidden");
+  syncScrim();
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && overlayOpen()) closeOverlays(); });
+window.addEventListener("resize", syncScrim);
 
 function route() {
   const viewing = location.pathname.match(/^\/t\/([\w-]+)/);
   audit("view", location.pathname, { task: viewing ? viewing[1] : undefined });
   if (state.es) { state.es.close(); state.es = null; }
   state.taskId = null;
+  state.computer = null;
+  $("#sidebar").classList.remove("open");
+  syncScrim();
   const p = location.pathname;
   document.querySelectorAll(".side-nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === p));
   const m = p.match(/^\/t\/([\w-]+)/);
@@ -207,12 +230,12 @@ async function refreshTasks() {
     if (g !== group) { list.append(h("div", { class: "task-group" }, g)); group = g; }
     list.append(h("div", {
       class: "task-item" + (t.id === state.taskId ? " active" : ""), title: t.title,
-      onclick: () => { navigate(`/t/${t.id}`); $("#sidebar").classList.remove("open"); },
+      onclick: () => { navigate(`/t/${t.id}`); $("#sidebar").classList.remove("open"); syncScrim(); },
     }, h("i", { class: `dot ${t.status}` }), h("span", {}, (t.origin === "schedule" ? "⏰ " : t.compare_of ? "⇄ " : "") + t.title)));
   }
   if (!state.tasks.length) list.append(h("div", { class: "empty" }, "Your tasks will show up here."));
 }
-setInterval(refreshTasks, 4000);
+setInterval(() => { if (document.visibilityState === "visible") refreshTasks(); }, 4000);
 
 // ------------------------------------------------------------------ composer
 function composer({ placeholder, runningPlaceholder, onSubmit, autofocus, big, extra }) {
@@ -337,7 +360,10 @@ async function showTask(id) {
     tabs.append(tabBtns[k]);
   }
   const setCount = (k, n) => { const c = tabBtns[k].querySelector(".count"); c.hidden = !n; c.textContent = n; };
+  tabs.append(h("button", { class: "icon-btn panel-close", title: "Close panel", "aria-label": "Close panel",
+    onclick: () => { computer.classList.add("hidden"); syncScrim(); } }, icon("x")));
   const computer = h("aside", { class: "computer" + (window.innerWidth < 1100 ? " hidden" : "") }, tabs, paneHost);
+  state.computer = computer;
   showTab("plan");
 
   const comp = composer({
@@ -379,7 +405,7 @@ async function showTask(id) {
       thread.classList.toggle("focus-view", prefs.focusView);
     } }, icon("eye"));
   const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, upSel, compareSel, focusBtn, thinkBtn,
-    h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => computer.classList.toggle("hidden") }, icon("panel")),
+    h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => { computer.classList.toggle("hidden"); syncScrim(); } }, icon("panel")),
     h("button", { class: "icon-btn", title: "Delete task", onclick: async () => {
       if (!confirm("Delete this task and its history?")) return;
       await api(`/api/tasks/${id}`, { method: "DELETE" }); refreshTasks(); navigate("/");
@@ -974,6 +1000,7 @@ async function showTask(id) {
   // keep the status pill honest (e.g. after reflection finishes)
   const poll = setInterval(async () => {
     if (state.taskId !== id) return clearInterval(poll);
+    if (document.visibilityState !== "visible") return;
     try {
       const t = await api(`/api/tasks/${id}`);
       if (!t.running && (v.status === "running" || v.status === "waiting")) setStatus(t.status === "running" ? "done" : t.status);
@@ -1377,7 +1404,11 @@ async function refreshCredits() {
       : `${c.source}. Click to add credits on OpenRouter.`;
   } catch {}
 }
-setInterval(refreshCredits, 60000);
+// Poll only while the page is on screen; catch up the moment it comes back.
+setInterval(() => { if (document.visibilityState === "visible") refreshCredits(); }, 120000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { refreshCredits(); refreshTasks(); }
+});
 
 // ------------------------------------------------------------------ theme
 const THEMES = ["system", "light", "dark"];

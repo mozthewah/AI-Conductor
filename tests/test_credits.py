@@ -202,3 +202,51 @@ async def test_limiter_narrows_on_in_flight_and_recovers():
     assert lim.limit == 1
     await lim.succeeded()
     assert lim.limit == 2
+
+
+async def test_idle_balance_checks_are_cached(monkeypatch):
+    m = CreditMonitor(key="k", management_key="m", low=2.0)
+    calls = []
+    monkeypatch.setattr(m, "_check_sync", lambda: calls.append(1) or {
+        "available": 5.0, "source": "account balance", "checked": __import__("time").time(), "error": "", "spent_today": 0})
+    await m.check()
+    await m.check(max_age=15 * 60)      # idle: the cached value is fine
+    assert len(calls) == 1
+    m.state["checked"] -= 120
+    await m.check(max_age=15 * 60)      # still within 15 minutes
+    assert len(calls) == 1
+    await m.check()                      # busy (60s default): stale, so re-read
+    assert len(calls) == 2
+
+
+async def test_paused_wait_backs_off(monkeypatch):
+    m = CreditMonitor(key="k", low=2.0)
+    waits = []
+
+    async def fake_wait_for(aw, timeout):
+        waits.append(timeout)
+        aw.close()
+        raise asyncio.TimeoutError
+    checks = iter([0.0, 0.0, 0.0, 9.0])
+
+    async def fake_check(force=False, max_age=None):
+        m.state["available"] = next(checks)
+        return m.status()
+    monkeypatch.setattr("conductor.credits.asyncio.wait_for", fake_wait_for)
+    monkeypatch.setattr(m, "check", fake_check)
+    assert await m.wait_for_credits(poll=60) == "credits"
+    assert waits[0] == 60 and waits[1] > waits[0] and waits[2] > waits[1]
+
+
+def test_idle_page_polling_does_not_hit_openrouter(tmp_path):
+    from fastapi.testclient import TestClient
+    from conductor.server import create_app
+    c = make(tmp_path, FakeLLM([]))
+    c.credits.fetch, c.credits.key = True, "k"
+    hits = []
+    c.credits._check_sync = lambda: hits.append(1) or {"available": 5.0, "source": "x",
+                                                         "checked": __import__("time").time(), "error": "", "spent_today": 0}
+    with TestClient(create_app(c, run_scheduler=False)) as client:
+        for _ in range(5):
+            client.get("/api/credits")
+    assert len(hits) == 1

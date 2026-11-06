@@ -282,7 +282,11 @@ Conductor watches your OpenRouter credits and handles running low or out without
 
 - **Balance:** shown in the sidebar. Your normal key shows its own limit and any budgets on it.
   To see the whole account balance, add a management key as `OPENROUTER_MANAGEMENT_KEY`.
-- **Running low** (below `CONDUCTOR_CREDIT_LOW`, default $2): a one-time warning on the task, and the
+- **How often it checks:** about once a minute while something is running. When idle, at most every
+  15 minutes, and not at all while no page is open on screen. A task paused for credits re-checks less
+  and less often (up to every 15 minutes); **Resume** always works instantly.
+- **Running low** (below `CONDUCTOR_CREDIT_LOW`, default $2): replies are capped at 16k tokens (OpenRouter
+  reserves credit for the largest possible reply before each call, so big caps stall small balances), and a one-time warning on the task, and the
   router leans toward cheaper models. Models can call `check_credits` to plan around the budget.
 - **OpenRouter's three kinds of "can't spend" (HTTP 402) are each handled:**
   - *In-flight budget full* (lots of parallel requests on a small balance): waits for `Retry-After`

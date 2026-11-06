@@ -405,3 +405,16 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .audit-raw { width: 100%; min-height: 60vh; margin-top: 10px; font: 12px/1.5 "JetBrains Mono", monospace; background: var(--sunk);
   color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 10px; white-space: pre; overflow: auto; }
 #updateBtn[disabled] { opacity: .6; }
+
+/* Mobile overlays: backdrop + close buttons */
+.scrim { position: fixed; inset: 0; z-index: 25; background: rgba(0, 0, 0, .35); }
+.panel-close, .sidebar-close { display: none; }
+@media (max-width: 1100px) {
+  .tabs { align-items: center; }
+  .panel-close { display: grid; margin-left: auto; margin-bottom: 4px; }
+  .computer { z-index: 26; }  /* above the floating menu button while open */
+}
+@media (max-width: 760px) {
+  .sidebar-close { display: grid; position: absolute; top: 12px; right: 10px; }
+  .sidebar { z-index: 30; }
+}

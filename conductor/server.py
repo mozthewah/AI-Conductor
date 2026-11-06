@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from . import access, scheduler, updater
 from .agent import Conductor
 from .config import Settings
+from .credits import IDLE_MAX_AGE
 
 WEB = Path(__file__).parent / "web"
 
@@ -386,7 +387,10 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
 
     @app.get("/api/credits")
     async def credits():
-        st = await c().credits.check()
+        # The page asks often; only go back to OpenRouter every minute while work is running,
+        # and every 15 minutes when idle (the balance only moves when models run).
+        busy = bool(c()._running)
+        st = await c().credits.check(max_age=None if busy else IDLE_MAX_AGE)
         acct = c().account
         return {**st, "byok": [b.get("provider") for b in acct.byok_keys()] if acct.has_byok else []}
 

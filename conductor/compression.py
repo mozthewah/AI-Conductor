@@ -113,10 +113,108 @@ def proxy_url(setting: str, timeout: float = 1.0) -> str | None:
     """Headroom's local proxy, if it's running (for routing Claude Code through it)."""
     if setting == "off":
         return None
-    url = setting if setting.startswith("http") else "http://127.0.0.1:8787"
+    url = setting if setting.startswith("http") else "http://127.0.0.1:8787"  # auto / connect
     try:
         import urllib.request
         with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as r:
             return url.rstrip("/") if r.status == 200 else None
     except Exception:
         return None
+
+
+class HeadroomProxy:
+    """Runs Headroom's proxy alongside Conductor (for the Claude Code fallback).
+
+    `auto`: start it with Conductor's web app if it's installed and not already running, restart it if
+    it dies, stop it on exit. `connect`: use one you run yourself, never start it. `off`: never.
+    A URL: use the proxy at that address. Conductor only ever stops a proxy it started.
+    """
+
+    PORT = 8787
+
+    def __init__(self, setting: str = "auto", log_dir: Path | None = None):
+        self.setting = setting or "auto"
+        self.log_dir = Path(log_dir) if log_dir else None
+        self.proc = None
+        self.error = ""
+
+    @property
+    def manages(self) -> bool:
+        return self.setting == "auto"
+
+    @staticmethod
+    def executable() -> str | None:
+        import shutil
+        import sys
+        here = Path(sys.executable).parent / "headroom"  # the one in Conductor's own environment first
+        return str(here) if here.exists() else shutil.which("headroom")
+
+    @staticmethod
+    def installed() -> bool:
+        """The proxy needs headroom-ai[proxy] (it pulls in the MCP and server packages)."""
+        import importlib.util
+        try:
+            return all(importlib.util.find_spec(m) is not None for m in ("headroom", "mcp"))
+        except (ImportError, ValueError):
+            return False
+
+    def running_ours(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def ensure(self) -> str | None:
+        """Make sure a proxy is there if we manage it; returns its URL (or None)."""
+        url = proxy_url(self.setting if self.setting != "auto" else "auto")
+        if url or not self.manages:
+            return url
+        if self.running_ours():
+            return None  # still starting up
+        self.start()
+        return None
+
+    def start(self) -> bool:
+        import subprocess
+        if not self.manages or self.running_ours():
+            return False
+        exe = self.executable()
+        if not exe or not self.installed():
+            self.error = 'not installed (pip install "headroom-ai[proxy]")'
+            return False
+        env = {**os.environ}
+        env.setdefault("HEADROOM_BEACON", "off")  # no anonymous upload unless you opt in
+        out = subprocess.DEVNULL
+        if self.log_dir:
+            try:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                out = open(self.log_dir / "headroom-proxy.log", "a")
+            except OSError:
+                out = subprocess.DEVNULL
+        try:
+            self.proc = subprocess.Popen([exe, "proxy", "--port", str(self.PORT)], env=env, stdout=out,
+                                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+            self.error = ""
+            return True
+        except OSError as e:
+            self.error = str(e)
+            return False
+
+    def stop(self) -> None:
+        import signal
+        import subprocess
+        if not self.running_ours():
+            return
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+            self.proc.wait(timeout=5)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.proc = None
+
+    def status(self) -> dict:
+        url = proxy_url(self.setting if self.setting != "auto" else "auto", timeout=0.5)
+        return {"setting": self.setting, "url": url, "ours": self.running_ours(),
+                "installed": self.installed(), "error": self.error}

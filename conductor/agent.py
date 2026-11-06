@@ -25,7 +25,7 @@ from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .account import Account
 from .claude_cli import ClaudeCLI, model_alias
-from .compression import Compressor, proxy_url
+from .compression import Compressor, HeadroomProxy, proxy_url
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
@@ -83,6 +83,7 @@ class Conductor:
         self.server_url: str | None = None    # set by the web server; Claude Code's safety hook calls it
         self.compressor = Compressor(settings.headroom, settings.workspace)
         self._hr_proxy_failed = False         # Claude Code through Headroom's proxy didn't work: go direct
+        self.hr_proxy = HeadroomProxy(settings.headroom_proxy, settings.data_dir / "logs")
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
@@ -866,6 +867,14 @@ class Conductor:
             return route.get("via") == "claude_cli" and self.credits.low
         return route.get("via") == "claude_cli" or (self.cli.mode == "prefer" and model.is_claude)
 
+    def _proxy_for_cli(self) -> str | None:
+        """Headroom's proxy URL if it's up; if Conductor manages it and it isn't running, (re)start it
+        for next time (it takes a few seconds to come up, so this run goes direct)."""
+        url = proxy_url(self.settings.headroom_proxy)
+        if not url and self.hr_proxy.manages and not self.hr_proxy.running_ours():
+            self.hr_proxy.start()
+        return url
+
     def _cli_prompt(self, task: dict, messages: list[dict], resuming: bool) -> str:
         """What Claude Code gets: on a resumed session just what's new, else the brief plus progress so far."""
         if resuming:
@@ -938,7 +947,7 @@ class Conductor:
                   "runs there), and stop any background servers you start once you're done. Some actions may "
                   "be declined by the user's safety settings; if so, find another way or say what you need.")
         started = time.time()
-        base = None if self._hr_proxy_failed else await asyncio.to_thread(proxy_url, self.settings.headroom_proxy)
+        base = None if self._hr_proxy_failed else await asyncio.to_thread(self._proxy_for_cli)
         prompt = self._cli_prompt(task, messages, bool(resume))
         hook = f"{self.server_url}/api/cli/hook/{token}" if self.server_url else None
         try:
@@ -1382,6 +1391,7 @@ class Conductor:
     async def shutdown(self) -> None:
         import os, signal
         self.cli.stop_all()
+        self.hr_proxy.stop()
         for p in list(self.processes.values()):
             try:
                 os.killpg(p["pgid"], signal.SIGTERM)

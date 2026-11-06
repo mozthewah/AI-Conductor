@@ -54,7 +54,7 @@ class Settings:
     credit_low: float = 2.0               # USD; below this, warn and lean on cheaper models
     claude_cli: str = "fallback"          # Claude Code on your subscription: fallback | prefer | off
     headroom: str = "auto"                # compress bulky tool output with Headroom: auto (if installed) | on | off
-    headroom_proxy: str = "auto"          # route Claude Code through Headroom's proxy: auto (if running) | off | URL
+    headroom_proxy: str = "auto"          # Headroom's proxy for Claude Code: auto (run it) | connect (yours) | off | URL
     claude_cli_path: str = ""             # where the `claude` CLI is, if it isn't on PATH
     byok: str = "auto"                    # auto: lean on your own provider keys when credits run low/out;
                                           # prefer: also favour them while credits are fine; off: ignore

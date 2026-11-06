@@ -72,3 +72,33 @@ async def test_in_the_loop_history_stays_byte_stable(tmp_path):
     # the turn the model already saw is sent again unchanged (prompt cache keeps hitting)
     assert json.dumps(third[:len(second)]) == json.dumps(second)
     assert any(e["kind"] == "tool.compressed" for e in c.audit.read())
+
+
+def test_proxy_manager_decisions(monkeypatch):
+    from conductor import compression
+    from conductor.compression import HeadroomProxy
+    started = []
+    monkeypatch.setattr(HeadroomProxy, "start", lambda self: started.append(self.setting) or True)
+    # already running (yours or ours): just use it
+    monkeypatch.setattr(compression, "proxy_url", lambda *a, **k: "http://127.0.0.1:8787")
+    assert HeadroomProxy("auto").ensure() == "http://127.0.0.1:8787" and started == []
+    # not running: auto starts it; connect / off never do
+    monkeypatch.setattr(compression, "proxy_url", lambda *a, **k: None)
+    assert HeadroomProxy("auto").ensure() is None and started == ["auto"]
+    HeadroomProxy("connect").ensure()
+    HeadroomProxy("off").ensure()
+    assert started == ["auto"]
+    # a proxy Conductor didn't start is never stopped
+    HeadroomProxy("auto").stop()
+
+
+async def test_cli_fallback_starts_a_dead_proxy_for_next_time(tmp_path, monkeypatch):
+    from conductor.compression import HeadroomProxy
+    s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", browser=False, fetch_catalog=False)
+    c = Conductor(s, llm=FakeLLM([]))
+    starts = []
+    monkeypatch.setattr(HeadroomProxy, "start", lambda self: starts.append(1) or True)
+    assert c._proxy_for_cli() is None and starts == [1]   # not up: start it, this run goes direct
+    c.settings.headroom_proxy = "connect"
+    c.hr_proxy = HeadroomProxy("connect")
+    assert c._proxy_for_cli() is None and starts == [1]   # yours to run: never started by Conductor

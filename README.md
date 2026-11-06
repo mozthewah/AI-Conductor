@@ -154,7 +154,7 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_CLAUDE_CLI` | `fallback` | Hand work to Claude Code on your subscription: `fallback`, `prefer`, `off` |
 | `CONDUCTOR_CLAUDE_PATH` | – | Path to the `claude` CLI if it isn't on PATH |
 | `CONDUCTOR_HEADROOM` | `auto` | Compress bulky tool output with Headroom when it's installed (`auto`, `on`, `off`) |
-| `CONDUCTOR_HEADROOM_PROXY` | `auto` | Send the Claude Code fallback through Headroom's proxy if it's running (`auto`, `off`, or a URL) |
+| `CONDUCTOR_HEADROOM_PROXY` | `auto` | Headroom's proxy for the Claude Code fallback: `auto` (Conductor runs it), `connect` (you run it), `off`, or a URL |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -371,8 +371,12 @@ If [Headroom](https://docs.headroomlabs.ai) (`headroom-ai`) is installed in Cond
 - **Cache-safe:** each result is compressed once, when it arrives, and the compressed version is what's
   stored and re-sent. Earlier turns never change, so the provider's prompt cache keeps hitting.
   (Re-compressing history on every call is what breaks caches; Conductor never does that.)
-- **Claude Code fallback:** if Headroom's proxy is running (`headroom proxy`, port 8787), Claude Code is
-  pointed at it. If a run fails through the proxy before doing anything, Conductor goes direct instead.
+- **Claude Code fallback:** Claude Code is pointed at Headroom's proxy (port 8787). With
+  `CONDUCTOR_HEADROOM_PROXY=auto` (default), `conductor serve` starts the proxy in the background (if
+  `headroom-ai[proxy]` is installed and none is running), restarts it if it dies, and stops it on exit and
+  before an update restart. It never stops a proxy you started yourself. `connect` uses one you run,
+  `off` never uses it. If a run fails through the proxy before doing anything, Conductor goes direct.
+  The proxy logs to `data/logs/headroom-proxy.log`; its first start downloads a small compression model.
 - **Privacy:** Headroom's anonymous usage beacon is switched off unless you set `HEADROOM_BEACON`.
 - Each compression shows in the audit log as `tool.compressed` with the tokens saved.
   `CONDUCTOR_HEADROOM=off` turns it off; `conductor doctor` shows whether it's active.

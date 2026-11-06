@@ -20,3 +20,9 @@ def _no_real_claude_cli(monkeypatch):
 def _no_headroom_proxy_probe(monkeypatch):
     """Don't look for a real Headroom proxy on this machine during tests."""
     monkeypatch.setattr("conductor.agent.proxy_url", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_headroom_proxy(monkeypatch):
+    """Never launch a real Headroom proxy from tests."""
+    monkeypatch.setattr("conductor.compression.HeadroomProxy.start", lambda self: False)

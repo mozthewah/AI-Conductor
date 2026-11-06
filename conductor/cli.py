@@ -276,8 +276,17 @@ def doctor(args) -> None:
     else:
         print("  Headroom not installed (optional, saves tokens): pip install -e \".[headroom]\"")
     if s.headroom_proxy != "off":
+        from .compression import HeadroomProxy
         hp = proxy_url(s.headroom_proxy)
-        print(f"  Headroom proxy: {'running at ' + hp + ' (the Claude Code fallback goes through it)' if hp else 'not running (optional)'}")
+        if hp:
+            ok(f"Headroom proxy running at {hp}; the Claude Code fallback goes through it")
+        elif s.headroom_proxy == "auto" and HeadroomProxy.installed():
+            ok("Headroom proxy installed; Conductor starts it with `conductor serve` and stops it on exit")
+        elif s.headroom_proxy == "auto" and hr.available:
+            print(f'  Headroom proxy not installed (optional, for the Claude Code fallback): '
+                  f'{sys.executable} -m pip install "headroom-ai[proxy]"')
+        else:
+            print("  Headroom proxy: not running")
     from .claude_cli import find as find_claude
     if s.claude_cli == "off":
         print("  Claude Code fallback is off (CONDUCTOR_CLAUDE_CLI=off)")

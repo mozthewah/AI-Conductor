@@ -73,6 +73,11 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         state["token"] = access.load_token(s.data_dir)  # passcode for other devices on your network
         state["c"].server_url = f"http://127.0.0.1:{s.port}"  # Claude Code's safety hook calls back here
         state["c"].refresh_account()  # BYOK keys, guardrails, activity (background; cached 30 min)
+        if state["c"].cli.available and state["c"].hr_proxy.manages:
+            # Headroom's proxy for the Claude Code fallback: start it in the background (takes a few
+            # seconds; it's stopped again on exit and before an update restart).
+            asyncio.get_running_loop().run_in_executor(None, state["c"].hr_proxy.ensure)
+            updater.on_restart(state["c"].hr_proxy.stop)
         sched = asyncio.create_task(scheduler.run_forever(state["c"])) if run_scheduler else None
         yield
         if sched:

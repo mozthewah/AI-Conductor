@@ -390,6 +390,24 @@ carries GPT, Claude and Gemini models.
 - Each run gets the brief plus the work so far (Copilot can't load Conductor's safety hook into a resumed
   session, so follow-ups start a fresh Copilot session with the full context).
 
+## First-time setup and importing from other assistants
+
+The first time you open Conductor, the home page offers **Setup** (also in the sidebar any time):
+
+1. **What's set up**: OpenRouter key, management key, Claude Code, Copilot, Headroom, phone access, each
+   with what to do if it's missing.
+2. **Keys** (on the computer only): paste keys, or use ones found in OpenClaw's or Hermes's `.env`
+   (shown masked). They're written to Conductor's `.env`; **Restart now** applies them.
+3. **About you**: a few lines (what you do, how you like answers) become memories; pick a budget.
+4. **Import from other assistants**, always previewed as a checklist (edit the text or kind, untick what
+   you don't want):
+   - **On this computer**: OpenClaw (`~/.openclaw`: USER.md, MEMORY.md, SOUL.md, daily memory notes,
+     skills), Hermes (`~/.hermes`: memories and skills), Claude Code (`~/.claude`: CLAUDE.md, skills),
+     Codex (`~/.codex`: AGENTS.md, skills), Gemini CLI (`~/.gemini/GEMINI.md`), Cursor rules. Skills
+     (`SKILL.md`) are copied into Conductor's skill library as-is. Nothing in those folders is changed.
+   - **From ChatGPT, Claude.ai, Gemini…**: copy the message Conductor gives you, send it to that
+     assistant, and paste its answer back.
+
 ## Free models for the small stuff
 
 OpenRouter's free models (ids ending in `:free`) handle low-stakes chores:

@@ -424,3 +424,23 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .chip.suggest { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 999px;
   padding: 7px 12px; font: inherit; font-size: 14px; cursor: pointer; text-align: left; }
 .chip.suggest:hover { border-color: var(--accent); }
+
+/* Setup & import */
+.setup-checks { display: grid; gap: 8px; }
+.setup-check { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.setup-check svg { width: 18px; height: 18px; flex: none; margin-top: 2px; color: var(--ink-3); }
+.setup-check.ok svg { color: var(--good); }
+.setup-about { width: 100%; box-sizing: border-box; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 10px; padding: 10px 12px; font: inherit; margin-bottom: 8px; }
+.paste-prompt { white-space: pre-wrap; background: var(--sunk); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.import-list { display: grid; gap: 4px; max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+.import-row { display: grid; grid-template-columns: auto 120px 1fr; gap: 8px; align-items: center; font-size: 14px; }
+.import-row small { grid-column: 3; color: var(--ink-3); font-size: 11px; margin-top: -4px; }
+.import-row.skill { grid-template-columns: auto auto 1fr; }
+.import-text { min-width: 0; border: 1px solid transparent; background: transparent; color: var(--ink); font: inherit; padding: 4px 6px; border-radius: 6px; }
+input.import-text:focus { border-color: var(--line); background: var(--panel); }
+.card.welcome { margin-bottom: 16px; }
+@media (max-width: 640px) {
+  .import-row { grid-template-columns: auto 1fr; }
+  .import-row select { grid-column: 2; }
+  .import-row .import-text, .import-row small { grid-column: 1 / -1; }
+}

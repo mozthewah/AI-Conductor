@@ -18,7 +18,7 @@ import os
 import secrets
 from urllib.parse import parse_qs, urlencode
 
-from . import access, scheduler, updater
+from . import access, onboarding, scheduler, updater
 from .agent import Conductor
 from .config import Settings
 from .credits import IDLE_MAX_AGE
@@ -295,6 +295,117 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         if why:
             out["permissionDecisionReason"] = why
         return {"hookSpecificOutput": out}
+
+    # ---------------------------------------------------------------- first-time setup & import
+    def _local(request: Request) -> bool:
+        return access.is_local(request.client.host if request.client else "")
+
+    @app.get("/api/setup")
+    async def setup_status(request: Request):
+        st, cx = c().settings, c()
+        sources = await asyncio.to_thread(onboarding.scan)
+        local = _local(request)
+        if not local:  # keys found in other agents are only shown on the computer itself
+            sources = [{**src, "keys": {}} for src in sources]
+        return {
+            "done": bool(onboarding.load_state(st.data_dir).get("done")), "local": local,
+            "tasks": len(cx.store.list_tasks()) if hasattr(cx.store, "list_tasks") else None,
+            "keys": {"openrouter": bool(st.openrouter_key), "management": bool(st.openrouter_management_key),
+                     "anthropic": st.anthropic_key},
+            "claude_code": cx.cli.available, "copilot": cx.copilot.available,
+            "headroom": cx.compressor.available, "approval": cx.policy.threshold, "budget": st.router_budget,
+            "on_network": not access.is_local(os.environ.get("CONDUCTOR_HOST", "127.0.0.1")),
+            "memories": len(cx.store.list_memories(limit=2000)), "skills": len(cx.skills.list()),
+            "sources": sources, "paste_prompt": onboarding.PASTE_PROMPT,
+        }
+
+    @app.post("/api/setup/preview")
+    async def setup_preview(request: Request):
+        body = json.loads(await request.body() or b"{}")
+        if body.get("text"):
+            return {"memories": onboarding.extract_items(str(body["text"])[:200_000], "pasted"), "skills": []}
+        src = next((x for x in await asyncio.to_thread(onboarding.scan) if x["id"] == body.get("source")), None)
+        if not src:
+            raise HTTPException(404, "Nothing to import from there.")
+        return {"memories": await asyncio.to_thread(onboarding.preview, src), "skills": src["skills"]}
+
+    @app.post("/api/setup/import")
+    async def setup_import(request: Request):
+        from .tools.memory import KINDS
+        body = json.loads(await request.body() or b"{}")
+        added = 0
+        for m in (body.get("memories") or [])[:onboarding.MAX_ITEMS * 3]:
+            content = str(m.get("content", "")).strip()
+            if 3 <= len(content) <= 1000:
+                c().store.add_memory(m.get("kind") if m.get("kind") in KINDS else "fact", content)
+                added += 1
+        allowed = {sk["path"] for src in await asyncio.to_thread(onboarding.scan) for sk in src["skills"]}
+        skills = 0
+        for path in body.get("skills") or []:
+            if path not in allowed:  # only skills the scan found, never an arbitrary path
+                continue
+            from .skills import _parse
+            sk = _parse(Path(path).read_text(errors="replace"), Path(path).parent.name)
+            c().skills.save(sk.name, sk.description or f"Imported from {Path(path).parent}", sk.body)
+            skills += 1
+        c().audit.write("setup.imported", "user", None, memories=added, skills=skills,
+                        source=body.get("source") or ("pasted" if body.get("pasted") else None))
+        return {"memories": added, "skills": skills}
+
+    @app.post("/api/setup/keys")
+    async def setup_keys(request: Request):
+        """Save API keys to Conductor's .env (from the computer itself only). Takes effect after a restart."""
+        if not _local(request):
+            raise HTTPException(403, "Keys can only be changed on the computer running Conductor.")
+        body = json.loads(await request.body() or b"{}")
+        values = {k: str(v).strip() for k, v in (body.get("values") or {}).items()
+                  if k in onboarding.KEY_NAMES and str(v).strip()}
+        if body.get("from_source"):
+            found = onboarding.source_keys(str(body["from_source"]))
+            values.update({k: found[k] for k in body.get("keys") or [] if k in found})
+        if not values:
+            raise HTTPException(400, "No keys to save.")
+        path = await asyncio.to_thread(onboarding.write_env, values)
+        c().audit.write("setup.keys_saved", "user", None, keys=sorted(values), file=str(path))
+        return {"saved": sorted(values), "restart_needed": True}
+
+    @app.post("/api/setup/prefs")
+    async def setup_prefs(request: Request):
+        body = json.loads(await request.body() or b"{}")
+        updates = {}
+        if body.get("budget") in ("frugal", "balanced", "best"):
+            c().settings.router_budget = body["budget"]
+            updates["CONDUCTOR_BUDGET"] = body["budget"]
+        if updates and _local(request):
+            await asyncio.to_thread(onboarding.write_env, updates)
+        about = str(body.get("about") or "").strip()
+        added = 0
+        for it in onboarding.extract_items(about, "USER.md") if about else []:
+            c().store.add_memory(it["kind"], it["content"])
+            added += 1
+        return {"ok": True, "memories": added, "budget": c().settings.router_budget}
+
+    @app.post("/api/setup/done")
+    async def setup_done():
+        onboarding.save_state(c().settings.data_dir, done=True)
+        c().audit.write("setup.done", "user", None)
+        return {"ok": True}
+
+    @app.post("/api/restart")
+    async def restart_now(request: Request):
+        if not _local(request):
+            raise HTTPException(403, "Restart from the computer running Conductor.")
+
+        async def later():
+            await asyncio.sleep(0.5)
+            c().audit.write("system.restart", "system", None, reason="setup")
+            try:
+                await c().shutdown()
+            except Exception:
+                pass
+            updater.restart()
+        asyncio.get_running_loop().create_task(later())
+        return {"restarting": True}
 
     @app.get("/favicon.ico")
     async def favicon():
@@ -621,7 +732,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/t/{task_id}", response_class=HTMLResponse)
     @app.get("/{page}", response_class=HTMLResponse)
     def index(task_id: str | None = None, page: str | None = None):
-        if page and page not in ("memory", "skills", "schedules", "files", "models", "safety", "audit"):
+        if page and page not in ("memory", "skills", "schedules", "files", "models", "safety", "audit", "setup"):
             raise HTTPException(404)
         return (WEB / "index.html").read_text()
 

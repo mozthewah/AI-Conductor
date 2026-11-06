@@ -215,6 +215,7 @@ function route() {
   if (p === "/models") return showModels();
   if (p === "/safety") return showSafety();
   if (p === "/audit") return showAudit();
+  if (p === "/setup") return showSetup();
   return showHome();
 }
 
@@ -290,6 +291,14 @@ async function showHome() {
     page.append(h("div", { class: "banner" },
       "No model provider key found. Add OPENROUTER_API_KEY (and/or ANTHROPIC_API_KEY) to .env, then restart."));
   }
+  api("/api/setup").then((st) => {
+    if (st.done) return;
+    page.prepend(h("div", { class: "card welcome" },
+      h("div", { class: "title" }, icon("check"), "Welcome to Conductor: a few minutes of setup"),
+      h("div", { class: "sev-reason" }, "Check your keys and fallbacks, tell it about yourself, and bring over memories and skills from OpenClaw, Hermes, Claude Code, ChatGPT and others."),
+      h("div", { class: "row" }, h("button", { class: "btn primary", "data-nav": "/setup" }, "Start setup"),
+        h("button", { class: "btn", onclick: async (e) => { await api("/api/setup/done", { method: "POST" }); e.target.closest(".welcome").remove(); } }, "Skip"))));
+  }).catch(() => {});
   const greet = new Date().getHours();
   page.append(
     h("h1", {}, greet < 12 ? "Good morning. What should we get done?" : greet < 18 ? "What should we get done?" : "Evening. What's on your list?"),
@@ -1525,3 +1534,133 @@ async function copyText(text) {
     }
   });
 })();
+
+
+// ------------------------------------------------------------------ first-time setup & import
+const KIND_LABELS = { preference: "preference", person: "about you", fact: "fact", project: "project", note: "note" };
+
+function importChecklist(memories, skills, onImport) {
+  const box = h("div", { class: "import-list" });
+  const rows = memories.map((m) => {
+    const cb = h("input", { type: "checkbox", checked: true });
+    const kind = h("select", { title: "Kind" }, Object.entries(KIND_LABELS).map(([k, l]) => h("option", { value: k, selected: k === m.kind }, l)));
+    const text = h("input", { class: "import-text", value: m.content });
+    box.append(h("label", { class: "import-row" }, cb, kind, text, m.source ? h("small", {}, m.source) : null));
+    return { cb, kind, text };
+  });
+  const skillRows = skills.map((sk) => {
+    const cb = h("input", { type: "checkbox", checked: true });
+    box.append(h("label", { class: "import-row skill" }, cb, h("span", { class: "kind" }, "skill"),
+      h("span", { class: "import-text" }, h("b", {}, sk.name), sk.description ? ` · ${sk.description}` : "")));
+    return { cb, path: sk.path };
+  });
+  if (!rows.length && !skillRows.length) box.append(h("div", { class: "empty" }, "Nothing importable found there."));
+  const all = h("button", { class: "btn", onclick: () => { const on = !rows.concat(skillRows).every((r) => r.cb.checked); rows.concat(skillRows).forEach((r) => { r.cb.checked = on; }); } }, "Select all / none");
+  const go = h("button", { class: "btn primary", onclick: async () => {
+    go.disabled = true;
+    const r = await onImport(rows.filter((x) => x.cb.checked).map((x) => ({ kind: x.kind.value, content: x.text.value })),
+      skillRows.filter((x) => x.cb.checked).map((x) => x.path));
+    box.replaceChildren(h("div", { class: "card" }, h("div", { class: "title" }, icon("check"), `Imported ${r.memories} memories and ${r.skills} skills.`)));
+  } }, "Import selected");
+  return h("div", {}, rows.length + skillRows.length ? h("div", { class: "toolbar" }, all, go) : null, box);
+}
+
+async function showSetup() {
+  const st = await api("/api/setup");
+  const tick = (ok, label, hint) => h("div", { class: "setup-check" + (ok ? " ok" : "") }, icon(ok ? "check" : "x"),
+    h("div", { class: "grow" }, h("b", {}, label), hint ? h("div", { class: "meta" }, hint) : null));
+
+  // 1. Status
+  const status = h("div", { class: "setup-checks" },
+    tick(st.keys.openrouter, "OpenRouter key", st.keys.openrouter ? "Set." : "Needed for most models. Add it below (on the computer) or in .env."),
+    tick(st.keys.management, "OpenRouter management key (optional)", "Shows your balance, BYOK keys and spend; read-only."),
+    tick(st.claude_code, "Claude Code fallback (optional)", st.claude_code ? "Found: Claude tasks can continue on your Claude subscription." : "Install Claude Code and sign in to use your Claude subscription when credits run short."),
+    tick(st.copilot, "GitHub Copilot fallback (optional)", st.copilot ? "Found: tasks can continue on your Copilot subscription." : "npm install -g @github/copilot, then `copilot` and /login."),
+    tick(st.headroom, "Headroom token savings (optional)", st.headroom ? "Active." : "pip install -e \".[headroom]\" in Conductor's folder."),
+    tick(st.on_network, "Phone access (optional)", st.on_network ? "On: see the Safety page for the QR code." : "Start with `conductor serve --lan` to use it from your phone."));
+
+  // 2. Keys (computer only)
+  const keyBox = h("div");
+  if (st.local) {
+    const fields = {};
+    const mk = (name, label) => { fields[name] = h("input", { type: "password", placeholder: label, autocomplete: "off" }); return fields[name]; };
+    const found = st.sources.flatMap((src) => Object.entries(src.keys || {}).map(([k, masked]) => ({ src, k, masked })));
+    keyBox.append(
+      found.length ? h("div", { class: "card" }, h("div", { class: "title" }, icon("key"), "Keys found in your other assistants"),
+        ...found.map(({ src, k, masked }) => h("div", { class: "file-row" }, h("span", {}, h("b", {}, k), ` from ${src.label}`), h("small", { class: "mono" }, masked),
+          h("button", { class: "btn", onclick: async (e) => {
+            await api("/api/setup/keys", { method: "POST", body: { from_source: src.id, keys: [k] } });
+            e.target.replaceWith(h("small", {}, "saved to .env"));
+            restartRow.hidden = false;
+          } }, "Use it")))) : null,
+      h("div", { class: "toolbar" }, mk("OPENROUTER_API_KEY", "OpenRouter API key (sk-or-v1-…)"), mk("OPENROUTER_MANAGEMENT_KEY", "Management key (optional)")),
+      h("div", { class: "toolbar" }, mk("ANTHROPIC_API_KEY", "Anthropic API key (optional)"),
+        h("button", { class: "btn primary", onclick: async () => {
+          const values = Object.fromEntries(Object.entries(fields).map(([k, el]) => [k, el.value.trim()]).filter(([, v]) => v));
+          if (!Object.keys(values).length) return;
+          await api("/api/setup/keys", { method: "POST", body: { values } });
+          Object.values(fields).forEach((el) => { el.value = ""; });
+          restartRow.hidden = false;
+        } }, "Save keys")),
+      h("p", { class: "meta" }, "Keys are written to Conductor's .env on this computer and never shown again."));
+  } else {
+    keyBox.append(h("p", { class: "meta" }, "Keys can only be added on the computer running Conductor."));
+  }
+  const restartRow = h("div", { class: "card", hidden: true }, h("div", { class: "title" }, icon("check"), "Saved. Restart Conductor to use the new keys."),
+    h("button", { class: "btn primary", onclick: async () => {
+      await api("/api/restart", { method: "POST" });
+      document.body.style.opacity = ".5";
+      for (let i = 0; i < 60; i++) { await new Promise((r) => setTimeout(r, 1500)); try { if ((await fetch("/api/config")).ok) { location.reload(); return; } } catch {} }
+    } }, "Restart now"));
+
+  // 3. About you + budget
+  const about = h("textarea", { class: "setup-about", rows: 4, placeholder: "e.g. What you do, what you're working on, and how you like answers (short? code first? which languages and tools?)" });
+  const budget = h("select", {}, [["frugal", "Frugal: cheaper models unless the work is hard"], ["balanced", "Balanced (recommended)"], ["best", "Best: quality first, cost second"]]
+    .map(([v, l]) => h("option", { value: v, selected: v === st.budget }, l)));
+  const aboutNote = h("span", { class: "meta" });
+  const aboutBox = h("div", {}, about, h("div", { class: "toolbar" }, budget,
+    h("button", { class: "btn primary", onclick: async () => {
+      const r = await api("/api/setup/prefs", { method: "POST", body: { about: about.value, budget: budget.value } });
+      aboutNote.textContent = `Saved${r.memories ? `: ${r.memories} things to remember` : ""}.`;
+      about.value = "";
+    } }, "Save"), aboutNote));
+
+  // 4. Import
+  const importBox = h("div");
+  const result = h("div");
+  const runImport = (source, pasted) => async (memories, skills) =>
+    api("/api/setup/import", { method: "POST", body: { memories, skills, source, pasted } });
+  for (const src of st.sources) {
+    const n = src.files.length, k = src.skills.length;
+    importBox.append(h("div", { class: "file-row" },
+      h("span", {}, h("b", {}, src.label), h("small", { class: "mono" }, ` ${src.path}`)),
+      h("small", {}, [n ? `${n} memory file${n > 1 ? "s" : ""}` : "", k ? `${k} skill${k > 1 ? "s" : ""}` : ""].filter(Boolean).join(" · ") || "keys only"),
+      h("button", { class: "btn", onclick: async () => {
+        const pv = await api("/api/setup/preview", { method: "POST", body: { source: src.id } });
+        result.replaceChildren(h("h3", { class: "lb-cat" }, `From ${src.label}`), importChecklist(pv.memories, pv.skills, runImport(src.id, false)));
+        result.scrollIntoView({ behavior: "smooth" });
+      } }, "Review")));
+  }
+  if (!st.sources.length) importBox.append(h("p", { class: "meta" }, "No other assistants found on this computer (looked for OpenClaw, Hermes, Claude Code, Codex, Gemini CLI and Cursor)."));
+  const promptBox = h("pre", { class: "paste-prompt" }, st.paste_prompt);
+  const paste = h("textarea", { class: "setup-about", rows: 6, placeholder: "Paste the answer here…" });
+  const pasteBox = h("div", {},
+    h("p", { class: "meta" }, "From ChatGPT, Claude.ai, Gemini or any other chat assistant: send it this message, then paste its answer below."),
+    promptBox, h("div", { class: "toolbar" }, h("button", { class: "btn", onclick: async (e) => { e.target.textContent = (await copyText(st.paste_prompt)) ? "Copied" : "Select and copy it"; } }, "Copy the message")),
+    paste, h("div", { class: "toolbar" }, h("button", { class: "btn primary", onclick: async () => {
+      if (!paste.value.trim()) return;
+      const pv = await api("/api/setup/preview", { method: "POST", body: { text: paste.value } });
+      result.replaceChildren(h("h3", { class: "lb-cat" }, "From your paste"), importChecklist(pv.memories, [], runImport(null, true)));
+      result.scrollIntoView({ behavior: "smooth" });
+    } }, "Find memories")));
+
+  page("Setup", `Get Conductor ready, and bring over what your other assistants know. You can come back here any time.${st.memories ? ` (It already remembers ${st.memories} things and knows ${st.skills} skills.)` : ""}`,
+    h("h2", { class: "section" }, "1. What's set up"), status,
+    h("h2", { class: "section" }, "2. Keys"), keyBox, restartRow,
+    h("h2", { class: "section" }, "3. About you"), aboutBox,
+    h("h2", { class: "section" }, "4. Import from other assistants"), importBox,
+    h("h3", { class: "lb-cat" }, "From a chat assistant"), pasteBox, result,
+    h("div", { class: "toolbar", style: "margin-top:24px" }, h("button", { class: "btn primary", onclick: async () => {
+      await api("/api/setup/done", { method: "POST" }); navigate("/");
+    } }, st.done ? "Done" : "Finish setup")));
+}

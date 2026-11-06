@@ -626,6 +626,7 @@ async function showTask(id) {
     else if (ev.type === "part" && d.action === "started") setLive(`${d.name || shortModel(d.model)} is working on “${d.title}”…`);
     switch (ev.type) {
       case "user":
+        if (v.suggestRow) { v.suggestRow.remove(); v.suggestRow = null; }
         if (d.queued) {  // said mid-task: show it in the running timeline, where it happened
           const badge = h("span", { class: "queued-badge" }, "queued · it'll see this at its next step");
           addAct(h("div", { class: "card midtask" }, h("div", { class: "title" }, icon("chat"), "You, while it worked", badge),
@@ -945,7 +946,24 @@ async function showTask(id) {
       case "done":
         if (v.replayed) { setStatus("done"); refreshTasks(); }
         v.pendingFeedback = true;
+        if (v.suggestRow) { v.suggestRow.remove(); v.suggestRow = null; }
         break;
+      case "title":
+        title.textContent = d.title;
+        refreshTasks();
+        break;
+      case "suggestions": {
+        if (v.suggestRow) v.suggestRow.remove();
+        const row = h("div", { class: "suggest-row" }, (d.items || []).map((s) => h("button", { class: "chip suggest", title: "Send this", onclick: async () => {
+          row.remove(); v.suggestRow = null;
+          const r = await api(`/api/tasks/${id}/messages`, { method: "POST", body: { prompt: s } });
+          if (r.status === "started") setStatus("running");
+        } }, s)));
+        v.suggestRow = row;
+        addBlock(row);
+        break;
+      }
+
       case "error":
         addBlock(h("div", { class: "card", style: "border-color:var(--bad)" }, h("div", { class: "title", style: "color:var(--bad)" }, icon("x"), "Something went wrong"), d.text));
         if (v.replayed) setStatus("error");

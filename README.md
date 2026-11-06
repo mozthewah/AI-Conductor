@@ -156,6 +156,7 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_COPILOT` | `fallback` | Hand work to GitHub Copilot CLI on your Copilot subscription: `fallback`, `prefer`, `off` |
 | `CONDUCTOR_COPILOT_MODEL` | – | Force a Copilot model (default: the task's model if Copilot has it, else `auto`) |
 | `CONDUCTOR_COPILOT_HEADROOM` | `auto` | Run Copilot through Headroom once `headroom copilot-auth login` is done (`auto`, `off`) |
+| `CONDUCTOR_FREE_MODELS` | `auto` | OpenRouter free models for chat titles and follow-up suggestions (`auto`, `off`, or a `:free` model id) |
 | `CONDUCTOR_HEADROOM` | `auto` | Compress bulky tool output with Headroom when it's installed (`auto`, `on`, `off`) |
 | `CONDUCTOR_HEADROOM_PROXY` | `auto` | Headroom's proxy for the Claude Code fallback: `auto` (Conductor runs it), `connect` (you run it), `off`, or a URL |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
@@ -388,6 +389,20 @@ carries GPT, Claude and Gemini models.
   Conductor leaves Copilot alone for 30 minutes.
 - Each run gets the brief plus the work so far (Copilot can't load Conductor's safety hook into a resumed
   session, so follow-ups start a fresh Copilot session with the full context).
+
+## Free models for the small stuff
+
+OpenRouter's free models (ids ending in `:free`) handle low-stakes chores:
+
+- **Chat titles**: a short title ("Burrow Night Tape redesign") instead of the first line of your message.
+  Short one-line requests keep their own text.
+- **Follow-up suggestions**: 2–3 tap-to-send follow-ups under each finished answer (they disappear as soon as
+  you send something).
+
+Conductor tries the best-looking free text models in turn, rests one for 15 minutes after it fails
+(free models are rate-limited), and if none work it uses the cheap router model, or skips the chore when
+credits are out. Some free providers log or train on prompts, so only short snippets go to them.
+`CONDUCTOR_FREE_MODELS=off` turns this off; set it to a specific `...:free` model id to always use that one.
 
 ## Saving tokens with Headroom
 

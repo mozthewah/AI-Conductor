@@ -230,6 +230,28 @@ class MessagesLLM:
         await acc.emit_extras()
         return result
 
+    # ------------------------------------------------------------------ one-shot text (small chores)
+    async def quick(self, *, model: ModelInfo, system: str, prompt: str, max_tokens: int = 400) -> str:
+        """A single short reply with no tools: titles, suggestions and other small chores."""
+        client = self._client(model)
+        started = time.time()
+        try:
+            resp = await client.messages.create(model=model.id, max_tokens=max_tokens, system=system,
+                                                messages=[{"role": "user", "content": prompt}])
+        except Exception as e:
+            if self.audit:
+                self.audit.write("model.aux_error", "system", CURRENT_TASK.get(), model=model.id,
+                                 purpose=system[:60], error=f"{type(e).__name__}: {str(e)[:200]}")
+            raise
+        text = "".join(getattr(b, "text", "") or "" for b in resp.content if getattr(b, "type", "") == "text")
+        if self.audit:
+            u = getattr(resp, "usage", None)
+            self.audit.write("model.aux_call", "system", CURRENT_TASK.get(), model=model.id, purpose=system[:60],
+                             tokens_in=getattr(u, "input_tokens", None), tokens_out=getattr(u, "output_tokens", None),
+                             cost_usd=0.0 if model.id.endswith(":free") else None,
+                             ms=int((time.time() - started) * 1000))
+        return text
+
     # ------------------------------------------------------------------ one-shot JSON
     async def structured(self, *, model: ModelInfo, system: str, prompt: str, schema: dict,
                          effort: str = "low") -> dict:

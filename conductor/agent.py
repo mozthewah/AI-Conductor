@@ -24,6 +24,7 @@ from .llm import CURRENT_TASK, INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_
 from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .account import Account
+from .chores import Chores
 from .claude_cli import ClaudeCLI, model_alias
 from .compression import Compressor, HeadroomProxy, proxy_url
 from .copilot_cli import CopilotCLI, install_hook as install_copilot_hook
@@ -93,6 +94,8 @@ class Conductor:
         self._copilot_hr_failed = False
         self._copilot_tokens: set[str] = set()  # hook tokens of Copilot runs (their steps are shown via the hook)
         self._explained: set[str] = set()
+        self.chores = Chores(self)              # titles + follow-up suggestions on free models
+        self._bg: set[asyncio.Task] = set()     # small background chores (kept so they aren't garbage-collected)
         self.hr_proxy = HeadroomProxy(settings.headroom_proxy, settings.data_dir / "logs")
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
@@ -167,7 +170,39 @@ class Conductor:
         task_id = self.store.create_task(title, origin=origin, system_prompt=self.build_system_prompt(prompt),
                                          compare_of=compare_of)
         self._launch(task_id, prompt, model or self.settings.model, "compare" if compare_of else None)
+        if origin == "user" and not compare_of and (len(prompt) > 60 or "\n" in prompt.strip()):
+            self._background(self._name_task(task_id, prompt))
         return task_id
+
+    def _background(self, coro) -> None:
+        try:
+            t = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    async def _name_task(self, task_id: str, prompt: str) -> None:
+        """Give the chat a short real title (a free model), instead of its first line."""
+        try:
+            title = await self.chores.title(prompt)
+        except Exception:
+            return
+        if title and self.store.get_task(task_id):
+            self.store.update_task(task_id, title=title)
+            await self.emit(task_id, "title", {"title": title})
+
+    async def _suggest(self, task_id: str, answer: str) -> None:
+        """2-3 tap-to-send follow-ups under a finished answer."""
+        try:
+            first = self.store.load_messages(task_id)[0]["content"]
+            prompt = first if isinstance(first, str) else text_of(first)
+            items = await self.chores.suggestions(prompt, answer)
+        except Exception:
+            return
+        if items:  # (the app clears them as soon as you send something)
+            await self.emit(task_id, "suggestions", {"items": items})
 
     def compare(self, task_id: str, model: str) -> str:
         """Re-run a task's original request on another model, side by side."""
@@ -564,6 +599,9 @@ class Conductor:
 
             self.store.update_task(task_id, status="done", answer=answer)
             await self.emit(task_id, "done", {"answer": answer})
+            if depth == 0 and self.chores.enabled and self.store.get_task(task_id).get("origin") == "user" \
+                    and not self.store.get_task(task_id).get("parent_id"):
+                self._background(self._suggest(task_id, answer))
             return answer
         except asyncio.CancelledError:
             self.store.update_task(task_id, status="cancelled")

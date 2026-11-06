@@ -54,6 +54,7 @@ class Settings:
     credit_low: float = 2.0               # USD; below this, warn and lean on cheaper models
     claude_cli: str = "fallback"          # Claude Code on your subscription: fallback | prefer | off
     headroom: str = "auto"                # compress bulky tool output with Headroom: auto (if installed) | on | off
+    free_models: str = "auto"             # OpenRouter free models for titles & follow-up suggestions: auto | off | <model id>
     headroom_proxy: str = "auto"          # Headroom's proxy for Claude Code: auto (run it) | connect (yours) | off | URL
     claude_cli_path: str = ""             # where the `claude` CLI is, if it isn't on PATH
     copilot: str = "fallback"             # GitHub Copilot CLI on your Copilot subscription: fallback | prefer | off
@@ -129,6 +130,7 @@ class Settings:
             byok=os.environ.get("CONDUCTOR_BYOK", cls.byok).lower(),
             claude_cli=os.environ.get("CONDUCTOR_CLAUDE_CLI", cls.claude_cli).lower(),
             headroom=os.environ.get("CONDUCTOR_HEADROOM", cls.headroom).lower(),
+            free_models=os.environ.get("CONDUCTOR_FREE_MODELS", cls.free_models).strip(),
             headroom_proxy=os.environ.get("CONDUCTOR_HEADROOM_PROXY", cls.headroom_proxy),
             claude_cli_path=os.environ.get("CONDUCTOR_CLAUDE_PATH", ""),
             copilot=os.environ.get("CONDUCTOR_COPILOT", cls.copilot).lower(),

@@ -418,3 +418,9 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
   .sidebar-close { display: grid; position: absolute; top: 12px; right: 10px; }
   .sidebar { z-index: 30; }
 }
+
+/* Tap-to-send follow-up suggestions */
+.suggest-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 4px; }
+.chip.suggest { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 999px;
+  padding: 7px 12px; font: inherit; font-size: 14px; cursor: pointer; text-align: left; }
+.chip.suggest:hover { border-color: var(--accent); }

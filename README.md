@@ -181,15 +181,29 @@ Conductor moves up a tier when that happens:
   task was routed for, the task moves to the best model for the new work.
 - **It notices when a model struggles.** Repeating the same call three times, or three failing steps
   in a row, hands the task to a stronger model with a note to step back and change approach.
-- **Models can ask for help.** `consult_expert` sends one hard question (with context) to a top model
-  and returns its advice, while the task stays on the cheaper model. `escalate` hands over the
-  whole task.
-- **You can do it too.** The **⬆ Stronger model** menu on every task switches models mid-conversation.
+- **Models know where they stand.** Each model is told which model it's running as and who is on
+  call above it, with concrete cues for calling up: hedging ("hm… actually… wait"), guessing at
+  facts, reconsidering the same point, or unfamiliar territory.
+- **Models can call up themselves:**
+  - `find_model` lists roster models that would likely handle the problem better, with their track
+    record, price, and how big a step up each is (smallest step first). It's free and calls no model.
+  - `consult_expert` sends one question (with context) to a stronger model and returns its advice,
+    while the task stays put.
+  - `escalate` hands the whole task over.
+
+  The last two take an optional model choice from `find_model`. By default they go to the *next step
+  up*, the cheapest model that's clearly better at this kind of work, not straight to the most
+  expensive one.
+- **Hedging gets noticed.** A turn full of "hm / actually / wait / not sure" gets a note to ask
+  instead of guessing. If the model keeps hedging after that, the task moves up a step automatically.
+- **You can do it too.** The **⬆ Stronger model** menu on every task offers the next step up, the
+  best available model, or any model in the roster.
 
 The new model sees the whole conversation. The earlier model's private reasoning notes are left
 out (only the model that wrote them can read them), and its web-tool records become plain-text
 summaries. Being escalated away from counts against a model for that kind of work, so the router
-learns not to start there next time. Automatic upgrades are capped at two per task
+learns not to start there next time. Upgrades climb one step at a time (e.g. a fast model → a mid-tier one → a top-tier one), and the incoming model gets a note
+on who it's replacing and why. Automatic upgrades are capped at two per task
 (`CONDUCTOR_AUTO_ESCALATE=off` disables them).
 
 Reasoning notes in the activity feed are collapsed to a one-line preview. Click one to expand it,

@@ -53,7 +53,7 @@ const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -307,7 +307,8 @@ async function showTask(id) {
 
   const upSel = modelSelect(roster, { auto: false, placeholder: "⬆ Stronger model…" });
   upSel.classList.add("compare-select", "up-select");
-  upSel.insertBefore(h("option", { value: "auto" }, "Best available for this work"), upSel.options[1]);
+  upSel.insertBefore(h("option", { value: "best" }, "Best available (top tier)"), upSel.options[1]);
+  upSel.insertBefore(h("option", { value: "auto" }, "Next step up (recommended)"), upSel.options[1]);
   upSel.addEventListener("change", async () => {
     if (!upSel.value) return;
     try {

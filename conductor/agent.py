@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
 import time
 from typing import Any
 
@@ -19,7 +21,11 @@ from .config import Settings
 from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
 from .benchmarks import Benchmarks
 from .models import Catalog
-from .router import Router
+from .router import SKILLS, Router
+
+SKILL_SET = set(SKILLS) | {"orchestration"}
+HEDGES = re.compile(r"\b(hm+|hmm+|actually|wait|on second thought|let me reconsider|i'?m not (?:sure|certain)|"
+                    r"not sure (?:if|whether)|i (?:might|may) be wrong|or maybe|hold on|i don'?t (?:know|recall))\b", re.I)
 from .safety import JUDGE_PROMPT, JUDGE_SCHEMA, JUDGE_SYSTEM, LEVELS, Assessment, Policy
 from .skills import SkillLibrary
 from .store import PROFILE_KINDS, Store, new_id
@@ -179,9 +185,11 @@ class Conductor:
         info = self.catalog.get(decision.model)
         route = {**decision.to_dict(), "name": info.name or info.id, **({"part_id": part["id"]} if part else {})}
         fields: dict[str, Any] = {"model": decision.model, "route": route}
+        # Settled before the first model turn, so the system prompt is still unsent.
+        system = task["system_prompt"]
         if decision.mode == "conduct" and task.get("parent_id") is None:
-            # Settled before the first model turn, so the system prompt is still unsent.
-            fields["system_prompt"] = task["system_prompt"] + prompts.CONDUCT_MODE
+            system += prompts.CONDUCT_MODE
+        fields["system_prompt"] = system + self.seat_text(decision.model, decision.skill, decision.domain)
         self.store.update_task(task_id, **fields)
         self.store.start_run(task_id, decision.model, decision.skill, decision.difficulty, decision.by,
                              domain=decision.domain, mode=decision.mode, parent_id=task.get("parent_id"))
@@ -227,7 +235,8 @@ class Conductor:
             if route is not None:
                 await self._route(task_id, prompt, **route)
         elif depth == 0:  # a follow-up: check it hasn't outgrown the current model
-            await self._reroute_followup(task_id, prompt)
+            if await self._reroute_followup(task_id, prompt):
+                self._handoff_note(task_id, messages)
         task = self.store.get_task(task_id)
         system = task["system_prompt"]
 
@@ -236,12 +245,16 @@ class Conductor:
         answer = ""
         seen_calls: dict[str, int] = {}
         failing_turns = 0
+        hedgy_turns = 0
+        nudged_at: int | None = None
         try:
             for _ in range(self.settings.max_steps):
                 turn = len(messages)
                 if task_id in self._escalate_next:
                     reason, by, target = self._escalate_next.pop(task_id)
-                    await self.escalate(task_id, reason, by=by, target=target)
+                    if await self.escalate(task_id, reason, by=by, target=target):
+                        self._handoff_note(task_id, messages)
+                        hedgy_turns, nudged_at = 0, None
                 model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
 
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
@@ -290,11 +303,24 @@ class Conductor:
                     stuck = "three steps in a row failed"
                 if stuck and self.settings.auto_escalate and task_id not in self._escalate_next:
                     self._escalate_next[task_id] = (f"The model seemed stuck: {stuck}.", "auto", None)
-                    results.append({"type": "text", "text": (
-                        f"[Conductor note: {stuck}, so a stronger model is taking over from here. "
-                        "Step back, look at what has been tried, and take a different approach.]")})
                     seen_calls.clear()
                     failing_turns = 0
+
+                # Hedging ("hm... actually... wait") means it's out of its depth: nudge it to ask its
+                # big brother; if it keeps hedging after the nudge, hand the task up automatically.
+                hedges = [m.group(0).lower() for b in blocks if b.get("type") in ("thinking", "text")
+                          for m in HEDGES.finditer(b.get("thinking") or b.get("text") or "")]
+                hedgy_turns = hedgy_turns + 1 if len(hedges) >= 2 else 0
+                if len(hedges) >= 4 or hedgy_turns >= 2:
+                    if nudged_at is None:
+                        nudged_at = turn
+                        hedgy_turns = 0
+                        signals = ", ".join(f"“{h}”" for h in list(dict.fromkeys(hedges))[:4])
+                        results.append({"type": "text", "text": prompts.HESITATION_NUDGE.format(signals=signals)})
+                        await self.emit(task_id, "status", {"text": "The model sounds unsure; nudged it to ask a stronger model."})
+                    elif self.settings.auto_escalate and task_id not in self._escalate_next \
+                            and self.stronger_model(self.store.get_task(task_id)):
+                        self._escalate_next[task_id] = ("It kept hedging after being nudged to ask for help.", "auto", None)
                 self._append(task_id, messages, "user", results)
             else:
                 answer = (text_of(messages[-1]["content"]) if messages[-1]["role"] == "assistant" else "")
@@ -326,23 +352,71 @@ class Conductor:
             return True
         return False
 
-    def stronger_model(self, task: dict) -> str | None:
-        """The best model for this task's kind of work, if it's clearly better than the current one."""
-        route = task.get("route") or {}
-        skill, domain = route.get("skill", "other"), route.get("domain", "general")
-        if route.get("mode") == "conduct":
-            skill, domain = "orchestration", "general"
-        current = task.get("model")
-        pick = self.router.pick(skill=skill, domain=domain, difficulty="hard", budget="best",
-                                exclude={current} if current else None)
-        if pick.by == "fallback" or pick.model == current:
-            return None
-        roster = [m.id for m in self.catalog.roster()]
+    def seat_text(self, model_id: str, skill: str, domain: str) -> str:
+        """Tell a model who it is and who it can call up to."""
+        me = self.catalog.get(model_id)
+        roster = [m for m in self.catalog.roster() if m.id != model_id]
+        if not roster:
+            return ""
+        roster_ids = [m.id for m in self.catalog.roster()]
         table = self.router._stats()
-        cur = self.catalog.get(current or "")
-        cur_q = self.router.estimate(cur, skill, domain, "hard", roster, table)[0] if current else 0
-        new_q = next((c["quality"] for c in pick.candidates if c["model"] == pick.model), 0)
-        return pick.model if new_q > cur_q + 0.02 else None
+        est = lambda m: self.router.estimate(m, skill if skill in SKILL_SET else "other", domain or "general",
+                                             "hard", roster_ids, table)[0]
+        mine = est(me)
+        ranked = sorted(roster, key=est, reverse=True)
+        above = [m for m in ranked if est(m) > mine + 0.02][:3]
+        names = ", ".join(m.name or m.id for m in (above or ranked[:2]))
+        if not above:
+            return prompts.SEAT_TOP.format(name=me.name or me.id, above=names)
+        tier_words = {"fast": "fast, low-cost", "strong": "capable mid-tier", "frontier": "top-tier"}.get(me.tier, "capable")
+        return prompts.SEAT_CALL_UP.format(name=me.name or me.id, tier_words=tier_words, above=names)
+
+    def model_options(self, task: dict, skill: str | None = None, domain: str | None = None) -> list[dict]:
+        """Models that would likely do this kind of work better than the task's current model,
+        cheapest step up first. Each entry explains itself so a model (or you) can choose."""
+        from .models import TIERS
+        from .router import COST_WEIGHT, TOKEN_ESTIMATE
+        route = task.get("route") or {}
+        skill = skill or route.get("skill", "other")
+        domain = domain or route.get("domain", "general")
+        if route.get("mode") == "conduct" and skill == route.get("skill"):
+            skill, domain = "orchestration", "general"
+        if skill not in SKILL_SET:
+            skill = "other"
+        roster = self.catalog.roster()
+        ids = [m.id for m in roster]
+        table = self.router._stats()
+        current = task.get("model") or ""
+        cur = self.catalog.get(current)
+        cur_q = self.router.estimate(cur, skill, domain, "hard", ids, table)[0] if current else 0.0
+        cur_t = TIERS.index(cur.tier) if cur.tier in TIERS else 1
+        tin, tout = TOKEN_ESTIMATE["hard"]
+        out = []
+        for m in roster:
+            if m.id == current:
+                continue
+            q, _, _, runs, bench = self.router.estimate(m, skill, domain, "hard", ids, table)
+            if q <= cur_q + 0.03:
+                continue
+            t = TIERS.index(m.tier) if m.tier in TIERS else 1
+            cost = m.cost(tin, tout, int(tin * 0.6))
+            out.append({"model": m.id, "name": m.name or m.id, "tier": m.tier, "quality": round(q, 2),
+                        "gain": round(q - cur_q, 2), "price": f"${m.price_in:g}/${m.price_out:g} per M tokens",
+                        "est_cost": round(cost, 3), "runs": runs, "benchmark": bench,
+                        "steps_up": max(t - cur_t, 0),
+                        "value": q - COST_WEIGHT["balanced"] * math.log10(1 + cost / 0.005) / 3})
+        # Smallest step up that clearly helps comes first; within a step, best value.
+        out.sort(key=lambda o: (o["steps_up"], -o["value"]))
+        return out
+
+    def stronger_model(self, task: dict, best: bool = False) -> str | None:
+        """Next model up the ladder for this work (or the very best, if best=True)."""
+        opts = self.model_options(task)
+        if not opts:
+            return None
+        if best:
+            return max(opts, key=lambda o: o["quality"])["model"]
+        return opts[0]["model"]
 
     async def escalate(self, task_id: str, reason: str, by: str = "auto", target: str | None = None) -> str | None:
         task = self.store.get_task(task_id)
@@ -351,7 +425,10 @@ class Conductor:
         if by in ("auto", "model") and len(history) >= self.settings.max_escalations:
             return None
         current = task.get("model")
-        new = target if target and target != "auto" else self.stronger_model(task)
+        if target == "best":
+            new = self.stronger_model(task, best=True)
+        else:
+            new = target if target and target != "auto" else self.stronger_model(task)
         if not new or new == current:
             await self.emit(self._root(task_id)["id"], "status", {
                 "text": f"Wanted a stronger model ({reason.rstrip('.')}), but {self.catalog.get(current or '').name or current} "
@@ -377,27 +454,38 @@ class Conductor:
             await self.emit(self._root(task_id)["id"], "escalated", payload)
         return new
 
-    async def _reroute_followup(self, task_id: str, prompt: str) -> None:
+    def _handoff_note(self, task_id: str, messages: list[dict]) -> None:
+        """Tell the incoming model who it is and why it's here (as a user-side note; history is append-only)."""
+        route = self.store.get_task(task_id).get("route") or {}
+        last = (route.get("escalations") or [{}])[-1]
+        if not last:
+            return
+        note = prompts.HANDOFF_NOTE.format(new=self.catalog.get(last["to"]).name or last["to"],
+                                           old=self.catalog.get(last.get("from") or "").name or last.get("from"),
+                                           reason=last.get("reason", ""))
+        self._append(task_id, messages, "user", [{"type": "text", "text": note}])
+
+    async def _reroute_followup(self, task_id: str, prompt: str) -> str | None:
         """A follow-up can be much bigger than the first message; move up if it outgrew the model."""
         task = self.store.get_task(task_id)
         route = task.get("route") or {}
         if not self.settings.auto_escalate or route.get("by") == "pinned" or route.get("mode") == "conduct":
-            return
+            return None
         try:
             label = await self.router.classify(prompt)
         except Exception:
-            return
+            return None
         from .router import DIFFICULTIES
         old_d = route.get("difficulty", "medium")
         old_rank = DIFFICULTIES.index(old_d) if old_d in DIFFICULTIES else 1
         new_rank = DIFFICULTIES.index(label["difficulty"])
         if new_rank <= old_rank and label["skill"] == route.get("skill"):
-            return
+            return None
         route = {**route, "skill": label["skill"], "domain": label["domain"],
                  "difficulty": DIFFICULTIES[max(old_rank, new_rank)]}
         self.store.update_task(task_id, route=route)
         if new_rank > old_rank or old_d == "easy":
-            await self.escalate(task_id, f"The work grew into {label['skill'].replace('_', ' ')} "
+            return await self.escalate(task_id, f"The work grew into {label['skill'].replace('_', ' ')} "
                                          f"({label['difficulty']}) beyond the first question.", by="auto")
 
     @staticmethod

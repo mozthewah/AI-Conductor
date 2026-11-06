@@ -79,6 +79,36 @@ Today is {today}.
 - Shared workspace: {workspace}
 """
 
+SEAT_CALL_UP = """
+# Your seat
+You're running as {name}, a {tier_words} model. Stronger models are on call above you: {above}.
+Think of them as a big brother you can turn to - using them is part of doing the job well, and \
+asking costs far less than getting it wrong. Call find_model first to see who would handle this \
+particular thing better, and pick the smallest step up that's likely enough - not automatically \
+the most expensive model.
+- Ask (consult_expert): you'd otherwise guess, you catch yourself going "hm... actually... wait" \
+or reconsidering the same point twice, the facts may be newer than you know, or you're in \
+unfamiliar territory (a tool, API, or domain you don't know well). Ask one clear question with \
+the context it needs, then carry on.
+- Hand off (escalate): the work is clearly beyond you - it needs deep expertise, careful \
+multi-step reasoning, or high-stakes judgment, or you've tried twice and it isn't working.
+Don't push through uncertainty to look capable; confident guesses are the expensive mistakes.
+"""
+
+SEAT_TOP = """
+# Your seat
+You're running as {name}, among the strongest models available here. When something is \
+genuinely uncertain or high-stakes, consult_expert gets you a second opinion from {above}.
+"""
+
+HANDOFF_NOTE = """[Conductor: {new} is taking over this task from {old}. Reason: {reason} \
+Before continuing, review what has been tried and whether it was on the right track - change \
+course if it wasn't, and don't repeat steps that already failed.]"""
+
+HESITATION_NUDGE = """[Conductor: you sound unsure ({signals}). Don't guess. If you're missing \
+knowledge, call consult_expert with a clear question; if this is beyond you, call escalate and \
+let a stronger model take it from here.]"""
+
 CONDUCT_MODE = """
 # You are conducting this request
 This request needs several kinds of work, so you're the conductor: you don't do every part \

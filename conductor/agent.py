@@ -83,6 +83,7 @@ class Conductor:
         self.server_url: str | None = None    # set by the web server; Claude Code's safety hook calls it
         self.compressor = Compressor(settings.headroom, settings.workspace)
         self._hr_proxy_failed = False         # Claude Code through Headroom's proxy didn't work: go direct
+        self._cli_failed: set[str] = set()   # tasks Claude Code couldn't take this run (reason shown once)
         self.hr_proxy = HeadroomProxy(settings.headroom_proxy, settings.data_dir / "logs")
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
@@ -296,6 +297,7 @@ class Conductor:
     # ------------------------------------------------------------------ the loop
     async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None,
                   effort: str | None = None, announce: bool = True) -> str:
+        self._cli_failed.discard(task_id)  # each run gets a fresh chance at the Claude Code fallback
         token = CURRENT_TASK.set(task_id)  # so side calls (supervisor, safety judge) are logged against it
         try:
             return await self._run(task_id, prompt, depth, route, effort, announce)
@@ -361,7 +363,13 @@ class Conductor:
 
                 byok_only: list[str] = []
                 if model.provider == "openrouter":
-                    model = await self._credit_check(task_id, model)
+                    model, cli_why = await self._credit_check(task_id, model, hands_off)
+                    if cli_why:  # credits are short and Claude Code (your subscription) can take this
+                        ans = await self._run_via_cli(task_id, messages, hands_off, cli_why)
+                        if ans is not None:
+                            answer = ans
+                            break
+                        continue  # it couldn't (the reason is shown); the next check falls back as before
                     byok_only = self._byok_only(model)
                     if task_id in self._byok_note_pending:
                         self._byok_note_pending.discard(task_id)
@@ -405,6 +413,11 @@ class Conductor:
                                 answer = ans
                                 break
                             await self._pause_for_credits(task_id, ce, need=need)
+                    elif model.is_claude and self._cli_ready(task_id) and (ans := await self._run_via_cli(
+                            task_id, messages, hands_off, "OpenRouter keeps saying your balance can't cover more "
+                            "requests right now.")) is not None:
+                        answer = ans
+                        break
                     else:  # in-flight budget still full after retries: a short breather, not a pause
                         await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
                         await asyncio.sleep(30)
@@ -768,9 +781,11 @@ class Conductor:
         roster = [m.id for m in self.catalog.roster() if m.provider == "openrouter"]
         self._account_refresh = asyncio.create_task(self.account.refresh(roster, force=True))
 
-    async def _credit_check(self, task_id: str, model):
-        """Cheap (cached) look at the balance before a step: warn once when low; when out, move to a
-        model your own provider keys cover, or pause. Returns the model to run this step on."""
+    async def _credit_check(self, task_id: str, model, hands_off: bool = False):
+        """Cheap (cached) look at the balance before a step. Warns once when low. When credits are short
+        and Claude Code can take the task, says so (a Claude specialist moves when credits are low; a
+        composer, or any other model, only once they're out). Otherwise, when out: move to a model your
+        own keys cover, or pause. Returns (model to run this step on, reason to use Claude Code or None)."""
         self.refresh_account()
         st = await self.credits.check()
         root = self._root(task_id)["id"]
@@ -780,11 +795,35 @@ class Conductor:
                                                   "threshold": st["low_threshold"], "top_up_url": st["top_up_url"],
                                                   "byok": [b.get("provider") for b in self.account.byok_keys()]
                                                   if self.account.has_byok else []})
-        if st["level"] == "out":
+        level = st["level"]
+        cli = self._cli_ready(task_id)
+        if cli and model.is_claude and (level == "out" or (level == "low" and not hands_off)):
+            have = f" (${st['available']:.2f} left)" if st.get("available") is not None else ""
+            return model, ("OpenRouter credits are used up." if level == "out"
+                           else f"OpenRouter credits are low{have}, so this saves them.")
+        if level == "out":
             reason = f"Credits are used up ({st['source']})."
             if not await self._switch_to_byok(task_id, reason):
+                if cli:
+                    return model, "OpenRouter credits are used up."
+                await self._explain_no_cli(task_id)
                 await self._pause_for_credits(task_id, CreditError("out", reason))
-        return self.catalog.get(self.store.get_task(task_id).get("model") or model.id)
+        return self.catalog.get(self.store.get_task(task_id).get("model") or model.id), None
+
+    async def _explain_no_cli(self, task_id: str) -> None:
+        """Say (once per task run) why the Claude Code fallback isn't taking over."""
+        if task_id in self._cli_failed:
+            return
+        self._cli_failed.add(task_id)
+        why = ("it's turned off (CONDUCTOR_CLAUDE_CLI=off)" if self.cli.mode == "off"
+               else "the `claude` command isn't visible to the Conductor process (start Conductor from a shell "
+                    "where `claude` works, or set CONDUCTOR_CLAUDE_PATH)" if not self.cli.exe
+               else "your Claude subscription's usage limit was reached recently")
+        await self.emit(self._root(task_id)["id"], "status", {"text": f"Couldn't hand this to Claude Code: {why}."})
+
+    def _cli_ready(self, task_id: str) -> bool:
+        return (self.cli.available and time.time() >= self._cli_limited_until
+                and task_id not in self._cli_failed)
 
     async def _switch_after_errors(self, task_id: str, model, err: Exception) -> bool:
         """The provider kept failing even after retries: carry on with the next-best model instead of dying."""
@@ -860,7 +899,7 @@ class Conductor:
 
     # ------------------------------------------------------------------ Claude Code (your subscription)
     def _wants_cli(self, task_id: str, model, hands_off: bool) -> bool:
-        if not self.cli.available or time.time() < self._cli_limited_until:
+        if not self._cli_ready(task_id):
             return False
         route = self.store.get_task(task_id).get("route") or {}
         if hands_off:  # a composer only stays on Claude Code while credits are still short
@@ -909,7 +948,9 @@ class Conductor:
 
     async def _run_via_cli(self, task_id: str, messages: list[dict], hands_off: bool, reason: str) -> str | None:
         """Hand this task to Claude Code on the user's subscription. Returns its answer, or None if it can't."""
-        if not self.cli.available or time.time() < self._cli_limited_until:
+        if not self.cli.available or time.time() < self._cli_limited_until or task_id in self._cli_failed:
+            if reason:
+                await self._explain_no_cli(task_id)
             return None
         task = self.store.get_task(task_id)
         route = dict(task.get("route") or {})
@@ -970,6 +1011,8 @@ class Conductor:
                          headroom_proxy=bool(base and not self._hr_proxy_failed),
                          ok=not res.is_error, turns=res.turns, ms=int((time.time() - started) * 1000),
                          error=res.error or None, cost_usd=0.0)
+        if res.limited or (res.is_error and not res.text):
+            self._cli_failed.add(task_id)  # don't keep retrying it this run; fall back as before
         if res.limited:
             self._cli_limited_until = time.time() + 30 * 60
             await self.emit(self._root(task_id)["id"], "status", {

@@ -340,9 +340,10 @@ re-checked every 6 hours.
 If the [Claude Code](https://code.claude.com) CLI is installed and signed in with your Claude account,
 Conductor can hand work to it, and that runs on your subscription instead of OpenRouter credits.
 
-- **When** (`CONDUCTOR_CLAUDE_CLI=fallback`, the default): a Claude task that can't continue on OpenRouter
-  (credits out, a step too big for the balance, the provider failing) continues on Claude Code instead
-  of pausing. Other models try your BYOK keys or a cheaper model first, and use Claude Code as the last
+- **When** (`CONDUCTOR_CLAUDE_CLI=fallback`, the default): a Claude specialist moves to Claude Code as soon
+  as credits are **low** (before spending more), and any Claude task moves when OpenRouter can't run it
+  (credits out, a step too big for the balance, "too many requests in flight", the provider failing),
+  instead of pausing. Other models try your BYOK keys or a cheaper model first, and use Claude Code as the last
   step before pausing. A composer that runs out of credits hands the rest of the request to Claude Code,
   which finishes it alone, without hiring other models.
 - **`prefer`**: Claude specialists run on Claude Code from the start, to save credits. **`off`**: never.
@@ -354,6 +355,9 @@ Conductor can hand work to it, and that runs on your subscription instead of Ope
 - **Billing**: Conductor removes `ANTHROPIC_API_KEY` from Claude Code's environment and doesn't use
   `--bare`, so it runs on your subscription login, not an API account. Your plan's usage limits apply:
   if you hit one, Conductor stops using Claude Code for 30 minutes and falls back to pausing.
+- If it can't take over (the CLI isn't found, a usage limit, an error), the task says why before pausing.
+  Conductor looks for `claude` on PATH and in the usual install spots (npm, nvm, `~/.local/bin`), so it
+  works from a background service too; `CONDUCTOR_CLAUDE_PATH` overrides.
 - `conductor doctor` shows whether it found the CLI. It's the CLI's documented headless mode
   (`claude -p`) running on your own machine for your own work.
 

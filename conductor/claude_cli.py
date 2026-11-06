@@ -35,9 +35,20 @@ LIMIT_RX = re.compile(r"(usage limit|limit reached|rate limit|out of (extra )?us
 
 
 def find(path: str = "") -> str | None:
-    return shutil.which(path or "claude") or next(
-        (p for p in (os.path.expanduser("~/.claude/local/claude"), os.path.expanduser("~/.local/bin/claude"))
-         if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    """The `claude` CLI: PATH first, then where installers usually put it (a background service often
+    runs with a bare PATH that misses npm / nvm / ~/.local installs)."""
+    import glob
+    if path:
+        return path if os.path.isfile(path) and os.access(path, os.X_OK) else shutil.which(path)
+    hit = shutil.which("claude")
+    if hit:
+        return hit
+    home = os.path.expanduser("~")
+    candidates = [f"{home}/.claude/local/claude", f"{home}/.local/bin/claude", f"{home}/.npm-global/bin/claude",
+                  f"{home}/.bun/bin/claude", "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
+    candidates += sorted(glob.glob(f"{home}/.nvm/versions/node/*/bin/claude"), reverse=True)
+    candidates += sorted(glob.glob("/opt/node*/bin/claude"), reverse=True)
+    return next((p for p in candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
 
 
 def model_alias(model_id: str, difficulty: str = "medium") -> str:

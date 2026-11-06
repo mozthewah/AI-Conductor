@@ -199,3 +199,76 @@ async def test_headroom_proxy_used_when_it_works(tmp_path, monkeypatch):
     tid = c.start_task("build the thing")
     await asyncio.wait_for(c.wait(tid), 10)
     assert [x["base_url"] for x in calls(log)] == ["http://127.0.0.1:8787"]
+
+
+# ---------------------------------------------------------------- credits already known to be short
+def short(c, level):
+    c.credits.state.update({"available": 0.0 if level == "out" else 1.0, "out": level == "out",
+                            "checked": 9e18, "source": "account balance"})
+
+
+async def test_low_credits_move_a_claude_specialist_before_spending_more(tmp_path, monkeypatch):
+    log = install_fake(tmp_path, monkeypatch)
+    llm = FakeLLM([[text("should not run on OpenRouter")]], label=L())
+    c = make(tmp_path, llm)
+    short(c, "low")
+    tid = c.start_task("build the thing")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert c.store.get_task(tid)["answer"] == "Done via Claude Code."
+    assert llm.calls == [] and len(calls(log)) == 1
+    esc = [e["data"] for e in c.store.load_events(tid) if e["type"] == "escalated"][-1]
+    assert "credits are low" in esc["reason"]
+
+
+async def test_known_out_moves_to_claude_code_instead_of_pausing(tmp_path, monkeypatch):
+    install_fake(tmp_path, monkeypatch)
+    llm = FakeLLM([[text("nope")]], label=L())
+    c = make(tmp_path, llm)
+    short(c, "out")
+    tid = c.start_task("build the thing")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert c.store.get_task(tid)["answer"] == "Done via Claude Code." and llm.calls == []
+    assert not any(e["type"] == "paused" for e in c.store.load_events(tid))
+
+
+async def test_low_credits_keep_a_composer_on_openrouter(tmp_path, monkeypatch):
+    log = install_fake(tmp_path, monkeypatch)
+    llm = FakeLLM([[text("composed on OpenRouter")]], label=L(difficulty="hard"))
+    c = make(tmp_path, llm)
+    short(c, "low")
+    tid = c.start_task("design and build the whole app")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert c.store.get_task(tid)["answer"] == "composed on OpenRouter" and calls(log) == []
+
+
+async def test_says_why_when_claude_code_cant_take_it(tmp_path, monkeypatch):
+    c = make(tmp_path, FakeLLM([[text("x")]], label=L()))  # no `claude` found (conftest)
+    short(c, "out")
+    tid = c.start_task("build the thing")
+    q = c.subscribe(tid)
+    seen = []
+    while True:
+        ev = await asyncio.wait_for(q.get(), 10)
+        seen.append(ev)
+        if ev["type"] == "paused":
+            break
+    c.credits.resume_now()
+    assert not c.cli.available
+    said = [e["data"]["text"] for e in seen if e["type"] == "status" and "Claude Code" in e["data"].get("text", "")]
+    assert said and "isn't visible to the Conductor process" in said[0]
+    for t in list(c._running.values()):
+        t.cancel()
+
+
+class InFlight(FakeLLM):
+    async def turn(self, **kw):
+        self.calls.append({"model": kw["model"].id})
+        raise CreditError("in_flight", "Too many requests in flight for your balance", 10.0)
+
+
+async def test_in_flight_stalls_move_a_claude_task_to_claude_code(tmp_path, monkeypatch):
+    install_fake(tmp_path, monkeypatch)
+    c = make(tmp_path, InFlight([], label=L()))
+    tid = c.start_task("build the thing")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert c.store.get_task(tid)["answer"] == "Done via Claude Code." and len(c.llm.calls) == 1

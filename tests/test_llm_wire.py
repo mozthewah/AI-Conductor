@@ -171,3 +171,61 @@ async def test_structured_without_schema_support_parses_loose_json():
                                system="s", prompt="p", schema={"type": "object"})
     assert out == {"category": "coding"}
     assert "output_config" not in seen[0]["body"] and "JSON" in seen[0]["body"]["messages"][0]["content"]
+
+
+async def test_openrouter_history_with_unsendable_blocks_is_translated():
+    """OpenRouter returns web-fetch result blocks that it rejects as input; send them back as text."""
+    seen = []
+    model = ModelInfo("deepseek/deepseek-v4.1-flash", "openrouter", "Flash", 0.04, 0.5, tier="fast")
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k", http_client=mock(sse(OR_STREAM), seen))
+    history = [
+        {"role": "user", "content": [{"type": "text", "text": "what is impeccable.style?"}]},
+        {"role": "assistant", "model": model.id, "content": [
+            {"type": "thinking", "thinking": "let me fetch", "signature": "sig"},
+            {"type": "server_tool_use", "id": "srv_1", "name": "web_fetch", "input": {"url": "https://impeccable.style"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srv_1", "content": {
+                "type": "web_fetch_result", "url": "https://impeccable.style",
+                "content": {"type": "document", "title": "Impeccable",
+                            "source": {"type": "text", "data": "Design skills and anti-pattern detection for AI agents"}}}},
+            {"type": "server_tool_use", "id": "srv_2", "name": "web_search", "input": {"query": "impeccable"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srv_2",
+             "content": [{"type": "web_search_result", "title": "Impeccable", "url": "https://impeccable.style"}]},
+            {"type": "mystery_new_block", "payload": {"text": "keep me"}},
+            {"type": "text", "text": "It's a design tool."},
+        ]},
+        {"role": "user", "content": [{"type": "text", "text": "thanks, now review my UI"}]},
+    ]
+    await collect(llm, model, messages=history)
+    sent = seen[0]["body"]["messages"][1]["content"]
+    types = [b["type"] for b in sent]
+    assert set(types) <= {"thinking", "server_tool_use", "web_search_tool_result", "text"}
+    assert types[0] == "thinking" and sent[0]["signature"] == "sig"  # untouched
+    assert types[1] == "text" and "web_fetch" in sent[1]["text"]  # orphaned call -> text
+    assert "anti-pattern detection" in sent[2]["text"]  # fetched page text survives
+    assert types[3:5] == ["server_tool_use", "web_search_tool_result"]  # accepted pair kept as-is
+    assert "keep me" in sent[5]["text"]
+
+
+async def test_rejected_history_is_retried_in_plain_form():
+    calls = []
+
+    def handler(request: httpx2.Request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx2.Response(400, json={"type": "error", "error": {
+                "type": "invalid_request_error", "message": "Invalid Anthropic Messages API request"},
+                "metadata": {"raw": "path: messages.1.content"}})
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=sse(OR_STREAM))
+
+    model = ModelInfo("x/y", "openrouter", "Y", tier="fast")
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k",
+                      http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+    history = [{"role": "user", "content": "hi"},
+               {"role": "assistant", "model": "x/y", "content": [
+                   {"type": "thinking", "thinking": "t", "signature": "s"}, {"type": "text", "text": "hello"}]},
+               {"role": "user", "content": "again"}]
+    out, events = await collect(llm, model, messages=history)
+    assert out["stop_reason"] == "end_turn" and len(calls) == 2
+    assert [b["type"] for b in calls[1]["messages"][1]["content"]] == ["text"]  # thinking dropped on retry
+    assert any(k == "status" and "simplified" in d["text"] for k, d in events)

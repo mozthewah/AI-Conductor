@@ -102,9 +102,18 @@ class MessagesLLM:
         client = self._client(model)
         kw = self._request(model, system, messages, tools, effort, web, session_id)
         retries = 0
+        plain = False
         while True:
             try:
                 return await self._stream(client, model, kw, on_event)
+            except anthropic.BadRequestError as e:
+                # If the provider rejects the shape of our history (not the request itself),
+                # retry once with a plain-text version of earlier turns rather than failing the task.
+                if plain or model.provider != "openrouter" or "messages" not in str(e.body or e.message):
+                    raise
+                plain = True
+                kw["messages"] = adapt_messages(messages, model, plain=True)
+                await on_event("status", {"text": "The provider rejected part of the history; retrying with a simplified copy."})
             except ValueError:
                 # Tool-input JSON that couldn't be parsed at all. It broke before the
                 # tool_use block completed, so there's nothing to answer; re-issue the turn.
@@ -260,7 +269,7 @@ class Accumulator:
                 await self.on_event("status", {"text": "Switched to a fallback model for this step."})
 
 
-def adapt_messages(messages: list[dict], model: ModelInfo) -> list[dict]:
+def adapt_messages(messages: list[dict], model: ModelInfo, plain: bool = False) -> list[dict]:
     """Per-model view of the stored transcript.
 
     Deterministic for a given model, so its prefix stays cache-stable and append-only.
@@ -272,11 +281,75 @@ def adapt_messages(messages: list[dict], model: ModelInfo) -> list[dict]:
     for m in messages:
         content = m["content"]
         if isinstance(content, list):
-            if m["role"] == "assistant" and m.get("model") and m["model"] != model.id:
+            if m["role"] == "assistant" and (plain or (m.get("model") and m["model"] != model.id)):
                 content = _foreign_turn(content)
             if not model.vision:
                 content = [_strip_images(b) for b in content]
+            if model.provider == "openrouter":
+                content = sanitize_for_openrouter(content)
         out.append({"role": m["role"], "content": content})
+    return out
+
+
+# Block types OpenRouter's Messages endpoint accepts as *input*. Its responses can include
+# others (e.g. web-fetch results) that it then rejects when sent back, so we translate those.
+OPENROUTER_INPUT_BLOCKS = {
+    "text", "image", "document", "tool_use", "tool_result", "thinking", "redacted_thinking",
+    "server_tool_use", "web_search_tool_result", "search_result", "compaction", "advisor_tool_result",
+    "tool_addition", "tool_removal", "openrouter_shell_tool_result", "openrouter_bash_tool_result",
+    "openrouter_tool_search_result",
+}
+
+
+def _collect_text(node, out: list[str], budget: int = 6000) -> None:
+    """Pull readable text (titles, urls, page text) out of a provider-specific result block."""
+    if sum(len(x) for x in out) >= budget:
+        return
+    if isinstance(node, str):
+        out.append(node)
+    elif isinstance(node, dict):
+        for key in ("title", "url", "text", "data", "content", "source", "result", "results", "error_code"):
+            if key in node and key not in ("type",):
+                v = node[key]
+                if key in ("title", "url", "error_code") and isinstance(v, str):
+                    out.append(f"{key}: {v}")
+                else:
+                    _collect_text(v, out, budget)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_text(item, out, budget)
+
+
+def _as_text(block: dict) -> dict:
+    t = block.get("type", "block")
+    if t.endswith("tool_use"):
+        body = f"[{block.get('name', t)} call: {json.dumps(block.get('input', {}))[:500]}]"
+    else:
+        parts: list[str] = []
+        _collect_text(block.get("content", block), parts)
+        text = "\n".join(p for p in parts if p.strip())
+        if not text:  # unfamiliar shape: keep a compact copy rather than dropping it
+            text = json.dumps({k: v for k, v in block.items() if k != "type"}, ensure_ascii=False)[:2000]
+        if len(text) > 6000:
+            text = text[:6000] + "\n... [truncated]"
+        body = f"[{t.replace('_', ' ')}]\n{text}" if text else f"[{t.replace('_', ' ')}]"
+    return {"type": "text", "text": body}
+
+
+def sanitize_for_openrouter(content: list[dict]) -> list[dict]:
+    """Turn blocks OpenRouter won't accept back into plain text (keeping what they said).
+    A server_tool_use whose result can't be sent is converted too, so no call is left unanswered."""
+    bad_ids = {b.get("tool_use_id") for b in content
+               if isinstance(b, dict) and b.get("type") not in OPENROUTER_INPUT_BLOCKS and b.get("tool_use_id")}
+    out = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        ok = t in OPENROUTER_INPUT_BLOCKS and not (t == "server_tool_use" and b.get("id") in bad_ids)
+        out.append(b if ok else _as_text(b))
+    if not out:
+        out = [{"type": "text", "text": "(no content)"}]
     return out
 
 

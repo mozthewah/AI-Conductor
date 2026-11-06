@@ -54,7 +54,8 @@ def update() -> dict:
         return {"ok": True, "updated": False, "log": log or "Already up to date."}
     changed = _git("diff", "--name-only", before, after).stdout.split()
     if "pyproject.toml" in changed:  # new or changed dependencies
-        extras = "[browser]" if _has_playwright() else ""
+        have = [name for name, mod in (("browser", "playwright"), ("headroom", "headroom")) if _importable(mod)]
+        extras = f"[{','.join(have)}]" if have else ""  # keep the optional extras you already have
         pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", f"{REPO}{extras}"],
                              capture_output=True, text=True, timeout=600)
         log += "\n\n$ pip install -e .\n" + (pip.stdout + pip.stderr).strip()
@@ -64,12 +65,9 @@ def update() -> dict:
     return {"ok": True, "updated": True, "from": before[:7], "to": after[:7], "log": log, "files": changed[:40]}
 
 
-def _has_playwright() -> bool:
-    try:
-        import playwright  # noqa: F401
-        return True
-    except ImportError:
-        return False
+def _importable(module: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(module) is not None
 
 
 def restart() -> None:

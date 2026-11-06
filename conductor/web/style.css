@@ -359,3 +359,14 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
   .page { padding: 60px 16px 40px; }
   .home { padding-top: 14vh; }
 }
+
+/* BYOK */
+.card.byok-switch { border-color: var(--good); background: var(--sunk); box-shadow: none; }
+.card.byok-switch .title svg { color: var(--good); }
+.chip-byok, .chip-blocked { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; border-radius: 6px; padding: 1px 7px; margin-right: 6px; }
+.chip-byok { color: var(--good); background: var(--sunk); border: 1px solid var(--line); }
+.chip-byok svg { width: 12px; height: 12px; }
+.chip-blocked { color: var(--bad, #c55); background: var(--sunk); border: 1px solid var(--line); }
+.account .card { margin-bottom: 8px; }
+.account .card .title .grow { flex: 1; }
+.account .meta { margin: 4px 0 8px; }

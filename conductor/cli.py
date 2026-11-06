@@ -176,6 +176,37 @@ def doctor(args) -> None:
             print(f"      no benchmark data for {mid} (it'll be judged by its price tier until it has results)")
     else:
         bad(f"Benchmarks unavailable: {st['error']}")
+    if s.openrouter_management_key:
+        from .account import Account
+        acct = Account(s.data_dir, key=s.openrouter_key, management_key=s.openrouter_management_key, mode=s.byok)
+        acct.note_catalog(cat)
+        acct.refresh_sync([m.id for m in roster if m.provider == "openrouter"], force=True)
+        summ = acct.summary(cat)
+        for what, why in summ["errors"].items():
+            bad(f"Management key: couldn't read {what}: {why}")
+        k = summ["key"]
+        (ok if k else bad)(f"Management key sees {summ.get('key_count') or 0} API key(s)"
+                           + (f"; Conductor runs on '{k.get('name') or k.get('label')}'" if k else
+                              "; couldn't match OPENROUTER_API_KEY to one of them"))
+        if summ["byok"]:
+            ok(f"BYOK keys: {', '.join(b['provider'] for b in summ['byok'])}"
+               + (f" (mode {s.byok})" if s.byok != "auto" else ""))
+            covered = summ["byok_covered"]
+            (ok if covered else print)(
+                f"  {'BYOK covers ' + ', '.join(c['name'] for c in covered) if covered else '  no roster model is served by those providers'}")
+            for sug in summ["byok_suggestions"]:
+                print(f"      could add {sug['model']} (your {', '.join(sug['providers'])} key)")
+        else:
+            print(f"  No BYOK provider keys (add them at {summ['byok_settings_url']})")
+        if summ["guardrail"]:
+            g = summ["guardrail"]
+            ok(f"Guardrail on Conductor's key: {g.get('name')}"
+               + (f", ${g['limit_usd']}/{g.get('reset_interval') or 'period'}" if g.get("limit_usd") else ""))
+            for b in summ["guardrail_blocked"]:
+                if b["model"] in {m.id for m in roster}:
+                    bad(f"Roster model {b['model']} is blocked by it ({b['why']}); the router will skip it")
+    else:
+        print("  OPENROUTER_MANAGEMENT_KEY not set (optional: balance, BYOK, guardrails, 30-day spend)")
     if s.browser:
         try:
             from .tools.browser import BrowserPool

@@ -65,6 +65,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         state["c"].audit.write("system.start", "system", model=s.model, approval=state["c"].policy.threshold,
                                compose=s.compose, budget=s.router_budget, port=s.port, workspace=str(s.workspace),
                                providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key})
+        state["c"].refresh_account()  # BYOK keys, guardrails, activity (background; cached 30 min)
         sched = asyncio.create_task(scheduler.run_forever(state["c"])) if run_scheduler else None
         yield
         if sched:
@@ -81,7 +82,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         return state["c"]
 
     # Routine polling the page does every few seconds; logging it would bury everything else.
-    quiet_gets = re.compile(r"^/api/(tasks|tasks/[\w-]+|credits|config|models|leaderboard|safety|schedules|skills|memories|files)$")
+    quiet_gets = re.compile(r"^/api/(tasks|tasks/[\w-]+|credits|account|config|models|leaderboard|safety|schedules|skills|memories|files)$")
 
     @app.middleware("http")
     async def audit_requests(request: Request, call_next):
@@ -213,7 +214,20 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
 
     @app.get("/api/credits")
     async def credits():
-        return await c().credits.check()
+        st = await c().credits.check()
+        acct = c().account
+        return {**st, "byok": [b.get("provider") for b in acct.byok_keys()] if acct.has_byok else []}
+
+    @app.get("/api/account")
+    async def account():
+        """What the management key shows: BYOK keys and coverage, the key's guardrail, 30-day spend."""
+        return c().account.summary(c().catalog)
+
+    @app.post("/api/account/refresh")
+    async def account_refresh():
+        roster = [m.id for m in c().catalog.roster() if m.provider == "openrouter"]
+        await c().account.refresh(roster, force=True)
+        return c().account.summary(c().catalog)
 
     @app.post("/api/tasks/{task_id}/resume")
     async def resume(task_id: str):
@@ -263,7 +277,9 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     def models():
         overall = {r["model"]: r for r in c().store.model_stats()}
         return {
-            "roster": [{**m.to_dict(), "stats": overall.get(m.id), "benchmarks": c().benchmarks.summary(m.id)}
+            "roster": [{**m.to_dict(), "stats": overall.get(m.id), "benchmarks": c().benchmarks.summary(m.id),
+                        "byok": c().account.byok_for(m.id, m.canonical) if m.provider == "openrouter" else [],
+                        "blocked": c().account.blocked(m.id, m.canonical) if m.provider == "openrouter" else None}
                        for m in c().catalog.roster()],
             "benchmarks_fetched_at": c().benchmarks.fetched_at,
             "benchmarks": c().benchmarks.status(),

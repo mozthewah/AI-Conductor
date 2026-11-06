@@ -41,7 +41,7 @@ INTERRUPTED_SENTINEL = "This part of the response was interrupted before it fini
 class LLM(Protocol):
     async def turn(self, *, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
                    on_event: OnEvent, effort: str = "high", web: bool = True,
-                   session_id: str | None = None) -> dict: ...
+                   session_id: str | None = None, providers: list[str] | None = None) -> dict: ...
 
     async def structured(self, *, model: ModelInfo, system: str, prompt: str, schema: dict,
                          effort: str = "low") -> dict: ...
@@ -91,7 +91,7 @@ class MessagesLLM:
 
     # ------------------------------------------------------------------ requests
     def _request(self, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
-                 effort: str, web: bool, session_id: str | None) -> dict:
+                 effort: str, web: bool, session_id: str | None, providers: list[str] | None = None) -> dict:
         direct = model.provider == "anthropic"
         kw: dict[str, Any] = {
             "model": model.id,
@@ -118,15 +118,20 @@ class MessagesLLM:
             if model.reasoning:
                 kw["thinking"] = {"type": "adaptive", "display": "updates" if model.is_claude else "summarized"}
                 kw["output_config"] = {"effort": effort}
+            extra: dict[str, Any] = {}
             if session_id:  # sticky provider routing for prompt-cache hits
-                kw["extra_body"] = {"session_id": session_id[:256]}
+                extra["session_id"] = session_id[:256]
+            if providers:  # run only on these providers (your own BYOK keys when credits are out)
+                extra["provider"] = {"only": providers, "allow_fallbacks": False}
+            if extra:
+                kw["extra_body"] = extra
         return kw
 
     async def turn(self, *, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
                    on_event: OnEvent, effort: str = "high", web: bool = True,
-                   session_id: str | None = None) -> dict:
+                   session_id: str | None = None, providers: list[str] | None = None) -> dict:
         client = self._client(model)
-        kw = self._request(model, system, messages, tools, effort, web, session_id)
+        kw = self._request(model, system, messages, tools, effort, web, session_id, providers)
         retries = 0
         plain = False
         waits = 0

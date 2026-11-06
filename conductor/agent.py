@@ -21,6 +21,7 @@ from .config import Settings
 from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
 from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
+from .account import Account
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
@@ -61,6 +62,12 @@ class Conductor:
         self.router = Router(self)
         self.credits = CreditMonitor(key=settings.openrouter_key, management_key=settings.openrouter_management_key,
                                      low=settings.credit_low, fetch=settings.fetch_catalog)
+        self.account = Account(settings.data_dir, key=settings.openrouter_key,
+                               management_key=settings.openrouter_management_key, fetch=settings.fetch_catalog,
+                               mode=settings.byok)
+        self.account.note_catalog(self.catalog)
+        self._account_refresh: asyncio.Task | None = None
+        self._byok_note_pending: set[str] = set()
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
@@ -321,14 +328,20 @@ class Conductor:
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
 
+                byok_only: list[str] = []
                 if model.provider == "openrouter":
-                    await self._credit_check(task_id)
+                    model = await self._credit_check(task_id, model)
+                    byok_only = self._byok_only(model)
+                    if task_id in self._byok_note_pending:
+                        self._byok_note_pending.discard(task_id)
+                        self._handoff_note(task_id, messages)
                 started_call = time.time()
                 try:
                     resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
                                                on_event=on_event, effort=effort,
-                                               web=self.settings.web_tools and not hands_off,
-                                               session_id=task_id)
+                                               # OpenRouter's web tools spend credits, so they're off on BYOK-only steps
+                                               web=self.settings.web_tools and not hands_off and not byok_only,
+                                               session_id=task_id, **({"providers": byok_only} if byok_only else {}))
                     u = resp.get("usage") or {}
                     self.audit.write("model.call", "system", task_id, model=model.id, effort=effort,
                                      stop=resp.get("stop_reason"), tokens_in=u.get("input_tokens"),
@@ -338,7 +351,9 @@ class Conductor:
                     self.audit.write("model.credit_limit", "system", task_id, model=model.id, credit_kind=ce.kind,
                                      error=str(ce), ms=int((time.time() - started_call) * 1000))
                     if ce.kind == "out":
-                        await self._pause_for_credits(task_id, ce)
+                        self.credits.mark_out()
+                        if byok_only or not await self._switch_to_byok(task_id, str(ce)):
+                            await self._pause_for_credits(task_id, ce)
                     else:  # in-flight budget still full after retries: a short breather, not a pause
                         await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
                         await asyncio.sleep(30)
@@ -465,7 +480,7 @@ class Conductor:
     def seat_text(self, model_id: str, skill: str, domain: str) -> str:
         """Tell a model who it is and who it can call up to."""
         me = self.catalog.get(model_id)
-        roster = [m for m in self.catalog.roster() if m.id != model_id]
+        roster = [m for m in self.router.usable_roster() if m.id != model_id]
         if not roster:
             return ""
         roster_ids = [m.id for m in self.catalog.roster()]
@@ -493,7 +508,7 @@ class Conductor:
             skill, domain = "orchestration", "general"
         if skill not in SKILL_SET:
             skill = "other"
-        roster = self.catalog.roster()
+        roster = self.router.usable_roster()
         ids = [m.id for m in roster]
         table = self.router._stats()
         current = task.get("model") or ""
@@ -534,7 +549,7 @@ class Conductor:
             difficulty = "medium"
         current = self.catalog.get(task.get("model") or "")
         escaped = {h.get("from") for h in route.get("escalations") or [] if h.get("direction", "up") == "up"}
-        roster = self.catalog.roster()
+        roster = self.router.usable_roster()
         ids = [m.id for m in roster]
         table = self.router._stats()
         tin, tout = TOKEN_ESTIMATE[difficulty]
@@ -650,16 +665,77 @@ class Conductor:
                                          steer=out.get("steer", "Return to your brief."))
 
     # ------------------------------------------------------------------ credits
-    async def _credit_check(self, task_id: str) -> None:
-        """Cheap (cached) look at the balance before a step: warn once when low, pause if known to be out."""
+    def refresh_account(self, force: bool = False) -> None:
+        """Re-read BYOK keys, guardrails, and activity in the background (cached for 30 minutes)."""
+        if self._account_refresh and not self._account_refresh.done():
+            return
+        if not force and time.time() - self.account.data.get("checked", 0) < 30 * 60:
+            return
+        roster = [m.id for m in self.catalog.roster() if m.provider == "openrouter"]
+        self._account_refresh = asyncio.create_task(self.account.refresh(roster, force=True))
+
+    async def _credit_check(self, task_id: str, model):
+        """Cheap (cached) look at the balance before a step: warn once when low; when out, move to a
+        model your own provider keys cover, or pause. Returns the model to run this step on."""
+        self.refresh_account()
         st = await self.credits.check()
         root = self._root(task_id)["id"]
         if st["level"] == "low" and root not in self._warned_low:
             self._warned_low.add(root)
             await self.emit(root, "credits_low", {"available": st["available"], "source": st["source"],
-                                                  "threshold": st["low_threshold"], "top_up_url": st["top_up_url"]})
+                                                  "threshold": st["low_threshold"], "top_up_url": st["top_up_url"],
+                                                  "byok": [b.get("provider") for b in self.account.byok_keys()]
+                                                  if self.account.has_byok else []})
         if st["level"] == "out":
-            await self._pause_for_credits(task_id, CreditError("out", f"Credits are used up ({st['source']})."))
+            reason = f"Credits are used up ({st['source']})."
+            if not await self._switch_to_byok(task_id, reason):
+                await self._pause_for_credits(task_id, CreditError("out", reason))
+        return self.catalog.get(self.store.get_task(task_id).get("model") or model.id)
+
+    def _byok_only(self, model) -> list[str]:
+        """While credits are out, pin a BYOK-covered model to your own providers (no shared capacity)."""
+        if model.provider != "openrouter" or self.credits.status()["level"] != "out":
+            return []
+        return self.account.byok_for(model.id, model.canonical)
+
+    async def _switch_to_byok(self, task_id: str, reason: str) -> bool:
+        """Credits are out: keep working on a model your own provider keys cover. True if the task can go on."""
+        if not self.account.has_byok:
+            return False
+        task = self.store.get_task(task_id)
+        current = self.catalog.get(task.get("model") or self.settings.fallback_model)
+        if current.provider == "openrouter" and self.account.byok_for(current.id, current.canonical):
+            return True  # already covered: the step reruns pinned to your providers
+        covered = {m.id for m in self.router.usable_roster()
+                   if m.provider == "openrouter" and self.account.byok_for(m.id, m.canonical)}
+        if not covered:
+            return False
+        route = dict(task.get("route") or {})
+        d = self.router.pick(skill=route.get("skill", "other"), domain=route.get("domain", "general"),
+                             difficulty=route.get("difficulty", "medium"), budget=self.settings.part_budget,
+                             only=covered)
+        if d.model not in covered:
+            return False
+        info = self.catalog.get(d.model)
+        providers = self.account.byok_for(info.id, info.canonical)
+        history = list(route.get("escalations") or [])
+        why = (f"{reason.rstrip('.')} - continuing on your own {', '.join(providers)} key (BYOK) "
+               "instead of pausing. Hosted web search/fetch is off until credits are back; use the browser "
+               "tool for lookups.")
+        history.append({"from": current.id, "to": info.id, "reason": why, "by": "credits", "at": time.time(),
+                        "direction": "byok"})
+        route.update({"escalations": history, "model": info.id, "name": info.name or info.id})
+        self.store.update_task(task_id, model=info.id, route=route)
+        self.store.set_run_model(task_id, info.id)
+        payload = {"task_id": task_id, "from": current.id, "from_name": current.name or current.id, "to": info.id,
+                   "name": info.name or info.id, "reason": why, "by": "credits", "direction": "byok",
+                   "providers": providers}
+        await self.emit(task_id, "escalated", payload)
+        root = self._root(task_id)["id"]
+        if root != task_id:
+            await self.emit(root, "escalated", payload)
+        self._byok_note_pending.add(task_id)
+        return True
 
     async def _pause_for_credits(self, task_id: str, err: CreditError) -> None:
         """Out of credits: park this task (and show it on the main task) until credits are back."""

@@ -30,9 +30,9 @@ class FakeLLM:
                                          "skill_name": "", "skill_description": "", "skill_instructions": ""}
         self.structured_calls: list[dict] = []
 
-    async def turn(self, *, system, messages, tools, on_event, effort=None, model=None, web=True, session_id=None):
+    async def turn(self, *, system, messages, tools, on_event, effort=None, model=None, web=True, session_id=None, providers=None):
         self.calls.append({"system": system, "messages": [dict(m) for m in messages], "model": model.id if model else None,
-                           "tools": [t["name"] for t in tools], "effort": effort})
+                           "tools": [t["name"] for t in tools], "effort": effort, "providers": providers, "web": web})
         step = self.script.pop(0)
         if callable(step):
             step = step(messages)

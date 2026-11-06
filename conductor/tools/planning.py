@@ -62,9 +62,23 @@ async def check_credits(ctx: ToolContext, args: dict) -> str:
         balance = "not visible (no management key and no limit on this key)"
     else:
         balance = f"${st['available']:.2f} ({st['source']})"
-    return (f"Credits left: {balance}. Status: {st['level']}. This task has spent about ${spent:.3f} so far."
-            + (" Credits are low: prefer cheaper models and fewer parallel parts, and finish the essentials first."
-               if st["level"] == "low" else ""))
+    out = (f"Credits left: {balance}. Status: {st['level']}. This task has spent about ${spent:.3f} so far."
+           + (" Credits are low: prefer cheaper models and fewer parallel parts, and finish the essentials first."
+              if st["level"] == "low" else ""))
+    acct = c.account
+    if acct.has_byok:
+        covered = [f"{m.name or m.id} ({', '.join(acct.byok_for(m.id, m.canonical))})"
+                   for m in c.router.usable_roster() if m.provider == "openrouter" and acct.byok_for(m.id, m.canonical)]
+        out += (f"\nThe user's own provider keys (BYOK): {', '.join(b.get('provider', '?') for b in acct.byok_keys())}. "
+                + (f"Roster models they cover (cost only a ~5% fee in credits, and keep working if credits run "
+                   f"out): {'; '.join(covered)}. Prefer these for big or wide work when credits are tight."
+                   if covered else "No roster model is served by those providers yet."))
+    g = acct.data.get("guardrail")
+    if g:
+        out += (f"\nA guardrail ('{g.get('name')}') applies to this key"
+                + (f": ${g['limit_usd']} per {g.get('reset_interval') or 'period'} budget" if g.get("limit_usd") else "")
+                + ". Models it blocks are already left out of your options.")
+    return out
 
 
 TOOLS = [
@@ -93,8 +107,9 @@ TOOLS = [
     ),
     Tool(
         name="check_credits",
-        description=("Check how much OpenRouter credit is left and what this task has spent. Look before "
-                     "starting expensive or wide work (many parallel parts, big models)."),
+        description=("Check how much OpenRouter credit is left, what this task has spent, and which models "
+                     "the user's own provider keys (BYOK) cover. Look before starting expensive or wide work "
+                     "(many parallel parts, big models)."),
         properties={}, required=[], handler=check_credits, summarize=lambda a: "Checked credits",
     ),
     Tool(

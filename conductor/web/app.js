@@ -22,6 +22,7 @@ const svg = (d) => {
   return s;
 };
 const ICONS = {
+  key: '<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M17 6l3 3M14 9l2 2"/>',
   send: '<path d="M12 19V5M5 12l7-7 7 7"/>',
   stop: '<rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
@@ -756,6 +757,13 @@ async function showTask(id) {
         break;
       case "escalated": {
         if (d.task_id === id) setModel({ model: d.to, name: d.name, reason: d.reason });
+        if (d.direction === "byok") {
+          addAct(h("div", { class: "card byok-switch" }, h("div", { class: "title" }, icon("key"),
+            "Credits ran out, so this moved to ", h("b", {}, d.name || shortModel(d.to)), ` on your own ${(d.providers || []).join(", ")} key`,
+            d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
+            h("div", { class: "sev-reason" }, "It keeps working on your provider account instead of pausing. Once you add credits, it goes back to normal routing.")), "keep");
+          break;
+        }
         const isDown = d.direction === "down";
         const who = isDown ? (d.reason && d.reason.startsWith("You asked") ? "You handed this" : "Handed this")
           : d.by === "user" ? "You moved this" : d.by === "model" ? "The model asked to hand this" : "Moved this";
@@ -832,7 +840,9 @@ async function showTask(id) {
       case "credits_low":
         addAct(h("div", { class: "card paused" }, h("div", { class: "title" }, icon("clock"),
           `Credits are low: $${(d.available || 0).toFixed(2)} left (${d.source})`),
-          h("div", { class: "sev-reason" }, "It'll lean on cheaper models to stretch them. If they run out, work pauses and resumes once you top up."),
+          h("div", { class: "sev-reason" }, (d.byok && d.byok.length)
+            ? `It'll lean on cheaper models and your own ${d.byok.join(", ")} key(s). If credits run out, work moves to a model your keys cover instead of pausing.`
+            : "It'll lean on cheaper models to stretch them. If they run out, work pauses and resumes once you top up."),
           h("div", { class: "row" }, h("a", { class: "btn", href: d.top_up_url, target: "_blank", rel: "noopener" }, "Add credits"))), "keep");
         break;
       case "steer": {
@@ -1066,7 +1076,10 @@ async function showModels() {
           h("div", { style: "font-weight:600" }, m.name || m.id, h("small", { class: "mono" }, " ", m.id)),
           h("div", { class: "meta" }, `${fmtCost(m.price_in)} in / ${fmtCost(m.price_out)} out per 1M tokens · ${Math.round(m.context / 1000)}k context`,
             m.vision ? " · sees images" : "", m.reasoning ? " · reasons" : "", m.provider === "anthropic" ? " · direct" : " · via OpenRouter"),
-          st ? h("div", { class: "meta" }, `${st.runs} task(s) · 👍 ${st.up || 0} 👎 ${st.down || 0} · avg ${fmtCost(st.avg_cost)} · ${fmtSecs(st.avg_seconds || 0)}`) : null),
+          st ? h("div", { class: "meta" }, `${st.runs} task(s) · 👍 ${st.up || 0} 👎 ${st.down || 0} · avg ${fmtCost(st.avg_cost)} · ${fmtSecs(st.avg_seconds || 0)}`) : null,
+          (m.byok && m.byok.length) || m.blocked ? h("div", { class: "meta" },
+            m.byok && m.byok.length ? h("span", { class: "chip-byok", title: "Served by a provider you have your own key for: costs only a ~5% fee in credits, and keeps working when credits run out" }, icon("key"), ` your ${m.byok.join(", ")} key`) : null,
+            m.blocked ? h("span", { class: "chip-blocked", title: "The router won't pick it" }, `blocked: ${m.blocked}`) : null) : null),
         h("button", { class: "icon-btn", title: "Remove from roster", onclick: async () => { await api(`/api/models/roster/${m.id}`, { method: "DELETE" }); loadRoster(); } }, icon("trash"))));
     }
   };
@@ -1111,6 +1124,12 @@ async function showModels() {
     h("div", { class: "sev-reason" }, bstat.models
       ? `Updated ${ago(bstat.fetched_at)}. These are the router's starting point before it learns from your results.`
       : `Without them every model starts out looking the same, and the router can only guess by price. Error: ${bstat.error} Run \`conductor doctor\` for details.`)) : null;
+  const acctEl = h("div");
+  const loadAccount = async (refresh) => {
+    let a;
+    try { a = await api(refresh ? "/api/account/refresh" : "/api/account", refresh ? { method: "POST" } : {}); } catch { return; }
+    acctEl.replaceChildren(accountView(a, async (id) => { await api("/api/models/roster", { method: "POST", body: { model: id } }); loadRoster(); loadAccount(); }, () => loadAccount(true)));
+  };
   page("Models", "The roster the router picks from, and how each model has done on your tasks. Prices refresh from OpenRouter daily.", benchLine,
     h("div", { class: "card", style: "margin-bottom:8px" },
       h("div", { class: "title" }, icon("route"), "How routing works"),
@@ -1119,13 +1138,60 @@ async function showModels() {
         `The router then picks the roster model with the best track record on that kind of task for you, weighed against cost (budget: ${cfg.budget || "balanced"}). ` +
         "Thumbs up/down on results teach it, and about 1 in 10 tasks it tries a less-proven model to keep learning. " +
         "Use “Try another model” on any task to compare side by side.")),
+    h("h2", { class: "section" }, "Your OpenRouter account"), acctEl,
     h("h2", { class: "section" }, "Scoreboard"), lbEl,
     h("h2", { class: "section" }, "Roster"),
     h("div", { class: "toolbar" }, q, h("button", { class: "btn", onclick: async () => {
       if (confirm("Reset the roster to the defaults?")) { await api("/api/models/roster/reset", { method: "POST" }); loadRoster(); }
     } }, "Reset")),
     results, rosterEl);
-  loadRoster(); loadLb();
+  loadRoster(); loadLb(); loadAccount();
+}
+
+const per = (r) => ({ daily: "day", weekly: "week", monthly: "month", yearly: "year" }[r] || r || "period");
+function accountView(a, addModel, refresh) {
+  const wrap = h("div", { class: "account" });
+  const refreshBtn = h("button", { class: "btn", onclick: (e) => { e.target.disabled = true; e.target.textContent = "Checking…"; refresh(); } }, "Refresh");
+  if (!a.has_management_key) {
+    wrap.append(h("div", { class: "card" }, h("div", { class: "title" }, icon("key"), "Add a management key to see more"),
+      h("div", { class: "sev-reason" }, "With OPENROUTER_MANAGEMENT_KEY in .env, Conductor can see your account balance, your own provider keys (BYOK), the guardrail on its key, and 30-day spend per model, and use them when routing.")));
+    return wrap;
+  }
+  const byok = a.byok || [];
+  const covered = a.byok_covered || [];
+  wrap.append(h("div", { class: "card" },
+    h("div", { class: "title" }, icon("key"), byok.length ? `Your own provider keys (BYOK): ${byok.map((b) => b.provider).join(", ")}` : "No BYOK provider keys", h("span", { class: "grow" }), refreshBtn),
+    h("div", { class: "sev-reason" }, byok.length
+      ? (covered.length
+        ? `Covers ${covered.length} roster model(s): ${covered.map((c) => c.name).join(", ")}. Work on these costs only a ~5% fee in OpenRouter credits (billed to your provider instead), and when credits run out, tasks move to them instead of pausing.${a.mode === "prefer" ? " The router favours them (CONDUCTOR_BYOK=prefer)." : " Set CONDUCTOR_BYOK=prefer to favour them all the time."}`
+        : "None of your roster models are served by these providers yet - see suggestions below, or search and add one.")
+      : h("span", {}, "Add your own OpenAI, Anthropic, Google, etc. keys on OpenRouter and Conductor will use them, including when credits run out. ", h("a", { href: a.byok_settings_url, target: "_blank", rel: "noopener" }, "Manage BYOK keys"))),
+    a.byok_disabled && a.byok_disabled.length ? h("div", { class: "meta" }, `Disabled keys (ignored): ${a.byok_disabled.join(", ")}`) : null,
+    ...(a.byok_suggestions || []).map((m) => h("div", { class: "file-row" },
+      h("span", {}, m.name, h("small", { class: "mono" }, " ", m.model)), h("small", {}, `your ${m.providers.join(", ")} key`),
+      h("button", { class: "btn", onclick: () => addModel(m.model) }, "Add to roster")))));
+  const k = a.key;
+  const g = a.guardrail;
+  wrap.append(h("div", { class: "card" }, h("div", { class: "title" }, icon("shield"), "Conductor's API key"),
+    h("div", { class: "sev-reason" }, k
+      ? `${k.name || k.label}: ${fmtCost(k.usage_monthly || 0)} this month${k.byok_usage_monthly ? ` (+ ${fmtCost(k.byok_usage_monthly)} on your own keys)` : ""}` +
+        (k.limit != null ? ` · limit ${fmtCost(k.limit)}${k.limit_reset ? " per " + per(k.limit_reset) : ""}, ${fmtCost(k.limit_remaining || 0)} left` : " · no limit") +
+        (a.key_count ? ` · ${a.key_count} key(s) on the account` : "")
+      : "Couldn't match OPENROUTER_API_KEY to a key on this account."),
+    g ? h("div", { class: "sev-reason" }, `Guardrail “${g.name}”` + (g.limit_usd ? `: ${fmtCost(g.limit_usd)} per ${per(g.reset_interval)}` : "") +
+      (g.allowed_providers ? ` · providers: ${g.allowed_providers.join(", ")}` : "") + (g.allowed_models ? ` · ${g.allowed_models.length} allowed model(s)` : "") +
+      ((a.guardrail_blocked || []).length ? ` · it blocks ${a.guardrail_blocked.length} model(s), which the router skips` : "")) : null));
+  const act = a.activity || [];
+  if (act.length) {
+    wrap.append(h("div", { class: "md" }, h("table", {},
+      h("thead", {}, h("tr", {}, ["Last 30 days", "Credits", "Your keys", "Requests", "Tokens"].map((x) => h("th", {}, x)))),
+      h("tbody", {}, act.map((r) => h("tr", {}, h("td", {}, shortModel(r.model)), h("td", {}, fmtCost(r.usage)),
+        h("td", {}, r.byok_usage ? fmtCost(r.byok_usage) : "–"), h("td", {}, r.requests), h("td", {}, r.tokens.toLocaleString())))))));
+  }
+  const errs = Object.entries(a.errors || {});
+  if (errs.length) wrap.append(h("div", { class: "meta" }, "Couldn't read: " + errs.map(([k2, v]) => `${k2} (${v})`).join("; ")));
+  if (a.checked) wrap.append(h("div", { class: "meta" }, `Checked ${ago(a.checked)}.`));
+  return wrap;
 }
 
 const LEVEL_HELP = {

@@ -148,6 +148,7 @@ class Decision:
     est_cost: float = 0.0
     candidates: list[dict] = field(default_factory=list)
     parts: list[dict] = field(default_factory=list)
+    byok: list[str] = field(default_factory=list)
 
     @property
     def category(self) -> str:  # older name for skill
@@ -223,14 +224,23 @@ class Router:
             b += w * (n - reward)
         return a / (a + b), a, b, exact_n, bench
 
+    def usable_roster(self) -> list[ModelInfo]:
+        """The roster minus models the guardrail on your OpenRouter key would reject."""
+        account = getattr(self.c, "account", None)
+        return [m for m in self.catalog.roster()
+                if not (account and m.provider == "openrouter" and account.blocked(m.id, m.canonical))]
+
     def pick(self, *, skill: str, domain: str, difficulty: str, budget: str, needs_vision: bool = False,
-             exclude: set[str] | None = None, seed: int | None = None) -> Decision:
+             exclude: set[str] | None = None, seed: int | None = None, only: set[str] | None = None) -> Decision:
         settings = self.c.settings
         credits_low = getattr(self.c, "credits", None) is not None and self.c.credits.low
         if credits_low:
             budget = "frugal"  # stretch the remaining credits
-        roster = [m for m in self.catalog.roster() if m.tools and (m.vision or not needs_vision)
-                  and m.id not in (exclude or set())]
+        account = getattr(self.c, "account", None)
+        # Count BYOK work at its credit cost (the 5% fee) when credits matter, or always if you prefer it.
+        byok_pricing = bool(account and account.has_byok and (account.mode == "prefer" or credits_low))
+        roster = [m for m in self.usable_roster() if m.tools and (m.vision or not needs_vision)
+                  and m.id not in (exclude or set()) and (only is None or m.id in only)]
         if not roster:
             return Decision(settings.fallback_model, skill, domain, difficulty,
                             "No roster model fits, so using the default.", "fallback")
@@ -244,9 +254,11 @@ class Router:
             sampled = rng.betavariate(a, b) if explore else quality
             tin, tout = TOKEN_ESTIMATE[difficulty]
             cost = m.cost(tin, tout, cache_read=int(tin * 0.6))
-            penalty = COST_WEIGHT.get(budget, 0.18) * math.log10(1 + cost / 0.005) / 3
+            byok = account.byok_for(m.id, m.canonical) if account and m.provider == "openrouter" else []
+            weighed = account.credit_cost(m.id, cost, m.canonical) if byok_pricing else cost
+            penalty = COST_WEIGHT.get(budget, 0.18) * math.log10(1 + weighed / 0.005) / 3
             scored.append({"model": m.id, "quality": round(quality, 3), "score": round(sampled - penalty, 3),
-                           "est_cost": round(cost, 4), "runs": n,
+                           "est_cost": round(cost, 4), "runs": n, "byok": byok,
                            "benchmark": None if bench is None else round(bench, 2)})
         scored.sort(key=lambda r: r["score"], reverse=True)
         best = scored[0]
@@ -259,10 +271,13 @@ class Router:
                   f"based on {basis} (est. quality {best['quality']:.0%}).")
         if explore:
             reason += " Trying something a bit different this time to keep learning."
+        if best["byok"]:
+            reason += f" Runs on your own {', '.join(best['byok'])} key (BYOK)."
         if credits_low:
-            reason += " (Credits are low, so leaning toward cheaper models.)"
+            reason += (" (Credits are low, so leaning toward cheaper models"
+                       f"{' and your own provider keys' if byok_pricing else ''}.)")
         return Decision(best["model"], skill, domain, difficulty, reason, "explore" if explore else "router",
-                        est_cost=best["est_cost"], candidates=scored[:4])
+                        est_cost=best["est_cost"], candidates=scored[:4], byok=best["byok"])
 
     # ------------------------------------------------------------------ entry points
     async def route(self, prompt: str, *, budget: str | None = None, pinned: str | None = None,

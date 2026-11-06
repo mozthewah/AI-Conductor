@@ -144,6 +144,8 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_LEARNING` | `on` | Reflect after tasks and save memories and skills |
 | `CONDUCTOR_WEB_TOOLS` | `on` | Hosted web search and fetch |
 | `CONDUCTOR_BROWSER` | `on` | Local Chromium browser tool |
+| `OPENROUTER_MANAGEMENT_KEY` | – | Optional, read-only use: balance, BYOK keys, guardrails, 30-day spend (see [The management key](#the-management-key-byok-guardrails-spend)) |
+| `CONDUCTOR_BYOK` | `auto` | `auto`: lean on your own provider keys when credits run low or out; `prefer`: always; `off` |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -286,6 +288,39 @@ Conductor watches your OpenRouter credits and handles running low or out without
     own once credits are back, or right away when you press **Resume**. If it can't see your
     balance, it retries every couple of minutes instead; that's free, since OpenRouter rejects
     unfunded requests before any model runs. Nothing is redone or lost.
+    If you have your own provider keys on OpenRouter (BYOK, below), the task moves to a model they
+    cover and keeps going instead of pausing.
+
+## The management key (BYOK, guardrails, spend)
+
+`OPENROUTER_MANAGEMENT_KEY` is optional. Create one at openrouter.ai/settings/management-keys.
+Conductor only *reads* with it (it never creates, changes, or deletes anything), and uses what it sees:
+
+- **Your own provider keys (BYOK).** Conductor lists the provider keys on your account (OpenAI,
+  Anthropic, Google, ...) and checks which roster models those providers serve. Work on those models
+  costs only OpenRouter's 5% BYOK fee in credits (waived up to a monthly allowance), and the rest
+  is billed to your provider account. So:
+  - `CONDUCTOR_BYOK=auto` (default): routing is normal while credits are fine. When they run **low**,
+    BYOK models count at their credit cost, so the router leans on them. When they run **out**, a
+    task moves to the best BYOK-covered model and keeps working instead of pausing. Those requests
+    are pinned to your providers, and OpenRouter's hosted web search is switched off until credits
+    are back, since it would spend credits.
+  - `prefer`: favour BYOK models all the time. `off`: ignore them.
+  - Disabled keys, and keys restricted to *other* OpenRouter API keys or to other models, are
+    respected.
+  - BYOK-covered models you haven't added to the roster are suggested on the Models page.
+- **Conductor's own key.** It finds which of your API keys it's running on, and shows that key's
+  spend this month (credits and BYOK) and its limit.
+- **Guardrails.** If a guardrail applies to that key, models it would reject (blocked models, or only
+  served by blocked providers) are dropped from routing, escalation, and hand-downs, so nothing is
+  picked only to fail.
+- **30-day activity.** Spend, BYOK spend, requests, and tokens per model, on the Models page.
+- **Account balance** in the sidebar, as before.
+
+All of this shows on the Models page under **Your OpenRouter account** (with a Refresh button), in
+`conductor doctor`, and to the models through `check_credits`. It's cached in `data/account.json` and
+refreshed every 30 minutes. Which providers serve each model is read with your normal key, and
+re-checked every 6 hours.
 
 ## Audit log
 

@@ -204,6 +204,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             "roster": [{**m.to_dict(), "stats": overall.get(m.id), "benchmarks": c().benchmarks.summary(m.id)}
                        for m in c().catalog.roster()],
             "benchmarks_fetched_at": c().benchmarks.fetched_at,
+            "benchmarks": c().benchmarks.status(),
             "catalog_size": len(c().catalog.models), "catalog_fetched_at": c().catalog.fetched_at,
         }
 

@@ -84,6 +84,7 @@ class Benchmarks:
         self.fetch = fetch
         self.signals: dict[str, dict[str, float]] = {}
         self.fetched_at = 0.0
+        self.error = "" if key else "No OpenRouter key, so no benchmark data."
 
     def load(self) -> "Benchmarks":
         cached = None
@@ -105,7 +106,14 @@ class Benchmarks:
                 self.path.write_text(json.dumps({"fetched_at": self.fetched_at, "signals": self.signals}))
                 return self
             except Exception as e:
-                log.warning("couldn't fetch benchmarks (%s); using cache or price-based guesses", e)
+                detail = ""
+                if hasattr(e, "read"):
+                    try:
+                        detail = e.read().decode("utf-8", "replace")[:300]
+                    except Exception:
+                        pass
+                self.error = f"{type(e).__name__}: {e} {detail}".strip()
+                log.warning("couldn't fetch benchmarks (%s); using cache or price-based guesses", self.error)
         if cached:
             self.signals, self.fetched_at = cached["signals"], cached.get("fetched_at", 0)
         return self
@@ -132,6 +140,11 @@ class Benchmarks:
                 total += w * 0.5
             wsum += w
         return total / wsum if wsum and known else None
+
+    def status(self) -> dict:
+        models = {m for sig in self.signals.values() for m in sig}
+        return {"models": len(models), "signals": sorted(self.signals), "fetched_at": self.fetched_at,
+                "error": "" if models else (self.error or "Benchmark feed returned no usable scores.")}
 
     def summary(self, model_id: str) -> dict[str, float]:
         return {sig: round(v[model_id], 1) for sig, v in self.signals.items() if model_id in v}

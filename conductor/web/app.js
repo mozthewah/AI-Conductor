@@ -54,7 +54,7 @@ const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", report_blocked: "x", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", report_blocked: "x", show_user: "eye", processes: "term", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -729,6 +729,32 @@ async function showTask(id) {
         }
         break;
       }
+      case "show": {
+        const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost)/.test(d.href);
+        const card = h("div", { class: "card show" },
+          h("div", { class: "title" }, icon("eye"), d.title || "Have a look"),
+          d.note ? h("div", { class: "sev-reason" }, d.note) : null,
+          d.image ? h("a", { href: d.href, target: "_blank", rel: "noopener" }, h("img", { class: "show-img", src: d.href, alt: d.title || "" })) : null,
+          h("a", { class: "btn primary show-link", href: d.href, target: "_blank", rel: "noopener" },
+            d.image ? "Open full size" : isLocal ? "Open the page" : "Open link"),
+          isLocal ? h("small", { class: "sev-reason" }, `${d.href} - running on the computer Conductor runs on`) : null);
+        addAct(card, "keep");
+        break;
+      }
+      case "server_tool_result": {
+        const chip = v.tools[d.id];
+        if (chip) {
+          chip.classList.toggle("err", !d.ok);
+          chip.label.textContent += d.ok ? ` · ${d.detail}` : ` · failed (${d.detail})`;
+          if (!d.ok) chip.setIcon("x");
+        }
+        break;
+      }
+      case "process":
+        addAct(h("span", { style: "color:var(--ink-3)" }, d.action === "started"
+          ? `Running in the background: ${d.name}${d.urls && d.urls.length ? " · " + d.urls.join(", ") : ""}`
+          : `Stopped background process: ${d.name}`));
+        break;
       case "steer": {
         if (d.task_id !== id) {
           const part = d.part_id && v.parts[d.part_id];
@@ -999,7 +1025,13 @@ async function showModels() {
     }, 250);
   });
   const cfg = state.config || {};
-  page("Models", "The roster the router picks from, and how each model has done on your tasks. Prices refresh from OpenRouter daily.",
+  const bstat = await api("/api/models").then((d) => d.benchmarks).catch(() => null);
+  const benchLine = bstat ? h("div", { class: "card " + (bstat.models ? "" : "bench-bad"), style: "margin-bottom:8px" },
+    h("div", { class: "title" }, icon(bstat.models ? "check" : "x"), bstat.models ? `Benchmarks loaded: ${bstat.models} models (${bstat.signals.join(", ")})` : "Benchmarks aren't loading"),
+    h("div", { class: "sev-reason" }, bstat.models
+      ? `Updated ${ago(bstat.fetched_at)}. These are the router's starting point before it learns from your results.`
+      : `Without them every model starts out looking the same, and the router can only guess by price. Error: ${bstat.error} Run \`conductor doctor\` for details.`)) : null;
+  page("Models", "The roster the router picks from, and how each model has done on your tasks. Prices refresh from OpenRouter daily.", benchLine,
     h("div", { class: "card", style: "margin-bottom:8px" },
       h("div", { class: "title" }, icon("route"), "How routing works"),
       h("div", { style: "font-size:14px;color:var(--ink-2)" },

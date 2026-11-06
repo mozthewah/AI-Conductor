@@ -24,6 +24,8 @@ from .models import Catalog
 from .router import SKILLS, Router
 
 SKILL_SET = set(SKILLS) | {"orchestration"}
+# What a hands-off composer can't do itself: the actual work goes to specialists.
+HANDS_ON_TOOLS = {"run_shell", "write_file", "edit_file", "browser", "processes"}
 HEDGES = re.compile(r"\b(hm+|hmm+|actually|wait|on second thought|let me reconsider|i'?m not (?:sure|certain)|"
                     r"not sure (?:if|whether)|i (?:might|may) be wrong|or maybe|hold on|i don'?t (?:know|recall))\b", re.I)
 from .safety import JUDGE_PROMPT, JUDGE_SCHEMA, JUDGE_SYSTEM, LEVELS, Assessment, Policy
@@ -56,6 +58,7 @@ class Conductor:
         self._escalate_next: dict[str, tuple[str, str, str | None]] = {}  # task -> (reason, by, target)
         self._blocked: dict[str, dict] = {}  # task -> {"what", "needs"} reported by a specialist
         self._inbox: dict[str, list[str]] = {}  # task -> messages the user sent while it was running
+        self.processes: dict[int, dict] = {}  # background processes started by tools
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -88,7 +91,8 @@ class Conductor:
         profile = prompts.bullet(self._profile(), "(nothing yet)")
         if depth > 0:
             return prompts.SUBAGENT.format(today=prompts.today(), profile=profile, role=role or "a focused helper",
-                                           skills=self.skills.index(), workspace=self.settings.workspace)
+                                           skills=self.skills.index(), workspace=self.settings.workspace,
+                                           port=self.settings.port)
         related = self.store.search_memories(prompt, limit=8, exclude_kinds=PROFILE_KINDS)
         shell_note = (f"and browser actions are rated by risk. Up to '{self.policy.threshold}' runs "
                       "immediately; riskier ones wait for the user's OK, so batch those together and prefer "
@@ -96,15 +100,19 @@ class Conductor:
         return prompts.CONDUCTOR.format(
             today=prompts.today(), profile=profile,
             related=prompts.bullet(related, "(none)"), skills=self.skills.index(),
-            workspace=self.settings.workspace, shell_note=shell_note,
+            workspace=self.settings.workspace, shell_note=shell_note, port=self.settings.port,
         )
 
-    def tool_list(self, depth: int) -> list[Tool]:
-        return [t for t in self.tools.values()
-                if not (t.top_level_only and depth > 0) and not (t.delegates and depth >= self.settings.max_depth)]
+    def hands_off(self, task_id: str) -> bool:
+        return bool((self.store.get_task(task_id).get("route") or {}).get("hands_off"))
 
-    def tool_specs(self, depth: int) -> list[dict]:
-        return [t.spec() for t in self.tool_list(depth)]
+    def tool_list(self, depth: int, hands_off: bool = False) -> list[Tool]:
+        return [t for t in self.tools.values()
+                if not (t.top_level_only and depth > 0) and not (t.delegates and depth >= self.settings.max_depth)
+                and not (hands_off and t.name in HANDS_ON_TOOLS)]
+
+    def tool_specs(self, depth: int, hands_off: bool = False) -> list[dict]:
+        return [t.spec() for t in self.tool_list(depth, hands_off)]
 
     # ------------------------------------------------------------------ public API
     def start_task(self, prompt: str, origin: str = "user", model: str | None = None,
@@ -210,11 +218,15 @@ class Conductor:
             decision.reason = "Side-by-side comparison run."
         info = self.catalog.get(decision.model)
         route = {**decision.to_dict(), "name": info.name or info.id, **({"part_id": part["id"]} if part else {})}
+        if decision.mode == "conduct" and task.get("parent_id") is None and not self.settings.composer_hands:
+            route["hands_off"] = True  # decided before the first turn, so the tool list is fixed from the start
         fields: dict[str, Any] = {"model": decision.model, "route": route}
         # Settled before the first model turn, so the system prompt is still unsent.
         system = task["system_prompt"]
         if decision.mode == "conduct" and task.get("parent_id") is None:
             system += prompts.CONDUCT_MODE
+            if route.get("hands_off"):
+                system += prompts.HANDS_OFF
         fields["system_prompt"] = system + self.seat_text(decision.model, decision.skill, decision.domain)
         self.store.update_task(task_id, **fields)
         self.store.start_run(task_id, decision.model, decision.skill, decision.difficulty, decision.by,
@@ -275,7 +287,8 @@ class Conductor:
         system = task["system_prompt"]
 
         ctx = ToolContext(conductor=self, task_id=task_id, depth=depth)
-        specs = self.tool_specs(depth)
+        hands_off = depth == 0 and self.hands_off(task_id)
+        specs = self.tool_specs(depth, hands_off)
         answer = ""
         seen_calls: dict[str, int] = {}
         failing_turns = 0
@@ -297,7 +310,8 @@ class Conductor:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
 
                 resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
-                                           on_event=on_event, effort=effort, web=self.settings.web_tools,
+                                           on_event=on_event, effort=effort,
+                                           web=self.settings.web_tools and not hands_off,
                                            session_id=task_id)
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks, model=model.id)
@@ -609,7 +623,7 @@ class Conductor:
         if truncated:
             return result("Your tool call was cut off at the output limit. Retry with smaller input "
                           "(e.g. write a large file in parts with append).", True)
-        if tool is None or tool not in self.tool_list(ctx.depth):
+        if tool is None or tool not in self.tool_list(ctx.depth, ctx.depth == 0 and self.hands_off(ctx.task_id)):
             return result(f"Unknown tool '{name}'.", True)
         problem = tool.validate(args)
         if problem:
@@ -833,6 +847,13 @@ class Conductor:
         return learned
 
     async def shutdown(self) -> None:
+        import os, signal
+        for p in list(self.processes.values()):
+            try:
+                os.killpg(p["pgid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.processes.clear()
         for t in list(self._running.values()):
             t.cancel()
         if self.browser_pool:

@@ -41,6 +41,7 @@ class Settings:
     conductor_budget: str = "best"    # the model that splits, reviews, and integrates
     explore: float = 0.1             # chance the router tries a less-proven model
     compose: str = "auto"            # auto = compose anything beyond a quick question; always; off = only multi-part
+    composer_hands: bool = False     # False: the composer can't run the shell/edit/browse itself - it must delegate
     max_depth: int = 2               # specialists can hand off sub-parts, up to this many levels
     check_every: int = 4             # supervise specialists every N steps (drift check by a cheap model)
     auto_escalate: bool = True       # move a task to a stronger model when it outgrows/struggles
@@ -63,6 +64,7 @@ class Settings:
     web_tools: bool = True
     browser: bool = True
     fetch_catalog: bool = True
+    port: int = 8765  # Conductor's own web server (tools must not take this port)
 
     @property
     def default_router_model(self) -> str:
@@ -102,6 +104,7 @@ class Settings:
             explore=float(os.environ.get("CONDUCTOR_EXPLORE", cls.explore)),
             auto_escalate=_flag("CONDUCTOR_AUTO_ESCALATE", True),
             compose=os.environ.get("CONDUCTOR_COMPOSE", cls.compose).lower(),
+            composer_hands=_flag("CONDUCTOR_COMPOSER_HANDS", False),
             max_depth=int(os.environ.get("CONDUCTOR_MAX_DEPTH", cls.max_depth)),
             expert_model=os.environ.get("CONDUCTOR_EXPERT_MODEL", cls.expert_model),
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
@@ -116,6 +119,7 @@ class Settings:
             learning=_flag("CONDUCTOR_LEARNING", True),
             web_tools=_flag("CONDUCTOR_WEB_TOOLS", True),
             browser=_flag("CONDUCTOR_BROWSER", True),
+            port=int(os.environ.get("CONDUCTOR_PORT", "8765")),
         )
         s.data_dir = s.data_dir.resolve()
         s.workspace = s.workspace.resolve()

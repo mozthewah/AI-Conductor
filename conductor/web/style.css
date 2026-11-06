@@ -95,6 +95,11 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .stop-btn[hidden] { display: none; }
 .stop-btn svg { width: 14px; height: 14px; }
 .stop-btn:hover { border-color: var(--bad); color: var(--bad); }
+.card.show { border-color: var(--accent); }
+.card.show .title svg { color: var(--accent); }
+.show-img { display: block; max-width: 100%; max-height: 420px; border-radius: 8px; border: 1px solid var(--line); margin: 8px 0; }
+.show-link { display: inline-block; margin-top: 6px; text-decoration: none !important; }
+.card.bench-bad { border-color: var(--warn); background: var(--warn-soft); }
 .card.midtask { border-color: var(--accent); box-shadow: none; }
 .card.midtask .title svg { color: var(--accent); }
 .midtask-text { font: 400 16px/1.4 var(--serif); white-space: pre-wrap; }

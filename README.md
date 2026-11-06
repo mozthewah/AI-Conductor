@@ -67,6 +67,10 @@ model best at it, keeps them on task, and puts the result together.
 Quick questions (chat or easy one-step work) skip the composer and go straight to the best model.
 `CONDUCTOR_COMPOSE=always` composes everything; `off` composes only obviously multi-part requests.
 
+**The composer has no hands.** In a composed task, the composer can plan, assign, review, read files,
+ask you and message you, but it can't run commands, edit files, browse, or search the web. Every
+piece of actual work goes to a specialist. (`CONDUCTOR_COMPOSER_HANDS=on` gives it hands back.)
+
 **Specialists get the same toolbox as the composer,** including handing off sub-parts of their own
 (up to `CONDUCTOR_MAX_DEPTH`, default 2 levels) and asking you questions.
 
@@ -244,6 +248,24 @@ Commands the built-in rules don't recognize are rated by the router's small mode
 reasoning shown. Scheduled runs have their own limit, and anything above it is declined because
 nobody's there to ask. Every automatic decision is logged in the task's activity feed. Change the
 levels and manage remembered rules on the **Safety** page.
+
+## Long-running commands and showing you things
+
+- `run_shell` with `background: true` starts servers and watchers without blocking. It returns the
+  process id, log path, and any local URL it's serving. The `processes` tool lists them, reads
+  their logs, and stops them. Background processes are stopped when Conductor shuts down. A
+  foreground command that leaves something running (`cmd &`) no longer hangs the tool; the
+  leftover is tracked so it can be stopped.
+- Models know Conductor's own port and won't start anything on it.
+- The agent's browser is private, so anything you should see or click (a local page, a mockup, a
+  report) comes to you through `show_user`: a card in the feed with a link, or a preview for images.
+- Web fetches show ✓ with their size, or the error, in the feed.
+
+## Troubleshooting
+
+`conductor doctor` checks your keys (and whether OpenRouter accepts them), the model catalog, the
+benchmark feed, and the browser, and prints the actual errors. The Models page also says
+whether benchmark data loaded. Without it, every model starts out rated the same.
 
 ## Safety notes
 

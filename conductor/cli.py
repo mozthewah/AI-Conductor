@@ -19,6 +19,7 @@ def serve(args) -> None:
 
     from .server import create_app
 
+    os.environ["CONDUCTOR_PORT"] = str(args.port)  # so tools know not to take this port
     print(f"{BOLD}AI Conductor{RESET} -> http://{args.host}:{args.port}")
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning")
 
@@ -129,18 +130,74 @@ def chat(args) -> None:
         print()
 
 
+def doctor(args) -> None:
+    """Check keys, the model catalog, the benchmark feed, and the browser - with the real errors."""
+    import json
+    import urllib.request
+
+    from .benchmarks import Benchmarks
+    from .models import Catalog
+
+    s = Settings.from_env()
+    ok = lambda m: print(f"{GREEN}  ✓ {m}{RESET}")
+    bad = lambda m: print(f"{RED}  ✗ {m}{RESET}")
+    print(f"{BOLD}Conductor doctor{RESET}  (data: {s.data_dir}, workspace: {s.workspace})")
+    (ok if s.openrouter_key else bad)(f"OPENROUTER_API_KEY {'set' if s.openrouter_key else 'missing'}")
+    (ok if s.anthropic_key else print)(f"  ANTHROPIC_API_KEY {'set' if s.anthropic_key else 'not set (optional)'}")
+    if s.openrouter_key:
+        try:
+            req = urllib.request.Request("https://openrouter.ai/api/v1/key",
+                                         headers={"Authorization": f"Bearer {s.openrouter_key}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                info = json.loads(r.read()).get("data", {})
+            ok(f"OpenRouter accepts the key (label: {info.get('label', '?')}, "
+               f"usage ${info.get('usage', 0):.2f}{', limit $' + str(info['limit']) if info.get('limit') else ''})")
+        except Exception as e:
+            bad(f"OpenRouter rejected or couldn't check the key: {e}")
+    s.ensure_dirs()
+    cat = Catalog(s.data_dir, has_openrouter=bool(s.openrouter_key), has_anthropic=s.anthropic_key).load()
+    roster = cat.roster()
+    (ok if roster else bad)(f"Model catalog: {len(cat.models)} models, {len(roster)} in your roster")
+    cache = s.data_dir / "benchmarks.json"
+    if cache.exists():
+        cache.unlink()  # force a fresh fetch so we see the real result
+    b = Benchmarks(s.data_dir, key=s.openrouter_key).load()
+    st = b.status()
+    if st["models"]:
+        covered = [m.id for m in roster if b.summary(m.id)]
+        ok(f"Benchmarks: {st['models']} models across {', '.join(st['signals'])}; "
+           f"{len(covered)}/{len(roster)} roster models covered")
+    else:
+        bad(f"Benchmarks unavailable: {st['error']}")
+    if s.browser:
+        try:
+            from .tools.browser import BrowserPool
+
+            async def check():
+                pool = BrowserPool(s.workspace / ".screens")
+                await pool._ensure()
+                await pool.shutdown()
+            asyncio.run(check())
+            ok("Browser: Chromium launches")
+        except Exception as e:
+            bad(f"Browser: {str(e).splitlines()[0]} (run `playwright install chromium`, or set CONDUCTOR_BROWSER=off)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="conductor", description="Your self-hosted AI conductor.")
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("serve", help="run the web app")
     s.add_argument("--host", default=os.environ.get("CONDUCTOR_HOST", "127.0.0.1"))
     s.add_argument("--port", type=int, default=int(os.environ.get("CONDUCTOR_PORT", "8765")))
+    sub.add_parser("doctor", help="check keys, models, benchmarks, and the browser")
     ch = sub.add_parser("chat", help="chat in the terminal")
     ch.add_argument("--auto", action="store_true", help="auto-approve everything up to high risk (critical still asks)")
     ch.add_argument("prompt", nargs="*")
     args = p.parse_args()
     if args.cmd == "chat":
         chat(args)
+    elif args.cmd == "doctor":
+        doctor(args)
     else:
         if args.cmd is None:
             args.host, args.port = os.environ.get("CONDUCTOR_HOST", "127.0.0.1"), 8765

@@ -255,11 +255,27 @@ class Accumulator:
             if t == "server_tool_use":
                 await self.on_event("server_tool_input", {"id": b.get("id"), "name": b.get("name"),
                                                           "input": b.get("input", {})})
-            elif t and t.endswith("_tool_result") and isinstance(b.get("content"), list):
-                results = [{"title": r.get("title", ""), "url": r.get("url", "")}
-                           for r in b["content"] if isinstance(r, dict) and r.get("url")]
-                if results:
-                    await self.on_event("sources", {"results": results[:8]})
+            elif t and t.endswith("_tool_result"):
+                content = b.get("content")
+                if isinstance(content, list):
+                    results = [{"title": r.get("title", ""), "url": r.get("url", "")}
+                               for r in content if isinstance(r, dict) and r.get("url")]
+                    if results:
+                        await self.on_event("sources", {"results": results[:8]})
+                    await self.on_event("server_tool_result", {"id": b.get("tool_use_id"), "ok": True,
+                                                               "detail": f"{len(results)} results"})
+                elif isinstance(content, dict):
+                    err = content.get("error_code") or content.get("error")
+                    if err:
+                        await self.on_event("server_tool_result", {"id": b.get("tool_use_id"), "ok": False,
+                                                                   "detail": str(err)})
+                    else:
+                        parts: list[str] = []
+                        _collect_text(content, parts, 10**9)
+                        size = sum(len(p) for p in parts)
+                        await self.on_event("server_tool_result", {
+                            "id": b.get("tool_use_id"), "ok": size > 0,
+                            "detail": f"{size:,} characters" if size else "came back empty"})
             elif t == "text":
                 urls = [c for c in b.get("citations") or [] if isinstance(c, dict) and c.get("url")]
                 if urls:

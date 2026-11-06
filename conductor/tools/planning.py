@@ -27,6 +27,32 @@ async def message_user(ctx: ToolContext, args: dict) -> str:
     return "Shown to the user."
 
 
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+
+
+async def show_user(ctx: ToolContext, args: dict) -> str:
+    from pathlib import Path
+    from urllib.parse import quote
+    target = args["target"].strip()
+    if target.startswith(("http://", "https://")):
+        href, is_image, label = target, Path(target.split("?")[0]).suffix.lower() in IMAGE_EXT, target
+    else:
+        root = ctx.settings.workspace.resolve()
+        p = (root / target.removeprefix("file://").lstrip("/")).resolve() if not Path(target).is_absolute() \
+            else Path(target.removeprefix("file://")).resolve()
+        if not p.is_relative_to(root) or not p.exists():
+            raise ToolError(f"No file at {target} in the workspace.")
+        rel = str(p.relative_to(root))
+        href, is_image, label = f"/api/files/raw?path={quote(rel)}", p.suffix.lower() in IMAGE_EXT, rel
+    payload = {"title": args.get("title") or label, "note": args.get("note", ""), "href": href,
+               "image": is_image, "label": label}
+    await ctx.emit("show", payload)
+    root_task = ctx.conductor._root(ctx.task_id)
+    if root_task and root_task["id"] != ctx.task_id:
+        await ctx.conductor.emit(root_task["id"], "show", payload)
+    return f"Shown to the user: {label}"
+
+
 TOOLS = [
     Tool(
         name="update_plan",
@@ -50,6 +76,20 @@ TOOLS = [
         required=["steps"],
         handler=update_plan,
         summarize=lambda a: f"Updated plan ({len(a.get('steps', []))} steps)",
+    ),
+    Tool(
+        name="show_user",
+        description=(
+            "Put something in front of the user: a link they can click (e.g. a local page a tool is serving, "
+            "like http://127.0.0.1:41963/) or a workspace file (images and mockups get a preview). Your "
+            "browser is private - the user never sees it - so anything they need to look at or click must "
+            "go through here."
+        ),
+        properties={"target": {"type": "string", "description": "URL, or a path in the workspace"},
+                    "title": {"type": "string"}, "note": {"type": "string", "description": "What to look at / do"}},
+        required=["target"],
+        handler=show_user,
+        summarize=lambda a: f"Showed you {a.get('title') or a.get('target', '')[:60]}",
     ),
     Tool(
         name="message_user",

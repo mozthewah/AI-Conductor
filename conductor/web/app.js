@@ -134,6 +134,7 @@ function route() {
   if (p === "/schedules") return showSchedules();
   if (p === "/files") return showFiles();
   if (p === "/models") return showModels();
+  if (p === "/safety") return showSafety();
   return showHome();
 }
 
@@ -467,17 +468,23 @@ async function showTask(id) {
       try { await api(`/api/requests/${d.id}`, { method: "POST", body: { approved, text } }); } catch (e) { alert(e.message); }
     };
     if (d.kind === "approval") {
-      card.append(h("div", { class: "title" }, icon("shield"), "Allow this action?"),
+      card.classList.add(`sev-${d.level || "medium"}`);
+      card.append(...[h("div", { class: "title" }, icon("shield"), "Allow this action?",
+          d.level ? h("span", { class: `sev sev-${d.level}` }, d.level) : null),
         h("div", { class: "md" }, h("code", {}, d.summary)),
+        d.reason ? h("div", { class: "sev-reason" }, d.reason) : null,
         h("div", { class: "row" },
-          h("button", { class: "btn primary", onclick: () => resolve(true) }, "Allow"),
-          h("button", { class: "btn", onclick: () => resolve(false) }, "Deny")));
+          h("button", { class: "btn primary", onclick: () => resolve(true) }, "Allow once"),
+          d.remember_key ? h("button", { class: "btn", title: `Auto-allow commands starting “${d.remember_key}” that are ${d.level} risk or lower`,
+            onclick: () => resolve(true, "always") }, `Always allow “${d.remember_key}”`) : null,
+          h("button", { class: "btn", onclick: () => resolve(false) }, "Deny")),
+        d.level === "critical" ? h("div", { class: "sev-reason" }, "Critical actions always ask, whatever your settings.") : null].filter(Boolean));
     } else {
       const input = h("input", { placeholder: "Type your answer…", onkeydown: (e) => { if (e.key === "Enter") resolve(true, input.value); } });
-      card.append(h("div", { class: "title" }, icon("chat"), "Question for you"), md(d.question),
+      card.append(...[h("div", { class: "title" }, icon("chat"), "Question for you"), md(d.question),
         d.options && d.options.length ? h("div", { class: "row" }, d.options.map((o) => h("button", { class: "btn", onclick: () => resolve(true, o) }, o))) : null,
         h("div", { class: "row" }, input, h("button", { class: "btn primary", onclick: () => resolve(true, input.value) }, "Reply"),
-          h("button", { class: "btn", onclick: () => resolve(false) }, "Skip")));
+          h("button", { class: "btn", onclick: () => resolve(false) }, "Skip"))].filter(Boolean));
       setTimeout(() => input.focus(), 50);
     }
     v.requests[d.id] = card;
@@ -625,12 +632,20 @@ async function showTask(id) {
         requestCard(d);
         if (v.replayed) setStatus("waiting");
         break;
+      case "approval": {
+        const el = addAct(h("span", { class: "auto-approval" + (d.allowed ? "" : " denied") }, icon("shield"),
+          h("span", { class: `sev sev-${d.level}` }, d.level), d.allowed ? " Auto-allowed: " : " Declined: ",
+          h("code", {}, d.summary.length > 90 ? d.summary.slice(0, 88) + "…" : d.summary)));
+        el.title = `${d.reason} (${d.why})`;
+        break;
+      }
       case "request_resolved": {
         const card = v.requests[d.id];
         if (card) {
           card.classList.add("resolved");
           card.querySelectorAll(".row").forEach((r) => r.remove());
-          card.append(h("div", { style: "font-size:13px;margin-top:6px" }, d.approved ? (d.text ? `You: ${d.text}` : "Allowed") : "Declined"));
+          card.append(h("div", { style: "font-size:13px;margin-top:6px" },
+            d.approved ? (d.text === "always" ? "Allowed, and remembered for next time" : d.text ? `You: ${d.text}` : "Allowed") : "Declined"));
         }
         if (v.replayed) setStatus("running");
         break;
@@ -882,6 +897,44 @@ async function showModels() {
     } }, "Reset")),
     results, rosterEl);
   loadRoster(); loadLb();
+}
+
+const LEVEL_HELP = {
+  safe: ["Read-only", "ls, cat, git status, opening or reading a web page"],
+  low: ["Small, reversible changes in the workspace", "mkdir, cp, writing a file, git add, clicking a link"],
+  medium: ["Installs, runs code, deletes workspace files", "pip install, python script.py, rm build/, typing into forms"],
+  high: ["Outside the workspace or outward-facing", "sudo, git push, sending data, reading SSH keys, clicking Buy/Send/Delete"],
+  critical: ["Destructive or system-level", "rm -rf ~, formatting disks, curl … | sh. Always asks."],
+};
+
+async function showSafety() {
+  const data = await api("/api/safety");
+  const levelPicker = (name, value, label, hint) => {
+    const wrap = h("div", { class: "card", style: "margin-bottom:12px" }, h("div", { class: "title" }, icon("shield"), label),
+      h("div", { class: "sev-reason", style: "margin-bottom:10px" }, hint));
+    const opts = h("div", { class: "sev-options" });
+    ["safe", "low", "medium", "high"].forEach((lvl) => {
+      const on = lvl === value;
+      opts.append(h("button", { class: "sev-option" + (on ? " on" : ""), onclick: async () => {
+        await api("/api/safety", { method: "PUT", body: { [name]: lvl } }); showSafety();
+      } }, h("span", { class: `sev sev-${lvl}` }, lvl), h("b", {}, `Up to ${lvl}`), h("small", {}, LEVEL_HELP[lvl][0])));
+    });
+    wrap.append(opts);
+    return wrap;
+  };
+  const rules = h("div");
+  if (!data.rules.length) rules.append(h("div", { class: "empty" }, "No remembered rules. Use “Always allow” on an approval prompt to add one."));
+  data.rules.forEach((r, i) => rules.append(h("div", { class: "list-item" }, icon("check"),
+    h("div", { class: "grow" }, h("code", {}, r.key), h("div", { class: "meta" }, `${r.tool === "run_shell" ? "shell" : r.tool} · up to ${r.max_level} risk · added ${ago(r.created)}`)),
+    h("button", { class: "icon-btn", title: "Forget", onclick: async () => { await api(`/api/safety/rules/${i}`, { method: "DELETE" }); showSafety(); } }, icon("trash")))));
+  page("Safety", "Every shell command and browser action is rated by risk. Choose what runs without asking you.",
+    levelPicker("threshold", data.threshold, "While you're around", "Actions up to this level run automatically. Riskier ones wait for your OK."),
+    levelPicker("unattended", data.unattended, "Scheduled runs (nobody to ask)", "Actions above this level are declined, and the task works around them."),
+    h("h2", { class: "section" }, "The levels"),
+    h("div", { class: "md" }, h("table", {}, h("tbody", {}, Object.entries(LEVEL_HELP).map(([lvl, [what, ex]]) =>
+      h("tr", {}, h("td", {}, h("span", { class: `sev sev-${lvl}` }, lvl)), h("td", {}, what), h("td", { style: "white-space:normal;color:var(--ink-2)" }, ex)))))),
+    h("p", { class: "sev-reason" }, "Commands the rules don't recognize are rated by the router's small model, which explains its reasoning. If it can't decide, you're asked."),
+    h("h2", { class: "section" }, "Always-allowed"), rules);
 }
 
 // ------------------------------------------------------------------ boot

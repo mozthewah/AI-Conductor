@@ -257,6 +257,25 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .card.team { padding-bottom: 4px; }
 .dot.queued { background: var(--line); }
 
+/* ---------- safety ---------- */
+.sev { display: inline-block; font: 600 10.5px var(--sans); text-transform: uppercase; letter-spacing: .05em; border-radius: 5px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }
+.sev-safe { background: var(--sunk); color: var(--ink-2); }
+.sev-low { background: var(--accent-soft); color: var(--accent-ink); }
+.sev-medium { background: var(--warn-soft); color: var(--warn); }
+.sev-high { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+.sev-critical { background: var(--bad); color: #fff; }
+.card.request.sev-high, .card.request.sev-critical { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 7%, var(--panel)); }
+.sev-reason { font-size: 13px; color: var(--ink-2); margin-top: 6px; }
+.auto-approval { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--ink-3); flex-wrap: wrap; }
+.auto-approval svg { width: 14px; height: 14px; color: var(--good); }
+.auto-approval.denied svg { color: var(--bad); }
+.auto-approval code { font-size: 12px; }
+.sev-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.sev-option { text-align: left; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+.sev-option .sev { margin-left: 0; align-self: flex-start; }
+.sev-option small { color: var(--ink-3); font-size: 12px; }
+.sev-option.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
 @media (max-width: 1100px) {
   .computer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 20; width: min(400px, 92vw); box-shadow: var(--shadow); }
 }

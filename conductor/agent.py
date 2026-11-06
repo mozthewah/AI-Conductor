@@ -20,6 +20,7 @@ from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, tex
 from .benchmarks import Benchmarks
 from .models import Catalog
 from .router import Router
+from .safety import JUDGE_PROMPT, JUDGE_SCHEMA, JUDGE_SYSTEM, LEVELS, Assessment, Policy
 from .skills import SkillLibrary
 from .store import PROFILE_KINDS, Store, new_id
 from .tools import Tool, ToolContext, ToolError, build_registry, clip
@@ -44,6 +45,8 @@ class Conductor:
         self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
                                      fetch=settings.fetch_catalog).load()
         self.router = Router(self)
+        self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
+        self._judged: dict[str, Assessment] = {}
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -78,8 +81,9 @@ class Conductor:
             return prompts.SUBAGENT.format(today=prompts.today(), profile=profile, role=role or "a focused helper",
                                            skills=self.skills.index(), workspace=self.settings.workspace)
         related = self.store.search_memories(prompt, limit=8, exclude_kinds=PROFILE_KINDS)
-        shell_note = ("run immediately." if self.settings.approval == "auto"
-                      else "need the user's approval each time, so batch related commands together.")
+        shell_note = (f"and browser actions are rated by risk. Up to '{self.policy.threshold}' runs "
+                      "immediately; riskier ones wait for the user's OK, so batch those together and prefer "
+                      "safer equivalents when they exist.")
         return prompts.CONDUCTOR.format(
             today=prompts.today(), profile=profile,
             related=prompts.bullet(related, "(none)"), skills=self.skills.index(),
@@ -432,10 +436,47 @@ class Conductor:
         entry[1].set_result({"approved": approved, "text": text})
         return True
 
-    async def request_approval(self, task_id: str, tool: str, summary: str, args: dict) -> bool:
-        if self.settings.approval == "auto":
-            return True
-        res = await self._wait_for_user(task_id, "approval", {"tool": tool, "summary": summary})
+    async def judge(self, command: str) -> Assessment | None:
+        """Ask the cheap router model to rate a command the rules didn't recognize."""
+        if command in self._judged:
+            return self._judged[command]
+        try:
+            out = await self.llm.structured(
+                model=self.catalog.get(self.settings.default_router_model), system=JUDGE_SYSTEM,
+                prompt=JUDGE_PROMPT.format(workspace=self.settings.workspace, command=command[:4000]),
+                schema=JUDGE_SCHEMA, effort="low")
+        except Exception as e:
+            log.warning("safety judge failed: %s", e)
+            return None
+        if out.get("level") not in LEVELS:
+            return None
+        a = Assessment(out["level"], out.get("reason") or "Rated by the safety model.")
+        self._judged[command] = a
+        return a
+
+    async def request_approval(self, task_id: str, tool: str, summary: str, args: dict,
+                               assessment: Assessment | None = None) -> bool:
+        a = assessment or Assessment("medium", "Unrated action.", sure=False)
+        if not a.sure and tool == "run_shell":
+            judged = await self.judge(args.get("command", ""))
+            if judged:  # the rules' floor still applies if they saw something worse
+                from .safety import rank
+                a = judged if rank(judged.level) >= rank(a.level) or a.level == "medium" else a
+                a = Assessment(a.level, a.reason + " (rated by the safety model)")
+        interactive = self.interactive(task_id)
+        decision, why = self.policy.decide(tool, args, a.level, interactive)
+        target = self._root(task_id)["id"]
+        if decision != "ask":
+            await self.emit(target, "approval", {"tool": tool, "summary": summary, "level": a.level,
+                                                 "reason": a.reason, "allowed": decision == "allow", "why": why,
+                                                 "from_task": task_id})
+            return decision == "allow"
+        from .safety import rule_key
+        res = await self._wait_for_user(task_id, "approval", {
+            "tool": tool, "summary": summary, "level": a.level, "reason": a.reason, "why": why,
+            "remember_key": rule_key(tool, args) if a.level != "critical" else ""})
+        if res and res["approved"] and res.get("text") == "always":
+            self.policy.remember(tool, args, a.level)
         return bool(res and res["approved"])
 
     async def ask_user(self, task_id: str, question: str, options: list[str]) -> str | None:

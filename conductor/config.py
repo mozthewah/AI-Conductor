@@ -47,7 +47,10 @@ class Settings:
     reflection_effort: str = "low"
     max_tokens: int = 64000
     max_steps: int = 60
-    approval: str = "ask"  # "ask" | "auto"
+    # Auto-approve actions up to this severity: safe | low | medium | high.
+    # Anything above asks you; critical always asks. ("ask" = low, "auto" = high, for old configs.)
+    approval: str = "low"
+    unattended_approval: str = "low"  # scheduled runs: above this is declined (nobody to ask)
     data_dir: Path = field(default_factory=lambda: Path("data"))
     workspace: Path = field(default_factory=lambda: Path("workspace"))
     learning: bool = True
@@ -94,7 +97,10 @@ class Settings:
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
             openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),
-            approval=os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),
+            approval={"ask": "low", "auto": "high"}.get(
+                os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),
+                os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower()),
+            unattended_approval=os.environ.get("CONDUCTOR_UNATTENDED_APPROVAL", cls.unattended_approval).lower(),
             data_dir=Path(os.environ.get("CONDUCTOR_DATA_DIR", "data")),
             workspace=Path(os.environ.get("CONDUCTOR_WORKSPACE", "workspace")),
             learning=_flag("CONDUCTOR_LEARNING", True),

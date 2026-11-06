@@ -6,6 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 
+from ..safety import assess_shell
 from . import Tool, ToolContext, ToolError, clip
 
 TEXT_LIMIT = 200_000
@@ -87,8 +88,10 @@ async def list_files(ctx: ToolContext, args: dict) -> str:
 
 async def run_shell(ctx: ToolContext, args: dict) -> str:
     cmd = args["command"]
-    if not await ctx.approve("run_shell", f"Run: {cmd}", args):
-        raise ToolError("The user declined this command. Ask them or try a different approach.")
+    assessment = assess_shell(cmd, ctx.settings.workspace)
+    if not await ctx.approve("run_shell", f"Run: {cmd}", args, assessment):
+        raise ToolError("This command wasn't approved (the user declined, or it's above the risk level allowed "
+                        "for this run). Try a safer approach, or ask the user.")
     timeout = min(int(args.get("timeout", 120)), 900)
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     for secret in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY"):

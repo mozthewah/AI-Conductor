@@ -117,7 +117,8 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_ROUTER_MODEL` | `anthropic/claude-haiku-5.5` | The classifier |
 | `CONDUCTOR_EXPLORE` | `0.1` | Share of tasks where the router tries a less-proven model |
 | `CONDUCTOR_EFFORT` | `high` | Reasoning effort for models that support it (`low` … `max`). Sub-agents run at `medium` |
-| `CONDUCTOR_APPROVAL` | `ask` | `ask` = approve each shell command; `auto` = run without asking |
+| `CONDUCTOR_APPROVAL` | `low` | Auto-approve actions up to `safe` / `low` / `medium` / `high` (critical always asks). Also editable on the Safety page |
+| `CONDUCTOR_UNATTENDED_APPROVAL` | `low` | Same, for scheduled runs; anything above it is declined |
 | `CONDUCTOR_LEARNING` | `on` | Reflect after tasks and save memories and skills |
 | `CONDUCTOR_WEB_TOOLS` | `on` | Hosted web search and fetch |
 | `CONDUCTOR_BROWSER` | `on` | Local Chromium browser tool |
@@ -167,6 +168,26 @@ TOOLS = [Tool("get_weather", "Current weather for a city.",
 
 Then add `tools += weather.TOOLS` in `build_registry` (`conductor/tools/__init__.py`).
 Set `risky=True` and call `await ctx.approve(...)` in the handler for anything that should ask first.
+
+## Approvals by risk level
+
+Every shell command and browser action is rated before it runs:
+
+| Level | What it means | Examples |
+|---|---|---|
+| **safe** | Read-only | `ls`, `cat`, `git status`, opening a page |
+| **low** | Small, reversible changes in the workspace | `mkdir`, `cp`, writing a file, `git add`, clicking a link |
+| **medium** | Installs, runs code, deletes workspace files | `pip install`, `python app.py`, `rm build/`, typing into forms |
+| **high** | Outside the workspace or outward-facing | `sudo`, `git push`, sending data, reading SSH keys, clicking Buy/Send/Delete |
+| **critical** | Destructive or system-level | `rm -rf ~`, formatting disks, `curl … \| sh`. Always asks. |
+
+Actions up to your auto-approve level just run (default: **low**). Riskier ones show an approval
+card with the level and the reason. **Always allow** remembers the command's first two words
+*together with its level*, so allowing `npm test` never covers `npm test && git push`.
+Commands the built-in rules don't recognize are rated by the router's small model, with its
+reasoning shown. Scheduled runs have their own limit, and anything above it is declined because
+nobody's there to ask. Every automatic decision is logged in the task's activity feed. Change the
+levels and manage remembered rules on the **Safety** page.
 
 ## Safety notes
 

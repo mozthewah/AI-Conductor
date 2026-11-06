@@ -32,7 +32,7 @@ class Scripted(FakeLLM):
 
 
 def make(tmp_path, respond, label):
-    s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", approval="auto", browser=False,
+    s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", approval="high", browser=False,
                  fetch_catalog=False, explore=0.0, openrouter_key="k", learning=False)
     c = Conductor(s, llm=Scripted(respond, label))
     c.catalog.models = {m.id: m for m in ALL}

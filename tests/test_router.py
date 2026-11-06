@@ -19,7 +19,7 @@ def L(skill, difficulty="medium", domain="general", vision=False, parts=None):
 
 
 def conductor(tmp_path, label, script=(), **kw):
-    s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", approval="auto", browser=False,
+    s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", approval="high", browser=False,
                  fetch_catalog=False, explore=0.0, openrouter_key="k", **kw)
     c = Conductor(s, llm=FakeLLM(list(script), label=label))
     c.catalog.models = {m.id: m for m in (FRONTIER, STRONG, FAST)}

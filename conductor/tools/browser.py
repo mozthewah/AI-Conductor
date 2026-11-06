@@ -11,6 +11,7 @@ import base64
 import os
 from pathlib import Path
 
+from ..safety import assess_browser
 from . import Tool, ToolContext, ToolError, clip
 
 ACTIONS = ["goto", "click", "type", "press", "scroll", "back", "read", "screenshot", "close"]
@@ -99,6 +100,9 @@ async def browser(ctx: ToolContext, args: dict) -> list[dict] | str:
         await pool.close_page(ctx.task_id)
         return "Browser tab closed."
     page = await pool.page(ctx.task_id)
+    assessment = assess_browser(args, page.url)
+    if assessment.level != "safe" and not await ctx.approve("browser", _summ(args), args, assessment):
+        raise ToolError("That browser action wasn't approved. Ask the user, or find another way.")
     try:
         if action == "goto":
             url = args.get("url") or ""

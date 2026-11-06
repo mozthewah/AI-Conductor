@@ -86,12 +86,20 @@ async def _chat(settings: Settings, first: str | None) -> None:
                     print(f"{DIM}  ⚇ sub-agent {d['action']}: {d['title']}{RESET}")
                 elif t == "request":
                     if d["kind"] == "approval":
-                        ans = (await _ainput(f"{YELLOW}  ? Allow {d['summary']} [y/N] {RESET}")).strip().lower()
-                        c.resolve_request(d["id"], ans in ("y", "yes"))
+                        always = f", a = always allow '{d['remember_key']}'" if d.get("remember_key") else ""
+                        print(f"{YELLOW}  ! {d.get('level', '?').upper()}: {d.get('reason', '')}{RESET}")
+                        ans = (await _ainput(f"{YELLOW}  ? Allow {d['summary']} [y/N{always}] {RESET}")).strip().lower()
+                        if ans in ("a", "always") and d.get("remember_key"):
+                            c.resolve_request(d["id"], True, "always")
+                        else:
+                            c.resolve_request(d["id"], ans in ("y", "yes"))
                     else:
                         opts = f" ({' / '.join(d['options'])})" if d.get("options") else ""
                         ans = (await _ainput(f"{YELLOW}  ? {d['question']}{opts}\n  > {RESET}")).strip()
                         c.resolve_request(d["id"], True, ans)
+                elif t == "approval":
+                    mark = "auto-allowed" if d["allowed"] else "declined"
+                    print(f"{DIM}  \u26e8 {mark} ({d['level']}): {d['summary'][:80]}{RESET}")
                 elif t == "routed":
                     print(f"{DIM}  \u21c4 {d.get('name') or d['model']} ({d['category']}, {d['difficulty']}"
                           f"{', ~$%.3f' % d['est_cost'] if d.get('est_cost') else ''}){RESET}")
@@ -114,7 +122,7 @@ async def _chat(settings: Settings, first: str | None) -> None:
 def chat(args) -> None:
     settings = Settings.from_env()
     if args.auto:
-        settings.approval = "auto"
+        settings.approval = "high"
     try:
         asyncio.run(_chat(settings, " ".join(args.prompt) if args.prompt else None))
     except (KeyboardInterrupt, EOFError):
@@ -128,7 +136,7 @@ def main() -> None:
     s.add_argument("--host", default=os.environ.get("CONDUCTOR_HOST", "127.0.0.1"))
     s.add_argument("--port", type=int, default=int(os.environ.get("CONDUCTOR_PORT", "8765")))
     ch = sub.add_parser("chat", help="chat in the terminal")
-    ch.add_argument("--auto", action="store_true", help="don't ask before running shell commands")
+    ch.add_argument("--auto", action="store_true", help="auto-approve everything up to high risk (critical still asks)")
     ch.add_argument("prompt", nargs="*")
     args = p.parse_args()
     if args.cmd == "chat":

@@ -46,8 +46,9 @@ class ToolContext:
     async def emit(self, type_: str, data: dict) -> None:
         await self.conductor.emit(self.task_id, type_, data)
 
-    async def approve(self, tool: str, summary: str, args: dict) -> bool:
-        return await self.conductor.request_approval(self.task_id, tool, summary, args)
+    async def approve(self, tool: str, summary: str, args: dict, assessment=None) -> bool:
+        """Check the safety policy; asks the user only when the action's severity requires it."""
+        return await self.conductor.request_approval(self.task_id, tool, summary, args, assessment)
 
 
 @dataclass
@@ -57,7 +58,7 @@ class Tool:
     properties: dict[str, Any]
     required: list[str]
     handler: Handler
-    risky: bool = False          # needs approval when CONDUCTOR_APPROVAL=ask
+    risky: bool = False          # can change things outside the model's head (shell, browser)
     top_level_only: bool = False  # hidden from specialists (assign, review, schedule...)
     summarize: Callable[[dict], str] | None = None
     extra: dict = field(default_factory=dict)

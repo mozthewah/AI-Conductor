@@ -12,7 +12,7 @@ from fakes import FakeLLM, progress, text, tool_use
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(data_dir=tmp_path / "data", workspace=tmp_path / "ws", approval="auto", browser=False,
+    return Settings(data_dir=tmp_path / "data", workspace=tmp_path / "ws", approval="high", browser=False,
                     fetch_catalog=False)
 
 
@@ -139,8 +139,8 @@ async def test_assigned_parts_run_in_parallel(settings):
 
 
 async def test_approval_flow_denied(settings):
-    settings.approval = "ask"
-    llm = FakeLLM([[tool_use("run_shell", command="echo hi")], [text("ok")]])
+    settings.approval = "low"
+    llm = FakeLLM([[tool_use("run_shell", command="pip install requests")], [text("ok")]])
     c = Conductor(settings, llm=llm)
     tid = c.start_task("run it")
     q = c.subscribe(tid)
@@ -152,7 +152,7 @@ async def test_approval_flow_denied(settings):
             break
     await c.wait(tid)
     res = llm.calls[1]["messages"][-1]["content"][0]
-    assert res["is_error"] and "declined" in res["content"]
+    assert res["is_error"] and "approved" in res["content"]
 
 
 async def test_shell_runs_when_auto(settings):
@@ -197,8 +197,8 @@ async def test_scheduler_fires_due_tasks(settings):
 
 
 async def test_unattended_tasks_dont_block_on_questions(settings):
-    settings.approval = "ask"
-    llm = FakeLLM([[tool_use("run_shell", command="echo hi")], [text("skipped")]])
+    settings.approval = "low"
+    llm = FakeLLM([[tool_use("run_shell", command="pip install requests")], [text("skipped")]])
     c = Conductor(settings, llm=llm)
     tid = c.start_task("x", origin="schedule")
     await asyncio.wait_for(c.wait(tid), 5)

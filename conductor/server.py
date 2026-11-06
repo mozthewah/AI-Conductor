@@ -42,6 +42,11 @@ class MemoryIn(BaseModel):
     content: str
 
 
+class SafetyIn(BaseModel):
+    threshold: str | None = None
+    unattended: str | None = None
+
+
 class SkillIn(BaseModel):
     name: str
     description: str
@@ -75,7 +80,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/api/config")
     def config():
         s = c().settings
-        return {"model": s.model, "effort": s.effort, "approval": s.approval, "learning": s.learning,
+        return {"model": s.model, "effort": s.effort, "approval": c().policy.threshold, "learning": s.learning,
                 "web_tools": s.web_tools, "tools": sorted(c().tools), "workspace": str(s.workspace),
                 "budget": s.router_budget, "router_model": s.default_router_model,
                 "providers": {"anthropic": s.anthropic_key, "openrouter": bool(s.openrouter_key)},
@@ -225,6 +230,23 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             r["score"] = round(r["reward"] / r["runs"], 3) if r["runs"] else None
         return rows
 
+    # ---------------------------------------------------------------- safety
+    @app.get("/api/safety")
+    def safety():
+        p = c().policy
+        return {"threshold": p.threshold, "unattended": p.unattended, "rules": p.rules}
+
+    @app.put("/api/safety")
+    def update_safety(body: SafetyIn):
+        c().policy.update(body.threshold, body.unattended)
+        return {"ok": True}
+
+    @app.delete("/api/safety/rules/{index}")
+    def forget_rule(index: int):
+        if not c().policy.forget(index):
+            raise HTTPException(404)
+        return {"ok": True}
+
     # ---------------------------------------------------------------- memory
     @app.get("/api/memories")
     def memories(q: str = ""):
@@ -309,7 +331,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/t/{task_id}", response_class=HTMLResponse)
     @app.get("/{page}", response_class=HTMLResponse)
     def index(task_id: str | None = None, page: str | None = None):
-        if page and page not in ("memory", "skills", "schedules", "files", "models"):
+        if page and page not in ("memory", "skills", "schedules", "files", "models", "safety"):
             raise HTTPException(404)
         return (WEB / "index.html").read_text()
 

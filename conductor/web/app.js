@@ -89,7 +89,7 @@ const ago = (ts) => {
   return new Date(ts * 1000).toLocaleDateString();
 };
 const STATUS_LABEL = { queued: "Queued", running: "Working", waiting: "Needs you", done: "Done",
-  error: "Error", cancelled: "Stopped", blocked: "Blocked" };
+  error: "Error", cancelled: "Stopped", blocked: "Blocked", paused: "Paused: credits" };
 
 function autosize(ta) {
   const fit = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 260) + "px"; };
@@ -381,7 +381,7 @@ async function showTask(id) {
     v.status = s;
     pill.className = `pill ${s}`;
     pill.textContent = STATUS_LABEL[s] || s;
-    comp.setRunning(s === "running" || s === "waiting" || s === "queued");
+    comp.setRunning(s === "running" || s === "waiting" || s === "queued" || s === "paused");
     liveStatus.hidden = s !== "running";
     if (s === "waiting") setLive("Waiting for you");
     if (!(s === "running" || s === "waiting")) inner.querySelectorAll(".cursor").forEach((e) => e.classList.remove("cursor"));
@@ -755,6 +755,38 @@ async function showTask(id) {
           ? `Running in the background: ${d.name}${d.urls && d.urls.length ? " · " + d.urls.join(", ") : ""}`
           : `Stopped background process: ${d.name}`));
         break;
+      case "paused": {
+        const card = h("div", { class: "card paused" },
+          h("div", { class: "title" }, icon("clock"), d.task_id === id ? "Paused: out of credits" : `“${d.title}” paused: out of credits`),
+          h("div", { class: "sev-reason" }, `${d.reason} Nothing is lost; it picks up from this exact step.`),
+          h("div", { class: "sev-reason" }, d.visible
+            ? "Conductor checks your balance every minute and resumes on its own once credits are back."
+            : "Conductor can't see your balance, so it will quietly retry every couple of minutes (free while you're out)."),
+          h("div", { class: "row" },
+            h("a", { class: "btn primary", href: d.top_up_url, target: "_blank", rel: "noopener" }, "Add credits on OpenRouter"),
+            h("button", { class: "btn", onclick: async (e) => {
+              e.target.disabled = true;
+              try { await api(`/api/tasks/${id}/resume`, { method: "POST" }); } catch (err) { alert(err.message); e.target.disabled = false; }
+            } }, "I've topped up: resume now")));
+        (v.pausedCards = v.pausedCards || []).push(card);
+        addAct(card, "keep");
+        if (v.replayed) setStatus("paused");
+        refreshCredits();
+        break;
+      }
+      case "resumed":
+        (v.pausedCards || []).forEach((c) => { c.classList.add("resolved"); c.querySelectorAll(".row").forEach((r) => r.remove()); });
+        v.pausedCards = [];
+        addAct(h("span", { style: "color:var(--ink-3)" }, d.how === "user" ? "Resumed." : "Credits are back; resumed."));
+        if (v.replayed) setStatus("running");
+        refreshCredits();
+        break;
+      case "credits_low":
+        addAct(h("div", { class: "card paused" }, h("div", { class: "title" }, icon("clock"),
+          `Credits are low: $${(d.available || 0).toFixed(2)} left (${d.source})`),
+          h("div", { class: "sev-reason" }, "It'll lean on cheaper models to stretch them. If they run out, work pauses and resumes once you top up."),
+          h("div", { class: "row" }, h("a", { class: "btn", href: d.top_up_url, target: "_blank", rel: "noopener" }, "Add credits"))), "keep");
+        break;
       case "steer": {
         if (d.task_id !== id) {
           const part = d.part_id && v.parts[d.part_id];
@@ -1086,6 +1118,24 @@ async function showSafety() {
     h("h2", { class: "section" }, "Always-allowed"), rules);
 }
 
+// ------------------------------------------------------------------ credits
+async function refreshCredits() {
+  const pill = $("#creditPill");
+  if (!pill || !(state.config && state.config.providers && state.config.providers.openrouter)) return;
+  try {
+    const c = await api("/api/credits");
+    pill.hidden = false;
+    pill.className = `credit-pill ${c.level}`;
+    pill.textContent = c.level === "out" ? "Out of credits: top up"
+      : c.available == null ? (c.spent_today != null ? `Credits: $${c.spent_today.toFixed(2)} spent today` : "Credits: balance not visible")
+      : `${c.level === "low" ? "Low: " : ""}$${c.available.toFixed(2)} left`;
+    pill.title = c.available == null
+      ? "Add OPENROUTER_MANAGEMENT_KEY to .env to see your account balance. Click to manage credits."
+      : `${c.source}. Click to add credits on OpenRouter.`;
+  } catch {}
+}
+setInterval(refreshCredits, 60000);
+
 // ------------------------------------------------------------------ theme
 const THEMES = ["system", "light", "dark"];
 function applyTheme() {
@@ -1112,5 +1162,6 @@ applyTheme();
       ? `Auto routing · ${state.config.budget} budget` : `${shortModel(state.config.model)} · ${state.config.effort} effort`;
   } catch {}
   refreshTasks();
+  refreshCredits();
   route();
 })();

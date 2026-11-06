@@ -261,6 +261,24 @@ levels and manage remembered rules on the **Safety** page.
   report) comes to you through `show_user`: a card in the feed with a link, or a preview for images.
 - Web fetches show ✓ with their size, or the error, in the feed.
 
+## Credits
+
+Conductor watches your OpenRouter credits and handles running low or out without losing work:
+
+- **Balance:** shown in the sidebar. Your normal key shows its own limit and any budgets on it.
+  To see the whole account balance, add a management key as `OPENROUTER_MANAGEMENT_KEY`.
+- **Running low** (below `CONDUCTOR_CREDIT_LOW`, default $2): a one-time warning on the task, and the
+  router leans toward cheaper models. Models can call `check_credits` to plan around the budget.
+- **OpenRouter's three kinds of "can't spend" (HTTP 402) are each handled:**
+  - *In-flight budget full* (lots of parallel requests on a small balance): waits for `Retry-After`
+    and retries.
+  - *Request too big for what's left*: retries with a smaller output budget.
+  - *Actually out* (account, key limit, or a spending budget): the task **pauses at that exact step**.
+    Paused specialists show on the main task. Conductor re-checks every minute and resumes on its
+    own once credits are back, or right away when you press **Resume**. If it can't see your
+    balance, it retries every couple of minutes instead; that's free, since OpenRouter rejects
+    unfunded requests before any model runs. Nothing is redone or lost.
+
 ## Troubleshooting
 
 `conductor doctor` checks your keys (and whether OpenRouter accepts them), the model catalog, the

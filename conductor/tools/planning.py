@@ -53,6 +53,20 @@ async def show_user(ctx: ToolContext, args: dict) -> str:
     return f"Shown to the user: {label}"
 
 
+async def check_credits(ctx: ToolContext, args: dict) -> str:
+    c = ctx.conductor
+    st = await c.credits.check(force=True)
+    root = c._root(ctx.task_id)
+    spent = root["cost_usd"] + sum((c.store.get_task(ch["id"]) or {}).get("cost_usd", 0) for ch in c.store.child_tasks(root["id"]))
+    if st["available"] is None:
+        balance = "not visible (no management key and no limit on this key)"
+    else:
+        balance = f"${st['available']:.2f} ({st['source']})"
+    return (f"Credits left: {balance}. Status: {st['level']}. This task has spent about ${spent:.3f} so far."
+            + (" Credits are low: prefer cheaper models and fewer parallel parts, and finish the essentials first."
+               if st["level"] == "low" else ""))
+
+
 TOOLS = [
     Tool(
         name="update_plan",
@@ -76,6 +90,12 @@ TOOLS = [
         required=["steps"],
         handler=update_plan,
         summarize=lambda a: f"Updated plan ({len(a.get('steps', []))} steps)",
+    ),
+    Tool(
+        name="check_credits",
+        description=("Check how much OpenRouter credit is left and what this task has spent. Look before "
+                     "starting expensive or wide work (many parallel parts, big models)."),
+        properties={}, required=[], handler=check_credits, summarize=lambda a: "Checked credits",
     ),
     Tool(
         name="show_user",

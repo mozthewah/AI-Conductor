@@ -15,8 +15,11 @@ import json
 import re
 from typing import Any, Awaitable, Callable, Protocol
 
+import asyncio
+
 import anthropic
 
+from .credits import CreditError, classify_402
 from .models import ModelInfo
 
 OnEvent = Callable[[str, dict], Awaitable[None]]
@@ -103,17 +106,33 @@ class MessagesLLM:
         kw = self._request(model, system, messages, tools, effort, web, session_id)
         retries = 0
         plain = False
+        waits = 0
         while True:
             try:
                 return await self._stream(client, model, kw, on_event)
-            except anthropic.BadRequestError as e:
-                # If the provider rejects the shape of our history (not the request itself),
-                # retry once with a plain-text version of earlier turns rather than failing the task.
-                if plain or model.provider != "openrouter" or "messages" not in str(e.body or e.message):
-                    raise
-                plain = True
-                kw["messages"] = adapt_messages(messages, model, plain=True)
-                await on_event("status", {"text": "The provider rejected part of the history; retrying with a simplified copy."})
+            except anthropic.APIStatusError as e:
+                credit = classify_402(e.status_code, e.body, getattr(e.response, "headers", None), e.message)
+                if credit is None:
+                    if not isinstance(e, anthropic.BadRequestError):
+                        raise
+                    if plain or model.provider != "openrouter" or "messages" not in str(e.body or e.message):
+                        raise
+                    plain = True
+                    kw["messages"] = adapt_messages(messages, model, plain=True)
+                    await on_event("status", {"text": "The provider rejected part of the history; retrying with a simplified copy."})
+                    continue
+                if credit.kind == "in_flight" and waits < 8:
+                    waits += 1
+                    delay = min(credit.retry_after or 10.0, 60.0)
+                    await on_event("status", {"text": f"Lots of requests in flight for your balance; retrying in {delay:.0f}s."})
+                    await asyncio.sleep(delay)
+                    continue
+                if credit.kind == "too_big" and kw["max_tokens"] > 4096:
+                    target = int(credit.affordable * 0.9) if credit.affordable else kw["max_tokens"] // 2
+                    kw["max_tokens"] = max(4096, min(target, kw["max_tokens"] // 2 if not credit.affordable else target))
+                    await on_event("status", {"text": f"Credits are tight; retrying with a smaller reply budget ({kw['max_tokens']:,} tokens)."})
+                    continue
+                raise credit
             except ValueError:
                 # Tool-input JSON that couldn't be parsed at all. It broke before the
                 # tool_use block completed, so there's nothing to answer; re-issue the turn.

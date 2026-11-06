@@ -226,6 +226,9 @@ class Router:
     def pick(self, *, skill: str, domain: str, difficulty: str, budget: str, needs_vision: bool = False,
              exclude: set[str] | None = None, seed: int | None = None) -> Decision:
         settings = self.c.settings
+        credits_low = getattr(self.c, "credits", None) is not None and self.c.credits.low
+        if credits_low:
+            budget = "frugal"  # stretch the remaining credits
         roster = [m for m in self.catalog.roster() if m.tools and (m.vision or not needs_vision)
                   and m.id not in (exclude or set())]
         if not roster:
@@ -256,6 +259,8 @@ class Router:
                   f"based on {basis} (est. quality {best['quality']:.0%}).")
         if explore:
             reason += " Trying something a bit different this time to keep learning."
+        if credits_low:
+            reason += " (Credits are low, so leaning toward cheaper models.)"
         return Decision(best["model"], skill, domain, difficulty, reason, "explore" if explore else "router",
                         est_cost=best["est_cost"], candidates=scored[:4])
 

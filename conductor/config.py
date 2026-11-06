@@ -49,6 +49,8 @@ class Settings:
     expert_model: str = "auto"       # who consult_expert asks; auto = best available for the work
     anthropic_key: bool = False
     openrouter_key: str = ""
+    openrouter_management_key: str = ""  # optional: lets Conductor see the account balance
+    credit_low: float = 2.0               # USD; below this, warn and lean on cheaper models
     effort: str = "high"
     subagent_effort: str = "medium"
     reflection_effort: str = "low"
@@ -109,6 +111,8 @@ class Settings:
             expert_model=os.environ.get("CONDUCTOR_EXPERT_MODEL", cls.expert_model),
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
             openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),
+            openrouter_management_key=os.environ.get("OPENROUTER_MANAGEMENT_KEY", ""),
+            credit_low=float(os.environ.get("CONDUCTOR_CREDIT_LOW", cls.credit_low)),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),
             approval={"ask": "low", "auto": "high"}.get(
                 os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),

@@ -158,6 +158,15 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     async def cancel(task_id: str):
         return {"ok": c().cancel(task_id)}
 
+    @app.get("/api/credits")
+    async def credits():
+        return await c().credits.check()
+
+    @app.post("/api/tasks/{task_id}/resume")
+    async def resume(task_id: str):
+        task_or_404(task_id)
+        return {"ok": True, "status": c().resume(task_id)}
+
     @app.post("/api/requests/{request_id}")
     async def resolve(request_id: str, body: Resolve):
         if not c().resolve_request(request_id, body.approved, body.text):

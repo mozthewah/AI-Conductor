@@ -20,6 +20,7 @@ from . import prompts
 from .config import Settings
 from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
 from .benchmarks import Benchmarks
+from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
 
@@ -53,6 +54,9 @@ class Conductor:
         self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
                                      fetch=settings.fetch_catalog).load()
         self.router = Router(self)
+        self.credits = CreditMonitor(key=settings.openrouter_key, management_key=settings.openrouter_management_key,
+                                     low=settings.credit_low, fetch=settings.fetch_catalog)
+        self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
         self._escalate_next: dict[str, tuple[str, str, str | None]] = {}  # task -> (reason, by, target)
@@ -309,10 +313,16 @@ class Conductor:
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
 
-                resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
-                                           on_event=on_event, effort=effort,
-                                           web=self.settings.web_tools and not hands_off,
-                                           session_id=task_id)
+                if model.provider == "openrouter":
+                    await self._credit_check(task_id)
+                try:
+                    resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
+                                               on_event=on_event, effort=effort,
+                                               web=self.settings.web_tools and not hands_off,
+                                               session_id=task_id)
+                except CreditError as ce:
+                    await self._pause_for_credits(task_id, ce)
+                    continue  # nothing was appended, so the same step simply runs again
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks, model=model.id)
                 usage = resp.get("usage") or {}
@@ -560,6 +570,50 @@ class Conductor:
             await self.emit(task["parent_id"], "steer", payload)
         return prompts.STEER_NOTE.format(issue=out.get("issue", "drifting from the brief"),
                                          steer=out.get("steer", "Return to your brief."))
+
+    # ------------------------------------------------------------------ credits
+    async def _credit_check(self, task_id: str) -> None:
+        """Cheap (cached) look at the balance before a step: warn once when low, pause if known to be out."""
+        st = await self.credits.check()
+        root = self._root(task_id)["id"]
+        if st["level"] == "low" and root not in self._warned_low:
+            self._warned_low.add(root)
+            await self.emit(root, "credits_low", {"available": st["available"], "source": st["source"],
+                                                  "threshold": st["low_threshold"], "top_up_url": st["top_up_url"]})
+        if st["level"] == "out":
+            await self._pause_for_credits(task_id, CreditError("out", f"Credits are used up ({st['source']})."))
+
+    async def _pause_for_credits(self, task_id: str, err: CreditError) -> None:
+        """Out of credits: park this task (and show it on the main task) until credits are back."""
+        self.credits.mark_out()
+        task = self.store.get_task(task_id)
+        root = self._root(task_id)
+        st = self.credits.status()
+        payload = {"task_id": task_id, "title": task["title"], "reason": str(err), "available": st["available"],
+                   "source": st["source"], "top_up_url": st["top_up_url"], "visible": st["available"] is not None}
+        self.store.update_task(task_id, status="paused")
+        await self.emit(task_id, "paused", payload)
+        if root["id"] != task_id:
+            self.store.update_task(root["id"], status="paused")
+            await self.emit(root["id"], "paused", payload)
+        how = await self.credits.wait_for_credits(poll=None if st["available"] is not None else 120)
+        self.credits.state["out"] = False
+        self.store.update_task(task_id, status="running")
+        if root["id"] != task_id:
+            self.store.update_task(root["id"], status="running")
+        resumed = {"task_id": task_id, "how": how}
+        await self.emit(task_id, "resumed", resumed)
+        if root["id"] != task_id:
+            await self.emit(root["id"], "resumed", resumed)
+
+    def resume(self, task_id: str) -> str:
+        """User says credits are back: wake paused work, or restart a task paused before a restart."""
+        if task_id in self._running:
+            self.credits.resume_now()
+            return "resumed"
+        self.credits.state["out"] = False
+        self.send_message(task_id, "Credits are topped up - continue where you left off.")
+        return "restarted"
 
     def _handoff_note(self, task_id: str, messages: list[dict]) -> None:
         """Tell the incoming model who it is and why it's here (as a user-side note; history is append-only)."""

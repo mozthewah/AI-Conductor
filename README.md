@@ -214,6 +214,13 @@ Conductor moves up a tier when that happens:
   The last two take an optional model choice from `find_model`. By default they go to the *next step
   up*, the cheapest model that's clearly better at this kind of work, not straight to the most
   expensive one.
+- **Models hand down, too.** The reverse of escalating: `hand_down` passes the rest of a task to a
+  cheaper model when what's left is routine (formatting, simple edits, mechanical changes). It picks
+  the cheapest model that's still good enough for that work, judged at the work's real difficulty,
+  and never one the task was already moved up from. `find_model(direction="cheaper")` shows the
+  options. Top-tier models are told not to spend themselves on routine work. Handing down isn't held
+  against the bigger model; the result is credited to whichever model finishes it. The task menu
+  also offers "⬇ Cheaper model".
 - **Hedging gets noticed.** A turn full of "hm / actually / wait / not sure" gets a note to ask
   instead of guessing. If the model keeps hedging after that, the task moves up a step automatically.
 - **You can do it too.** The **⬆ Stronger model** menu on every task offers the next step up, the

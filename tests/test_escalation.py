@@ -172,3 +172,44 @@ async def test_escalating_to_an_unknown_model_is_refused(tmp_path):
     await c.wait(tid)
     res = c.llm.calls[1]["messages"][-1]["content"][0]
     assert res["is_error"] and "find_model" in res["content"]
+
+
+async def test_top_model_hands_routine_work_down(tmp_path):
+    c = make(tmp_path, [[tool_use("hand_down", reason="only renaming files left")], [text("Renamed.")]],
+             L("writing", "easy"))
+    tid = c.start_task("tidy the file names", model=FRONTIER.id)
+    await c.wait(tid)
+    assert c.llm.calls[1]["model"] == FAST.id  # cheapest model that's good enough for easy work
+    note = c.llm.calls[1]["messages"][-1]["content"][0]["text"]
+    assert "judged the rest routine" in note and "renaming files" in note
+    # no penalty recorded against the model that handed down
+    assert not any(r["model"] == FRONTIER.id for r in c.store.run_stats() if r["runs"] and r["reward"] < r["runs"] * 0.5)
+    route = c.store.get_task(tid)["route"]
+    assert route["escalations"][-1]["direction"] == "down"
+
+
+async def test_never_hands_down_to_a_model_it_was_escalated_from(tmp_path):
+    c = make(tmp_path, [[text("hi")]], L("coding", "easy"))
+    tid = c.start_task("x", model=FAST.id)
+    await c.wait(tid)
+    await c.escalate(tid, "too hard", by="auto")              # FAST -> STRONG
+    opts = [o["model"] for o in c.cheaper_options(c.store.get_task(tid))]
+    assert FAST.id not in opts
+
+
+async def test_find_model_cheaper_and_seat_prompt(tmp_path):
+    c = make(tmp_path, [[tool_use("find_model", need="reformat a table", direction="cheaper")], [text("ok")]],
+             L("writing", "easy"))
+    tid = c.start_task("x", model=FRONTIER.id)
+    await c.wait(tid)
+    listing = c.llm.calls[1]["messages"][-1]["content"][0]["content"]
+    assert "cheapest first" in listing and "lab/fast" in listing and "cheaper here" in listing
+    assert "hand_down" in c.llm.calls[0]["system"] and "most expensive" in c.llm.calls[0]["system"]
+
+
+async def test_hand_down_refuses_models_that_are_not_good_enough_or_cheaper(tmp_path):
+    c = make(tmp_path, [[tool_use("hand_down", reason="x", model=FRONTIER.id)], [text("ok")]], L("writing", "easy"))
+    tid = c.start_task("x", model=STRONG.id)
+    await c.wait(tid)
+    res = c.llm.calls[1]["messages"][-1]["content"][0]
+    assert res["is_error"] and "cheaper" in res["content"]

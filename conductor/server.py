@@ -125,12 +125,15 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.post("/api/tasks/{task_id}/escalate")
     async def escalate(task_id: str, body: ModelChoice):
         task_or_404(task_id)
-        reason = "You asked for a stronger model."
-        if c().request_escalation(task_id, reason, by="user", target=body.model):
+        down = body.model == "down"
+        reason = "You asked for a cheaper model." if down else "You asked for a stronger model."
+        by, target = ("down", "auto") if down else ("user", body.model)
+        if c().request_escalation(task_id, reason, by=by, target=target):
             return {"ok": True, "pending": True}
-        new = await c().escalate(task_id, reason, by="user", target=body.model)
+        new = await c().escalate(task_id, reason, by=by, target=target)
         if not new:
-            raise HTTPException(409, "Already on the strongest available model for this kind of work.")
+            raise HTTPException(409, "No cheaper model looks good enough for this." if down
+                                else "Already on the strongest available model for this kind of work.")
         return {"ok": True, "model": new}
 
     @app.post("/api/tasks/{task_id}/feedback")

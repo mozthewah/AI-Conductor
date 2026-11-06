@@ -495,6 +495,46 @@ class Conductor:
         out.sort(key=lambda o: (o["steps_up"], -o["value"]))
         return out
 
+    def cheaper_options(self, task: dict, skill: str | None = None, domain: str | None = None,
+                        difficulty: str | None = None) -> list[dict]:
+        """Cheaper models that still look good enough for this work (judged at its real difficulty,
+        not as if it were hard), cheapest first. Never one the task was already moved up from."""
+        from .router import DIFFICULTIES, TOKEN_ESTIMATE
+        route = task.get("route") or {}
+        skill = skill or route.get("skill", "other")
+        domain = domain or route.get("domain", "general")
+        if skill not in SKILL_SET:
+            skill = "other"
+        difficulty = difficulty if difficulty in DIFFICULTIES else route.get("difficulty", "medium")
+        if difficulty not in DIFFICULTIES:
+            difficulty = "medium"
+        current = self.catalog.get(task.get("model") or "")
+        escaped = {h.get("from") for h in route.get("escalations") or [] if h.get("direction", "up") == "up"}
+        roster = self.catalog.roster()
+        ids = [m.id for m in roster]
+        table = self.router._stats()
+        tin, tout = TOKEN_ESTIMATE[difficulty]
+        cur_cost = current.cost(tin, tout, int(tin * 0.6))
+        out = []
+        for m in roster:
+            if m.id == current.id or m.id in escaped:
+                continue
+            cost = m.cost(tin, tout, int(tin * 0.6))
+            if cur_cost and cost > cur_cost * 0.7:  # must be meaningfully cheaper
+                continue
+            q, _, _, runs, bench = self.router.estimate(m, skill, domain, difficulty, ids, table)
+            if q < 0.68:
+                continue
+            out.append({"model": m.id, "name": m.name or m.id, "tier": m.tier, "quality": round(q, 2),
+                        "price": f"${m.price_in:g}/${m.price_out:g} per M tokens", "est_cost": round(cost, 4),
+                        "saving": round(1 - cost / cur_cost, 2) if cur_cost else 0, "runs": runs, "benchmark": bench})
+        out.sort(key=lambda o: (o["est_cost"], -o["quality"]))
+        return out
+
+    def cheaper_model(self, task: dict) -> str | None:
+        opts = self.cheaper_options(task)
+        return opts[0]["model"] if opts else None
+
     def stronger_model(self, task: dict, best: bool = False) -> str | None:
         """Next model up the ladder for this work (or the very best, if best=True)."""
         opts = self.model_options(task)
@@ -508,24 +548,36 @@ class Conductor:
         task = self.store.get_task(task_id)
         route = dict(task.get("route") or {})
         history = list(route.get("escalations") or [])
-        if by in ("auto", "model") and len(history) >= self.settings.max_escalations:
-            return None
         current = task.get("model")
-        if target == "best":
+        down = by == "down"
+        ups = [h for h in history if h.get("direction", "up") == "up"]
+        if by in ("auto", "model") and len(ups) >= self.settings.max_escalations:
+            return None
+        if len(history) >= self.settings.max_escalations + 3:  # no endless ping-pong
+            return None
+        if down:
+            new = target if target and target != "auto" else self.cheaper_model(task)
+            if not new:
+                await self.emit(self._root(task_id)["id"], "status", {
+                    "text": f"Wanted to hand this down ({reason.rstrip('.')}), but no cheaper model looks good enough for it."})
+                return None
+        elif target == "best":
             new = self.stronger_model(task, best=True)
         else:
             new = target if target and target != "auto" else self.stronger_model(task)
-        if not new or new == current:
+        if not down and (not new or new == current):
             await self.emit(self._root(task_id)["id"], "status", {
                 "text": f"Wanted a stronger model ({reason.rstrip('.')}), but {self.catalog.get(current or '').name or current} "
                         "is already the best available for this."})
             return None
         info = self.catalog.get(new)
-        history.append({"from": current, "to": new, "reason": reason, "by": by, "at": time.time()})
+        history.append({"from": current, "to": new, "reason": reason, "by": by, "at": time.time(),
+                        "direction": "down" if down else "up"})
         route.update({"escalations": history, "model": new, "name": info.name or new})
         self.store.update_task(task_id, model=new, route=route)
-        # Teach the router: the earlier model wasn't enough for this kind of work.
-        if current:
+        # Teach the router: the earlier model wasn't enough for this kind of work. (Handing down
+        # isn't a failure - the result simply gets credited to the cheaper model that finishes it.)
+        if current and not down:
             ghost = f"{task_id}#esc{len(history)}"
             self.store.start_run(ghost, current, route.get("skill", "other"), route.get("difficulty", "medium"),
                                  "escalated", domain=route.get("domain", "general"), mode=route.get("mode", "direct"),
@@ -534,7 +586,8 @@ class Conductor:
             self.store.set_review(ghost, 0.3 if by != "user" else 0.2)
         self.store.set_run_model(task_id, new)
         payload = {"task_id": task_id, "from": current, "from_name": self.catalog.get(current or "").name or current,
-                   "to": new, "name": info.name or new, "reason": reason, "by": by}
+                   "to": new, "name": info.name or new, "reason": reason, "by": by,
+                   "direction": "down" if down else "up"}
         await self.emit(task_id, "escalated", payload)
         if task.get("parent_id"):
             await self.emit(self._root(task_id)["id"], "escalated", payload)
@@ -622,9 +675,10 @@ class Conductor:
         last = (route.get("escalations") or [{}])[-1]
         if not last:
             return
-        note = prompts.HANDOFF_NOTE.format(new=self.catalog.get(last["to"]).name or last["to"],
-                                           old=self.catalog.get(last.get("from") or "").name or last.get("from"),
-                                           reason=last.get("reason", ""))
+        template = prompts.HANDDOWN_NOTE if last.get("direction") == "down" else prompts.HANDOFF_NOTE
+        note = template.format(new=self.catalog.get(last["to"]).name or last["to"],
+                               old=self.catalog.get(last.get("from") or "").name or last.get("from"),
+                               reason=last.get("reason", ""))
         self._append(task_id, messages, "user", [{"type": "text", "text": note}])
 
     async def _reroute_followup(self, task_id: str, prompt: str) -> str | None:

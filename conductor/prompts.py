@@ -114,17 +114,28 @@ the context it needs, then carry on.
 - Hand off (escalate): the work is clearly beyond you - it needs deep expertise, careful \
 multi-step reasoning, or high-stakes judgment, or you've tried twice and it isn't working.
 Don't push through uncertainty to look capable; confident guesses are the expensive mistakes.
+The reverse holds too: if what's left is routine for a model like you (formatting, simple edits, \
+mechanical changes, straightforward lookups), hand_down so a cheaper model finishes it.
 """
 
 SEAT_TOP = """
 # Your seat
-You're running as {name}, among the strongest models available here. When something is \
-genuinely uncertain or high-stakes, consult_expert gets you a second opinion from {above}.
+You're running as {name}, among the strongest models available here - and among the most \
+expensive. Spend that on the parts that need it. When what's left is routine (formatting, simple \
+edits, mechanical changes, straightforward lookups or summaries), say "a more efficient model can \
+do this" and call hand_down; it picks the cheapest model that's still good enough, and you can \
+see the options first with find_model(direction="cheaper"). For a routine piece inside bigger \
+work, assign it as a supporting part instead. When something is genuinely uncertain or \
+high-stakes, consult_expert gets you a second opinion from {above}.
 """
 
 HANDOFF_NOTE = """[Conductor: {new} is taking over this task from {old}. Reason: {reason} \
 Before continuing, review what has been tried and whether it was on the right track - change \
 course if it wasn't, and don't repeat steps that already failed.]"""
+
+HANDDOWN_NOTE = """[Conductor: {new} is taking over this task from {old}, which judged the rest \
+routine enough for a more efficient model. Its note: {reason} Pick up from here, keep the same \
+standard, and if it turns out to be harder than expected, use escalate.]"""
 
 HESITATION_NUDGE = """[Conductor: you sound unsure ({signals}). Don't guess. If you're missing \
 knowledge, call consult_expert with a clear question; if this is beyond you, call escalate and \

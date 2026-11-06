@@ -45,6 +45,7 @@ const ICONS = {
   up: '<path d="M7 11v9H4v-9zM7 11l4-7c1.5 0 2.5 1 2.2 2.5L12.5 10H18a2 2 0 0 1 2 2.3l-1.2 6A2 2 0 0 1 16.8 20H7"/>',
   down: '<path d="M7 13V4H4v9zM7 13l4 7c1.5 0 2.5-1 2.2-2.5L12.5 14H18a2 2 0 0 0 2-2.3l-1.2-6A2 2 0 0 0 16.8 4H7"/>',
   arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  arrowDown: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   bulb: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   thought: '<path d="M7 18a4 4 0 0 1-.6-8A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1 .5 8z"/><circle cx="5" cy="21" r="1"/>',
@@ -54,7 +55,7 @@ const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", report_blocked: "x", show_user: "eye", processes: "term", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", hand_down: "arrowDown", find_model: "search", report_blocked: "x", show_user: "eye", processes: "term", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -317,8 +318,10 @@ async function showTask(id) {
 
   const upSel = modelSelect(roster, { auto: false, placeholder: "⬆ Stronger model…" });
   upSel.classList.add("compare-select", "up-select");
+  upSel.insertBefore(h("option", { value: "down" }, "⬇ Cheaper model (good enough)"), upSel.options[1]);
   upSel.insertBefore(h("option", { value: "best" }, "Best available (top tier)"), upSel.options[1]);
   upSel.insertBefore(h("option", { value: "auto" }, "Next step up (recommended)"), upSel.options[1]);
+  upSel.options[0].textContent = "⇅ Change model…";
   upSel.addEventListener("change", async () => {
     if (!upSel.value) return;
     try {
@@ -710,9 +713,11 @@ async function showTask(id) {
         break;
       case "escalated": {
         if (d.task_id === id) setModel({ model: d.to, name: d.name, reason: d.reason });
-        const who = d.by === "user" ? "You moved this" : d.by === "model" ? "The model asked to hand this" : "Moved this";
-        addAct(h("div", { class: "card escalated" }, h("div", { class: "title" }, icon("arrowUp"),
-          `${who} up to `, h("b", {}, d.name || shortModel(d.to)), d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
+        const isDown = d.direction === "down";
+        const who = isDown ? (d.reason && d.reason.startsWith("You asked") ? "You handed this" : "Handed this")
+          : d.by === "user" ? "You moved this" : d.by === "model" ? "The model asked to hand this" : "Moved this";
+        addAct(h("div", { class: "card escalated" + (isDown ? " down" : "") }, h("div", { class: "title" }, icon(isDown ? "arrowDown" : "arrowUp"),
+          `${who} ${isDown ? "down to" : "up to"} `, h("b", {}, d.name || shortModel(d.to)), isDown ? " (more efficient)" : "", d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
           h("div", { class: "sev-reason" }, d.reason)));
         if (d.task_id === id) compareSel.querySelectorAll("option").forEach((o) => { o.hidden = o.value === d.to; });
         break;

@@ -337,6 +337,8 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .card.escalated { border-color: var(--accent); background: var(--accent-soft); box-shadow: none; }
 .card.escalated .title svg { color: var(--accent); }
 .up-select { max-width: 150px; }
+.card.escalated.down { border-color: var(--line); background: var(--sunk); }
+.card.escalated.down .title svg { color: var(--good); }
 
 @media (max-width: 1100px) {
   .computer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 20; width: min(400px, 92vw); box-shadow: var(--shadow); }

@@ -47,6 +47,19 @@ async def find_model(ctx: ToolContext, args: dict) -> str:
     if not skill and args.get("need"):
         guess = heuristic_label(args["need"])
         skill, domain = guess["skill"], domain or guess["domain"]
+    if args.get("direction") == "cheaper":
+        me = c.catalog.get(task.get("model") or "")
+        opts = c.cheaper_options(task, skill, domain)
+        if not opts:
+            return f"No cheaper model in the roster looks good enough for this. Keep it with you ({me.name or me.id})."
+        lines = [f"Cheaper models that look good enough for this (vs you, {me.name or me.id}), cheapest first:"]
+        for o in opts[:6]:
+            basis = (f"{o['runs']} past task(s)" if o["runs"] else
+                     "public benchmarks" if o["benchmark"] is not None else "its tier")
+            lines.append(f"- {o['model']} ({o['name']}): {o['tier']}, est. quality {o['quality']:.0%} from {basis}; "
+                         f"{o['price']}, about {o['saving']:.0%} cheaper here")
+        lines.append("Call hand_down(model=...) to pass the rest of the task to one of them.")
+        return "\n".join(lines)
     opts = c.model_options(task, skill, domain)
     me = c.catalog.get(task.get("model") or "")
     if not opts:
@@ -100,6 +113,23 @@ async def escalate(ctx: ToolContext, args: dict) -> str:
     return f"{name} takes over from the next step. Leave a short note on what you've tried so far."
 
 
+async def hand_down(ctx: ToolContext, args: dict) -> str:
+    c = ctx.conductor
+    task = c.store.get_task(ctx.task_id)
+    if args.get("model"):
+        target = _pick(ctx, args["model"])
+        if target not in {o["model"] for o in c.cheaper_options(task)}:
+            raise ToolError("That model isn't a cheaper, good-enough option for this work. "
+                            "Use find_model(direction='cheaper') to see which are.")
+    else:
+        target = c.cheaper_model(task)
+    if not target:
+        return "No cheaper model looks good enough for this - keep going yourself."
+    c._escalate_next[ctx.task_id] = (args["reason"], "down", target)
+    name = c.catalog.get(target).name or target
+    return f"{name} takes over from the next step. Leave a short note on where things stand and what's left."
+
+
 TOOLS = [
     Tool("find_model",
          "Find models that would likely handle something better than you, before asking or handing off. "
@@ -107,6 +137,8 @@ TOOLS = [
          "for freelancers'); you get the roster's better options with their track record, price, and how "
          "big a step up each is, smallest step first. Free - it doesn't call any model.",
          {"need": {"type": "string", "description": "What you need help with"},
+          "direction": {"type": "string", "enum": ["stronger", "cheaper"],
+                        "description": "stronger (default): who'd do this better; cheaper: who could do it for less"},
           "skill": {"type": "string", "description": "Optional: coding, ui_design, architecture, research, writing, analysis, planning, browsing"},
           "domain": {"type": "string", "description": "Optional: travel, finance, health... or general"}},
          ["need"], find_model, summarize=lambda a: f"Looked for a better model for {a.get('need', '')[:50]}"),
@@ -120,6 +152,14 @@ TOOLS = [
           "context": {"type": "string", "description": "What it needs to know: goal, what you tried, key snippets"},
           "model": {"type": "string", "description": "Optional model id from find_model; default is the next step up"}},
          ["question"], consult_expert, summarize=lambda a: "Asked a stronger model"),
+    Tool("hand_down",
+         "Hand the rest of this task to a cheaper, more efficient model when what's left is routine for "
+         "you: formatting, simple edits, mechanical changes, straightforward lookups or summaries. By "
+         "default it picks the cheapest model that's still good enough for this work; pass a model id "
+         "from find_model(direction='cheaper') to choose. If the work turns out harder, it can escalate back.",
+         {"reason": {"type": "string", "description": "Why it's routine, and what's left to do"},
+          "model": {"type": "string"}},
+         ["reason"], hand_down, summarize=lambda a: "Handed the rest to a cheaper model"),
     Tool("escalate",
          "Hand the rest of this task to a stronger model ('pass it to my big brother'). Use it when the "
          "work is clearly beyond you: it needs deep expertise or careful multi-step reasoning, you've "

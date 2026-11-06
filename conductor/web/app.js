@@ -177,7 +177,8 @@ document.addEventListener("click", (e) => {
 $("#menuBtn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
 
 function route() {
-  audit("view", location.pathname);
+  const viewing = location.pathname.match(/^\/t\/([\w-]+)/);
+  audit("view", location.pathname, { task: viewing ? viewing[1] : undefined });
   if (state.es) { state.es.close(); state.es = null; }
   state.taskId = null;
   const p = location.pathname;
@@ -766,6 +767,12 @@ async function showTask(id) {
             h("div", { class: "sev-reason" }, "It keeps working on your provider account instead of pausing. Once you add credits, it goes back to normal routing.")), "keep");
           break;
         }
+        if (d.direction === "sideways") {
+          addAct(h("div", { class: "card escalated down" }, h("div", { class: "title" }, icon("route"),
+            "Switched to ", h("b", {}, d.name || shortModel(d.to)), d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
+            h("div", { class: "sev-reason" }, d.reason)), "keep");
+          break;
+        }
         const isDown = d.direction === "down";
         const who = isDown ? (d.reason && d.reason.startsWith("You asked") ? "You handed this" : "Handed this")
           : d.by === "user" ? "You moved this" : d.by === "model" ? "The model asked to hand this" : "Moved this";
@@ -1277,7 +1284,8 @@ function auditLine(r) {
   if (k === "http.request") return `${r.method} ${r.path}${r.query ? "?" + r.query : ""} → ${r.status} (${r.ms} ms)`;
   if (k.startsWith("ui.")) return `${r.label || ""}${r.value != null ? " → " + r.value : ""}${r.page && r.page !== r.label ? "  ·  " + r.page : ""}`;
   if (k === "tool.result") return `${r.name} ${r.ok ? "ok" : "failed"}${r.ms != null ? ` (${r.ms} ms)` : ""}${r.ok ? "" : ": " + (r.preview || "")}`;
-  if (k === "model.call") return `${shortModel(r.model)} · ${r.tokens_in ?? "?"} in / ${r.tokens_out ?? "?"} out · ${fmtCost(r.cost_usd)} · ${r.ms} ms`;
+  if (k === "model.call") return `${shortModel(r.model)} · ${r.tokens_in ?? "?"} in${r.cached != null ? ` (${r.tokens_in ? Math.round(100 * r.cached / r.tokens_in) : 0}% cached)` : ""} / ${r.tokens_out ?? "?"} out · ${fmtCost(r.cost_usd)} · ${r.ms} ms`;
+  if (k === "status" && r.error) return `${r.text}  (${r.error})`;
   if (k === "route.decided") return `${r.name || shortModel(r.model)} (${r.skill || r.category || ""}${r.difficulty ? ", " + r.difficulty : ""})`;
   if (k === "route.model_changed") return `${r.from_name || shortModel(r.from)} → ${r.name || shortModel(r.to)}: ${r.reason || ""}`;
   if (k.startsWith("auth.")) return `${r.client || ""}${r.how ? " via " + r.how : ""}${r.device ? " · " + r.device : ""}${r.path ? " · " + r.path : ""}`;

@@ -160,10 +160,17 @@ STEER_NOTE = """[Composer check-in: you're drifting from your brief - {issue}. {
 
 SUPERVISE_SYSTEM = ("You supervise an AI specialist for a composer model. Judge only whether its recent "
                     "actions serve its brief; tangents, scope creep, and loops count as off track. Be "
-                    "fair: exploring before acting is normal.")
+                    "fair: exploring before acting is normal, and so is building or fixing its own helper "
+                    "scripts, test harnesses, or screenshot/verification tooling to check its work, looking "
+                    "at shared context to stay consistent, and stopping or restarting processes it started "
+                    "itself (listed below). Flag only clear drift, and when unsure, say it's on track.")
 SUPERVISE_PROMPT = """<brief>
 {brief}
 </brief>
+
+<its_own_work>
+{own}
+</its_own_work>
 
 <recent_actions>
 {actions}

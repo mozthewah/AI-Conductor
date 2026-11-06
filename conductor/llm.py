@@ -188,7 +188,9 @@ class MessagesLLM:
         what = "The connection dropped" if isinstance(exc, (httpx2.TransportError, anthropic.APIConnectionError,
                                                              ConnectionError)) else "The model provider had a hiccup"
         await on_event("turn_reset", {})  # discard the half-streamed attempt in the UI
-        await on_event("status", {"text": f"{what}; retrying in {delay}s (attempt {drops + 2} of {len(RETRY_DELAYS) + 1})."})
+        detail = " ".join(str(getattr(exc, "message", "") or exc).split())[:200] or type(exc).__name__
+        await on_event("status", {"text": f"{what}; retrying in {delay}s (attempt {drops + 2} of {len(RETRY_DELAYS) + 1}).",
+                                  "error": f"{type(exc).__name__}: {detail}"})
         await asyncio.sleep(delay)
         return drops + 1
 

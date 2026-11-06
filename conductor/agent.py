@@ -38,6 +38,9 @@ from .tools import Tool, ToolContext, ToolError, build_registry, clip
 
 log = logging.getLogger("conductor")
 
+READ_TOOLS = {"view_image", "read_file", "list_files"}
+CHANGING_TOOLS = {"write_file", "edit_file", "run_shell", "processes", "browser"}
+
 # Events that stream token-by-token are broadcast live but not persisted;
 # the finished block is persisted as its own event instead.
 EPHEMERAL = {"text_delta", "progress_delta", "tool_start", "text_start"}
@@ -310,6 +313,8 @@ class Conductor:
         specs = self.tool_specs(depth, hands_off)
         answer = ""
         seen_calls: dict[str, int] = {}
+        changes = 0  # turns that changed something (files, processes, the browser)
+        provider_switches = 0  # moves to another model because the provider kept failing
         failing_turns = 0
         hedgy_turns = 0
         nudged_at: int | None = None
@@ -345,6 +350,7 @@ class Conductor:
                     u = resp.get("usage") or {}
                     self.audit.write("model.call", "system", task_id, model=model.id, effort=effort,
                                      stop=resp.get("stop_reason"), tokens_in=u.get("input_tokens"),
+                                     cached=u.get("cache_read"),
                                      tokens_out=u.get("output_tokens"), cost_usd=round(u.get("cost", 0.0), 6),
                                      ms=int((time.time() - started_call) * 1000), depth=depth)
                 except CreditError as ce:
@@ -362,6 +368,12 @@ class Conductor:
                     self.audit.write("model.error", "system", task_id, model=model.id,
                                      error=f"{type(call_err).__name__}: {call_err}",
                                      ms=int((time.time() - started_call) * 1000), byok_only=byok_only or None)
+                    from .llm import is_transient
+                    if not byok_only and is_transient(call_err) and model.provider == "openrouter" \
+                            and provider_switches < 2 and await self._switch_after_errors(task_id, model, call_err):
+                        provider_switches += 1
+                        self._handoff_note(task_id, messages)
+                        continue
                     if byok_only:  # e.g. the model isn't enabled on your provider account: try another, or pause
                         self.account.failed[model.id] = str(call_err)[:200]
                         await self.emit(self._root(task_id)["id"], "status", {
@@ -408,9 +420,13 @@ class Conductor:
                 for b in blocks:
                     if b.get("type") in ("tool_use", "server_tool_use") and b.get("name") not in ("update_plan",):
                         sig = b.get("name", "") + json.dumps(b.get("input", {}), sort_keys=True)
+                        if b.get("name") in READ_TOOLS:  # re-reading after a change is checking, not looping
+                            sig += f"@{changes}"
                         seen_calls[sig] = seen_calls.get(sig, 0) + 1
                         if seen_calls[sig] == 3:
                             stuck = f"it repeated the same {b.get('name')} call three times"
+                if any(b.get("type") == "tool_use" and b.get("name") in CHANGING_TOOLS for b in blocks):
+                    changes += 1
                 failing_turns = failing_turns + 1 if results and all(r.get("is_error") for r in results) else 0
                 if failing_turns >= 3:
                     stuck = "three steps in a row failed"
@@ -654,10 +670,19 @@ class Conductor:
                     actions.append(f"- {b['name']}: {json.dumps(b.get('input', {}))[:220]}")
                 elif b.get("type") == "text" and b.get("text"):
                     actions.append(f"- said: {b['text'][:220]}")
+        started, touched = [], []
+        for e in self.store.load_events(task_id):
+            if e["type"] == "process" and e["data"].get("action") == "started":
+                started.append(f"{e['data'].get('id')} ({e['data'].get('name')})")
+            elif e["type"] == "artifact" and e["data"].get("path"):
+                touched.append(e["data"]["path"])
+        own = ("Processes it started: " + (", ".join(started[-10:]) or "none") + "\nFiles it created or changed: "
+               + (", ".join(list(dict.fromkeys(touched))[-15:]) or "none"))
         try:
             out = await self.llm.structured(
                 model=self.catalog.get(self.settings.default_router_model), system=prompts.SUPERVISE_SYSTEM,
-                prompt=prompts.SUPERVISE_PROMPT.format(brief=clip(brief, 6000), actions="\n".join(actions[-14:])),
+                prompt=prompts.SUPERVISE_PROMPT.format(brief=clip(brief, 6000), own=own,
+                                                       actions="\n".join(actions[-14:])),
                 schema=prompts.SUPERVISE_SCHEMA, effort="low")
         except Exception as e:
             log.warning("supervision check failed: %s", e)
@@ -700,6 +725,33 @@ class Conductor:
             if not await self._switch_to_byok(task_id, reason):
                 await self._pause_for_credits(task_id, CreditError("out", reason))
         return self.catalog.get(self.store.get_task(task_id).get("model") or model.id)
+
+    async def _switch_after_errors(self, task_id: str, model, err: Exception) -> bool:
+        """The provider kept failing even after retries: carry on with the next-best model instead of dying."""
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        history = list(route.get("escalations") or [])
+        tried = {h.get("from") for h in history if h.get("direction") == "sideways"} | {model.id}
+        d = self.router.pick(skill=route.get("skill", "other"), domain=route.get("domain", "general"),
+                             difficulty=route.get("difficulty", "medium"), budget=self.settings.part_budget,
+                             exclude=tried)
+        if not d.model or d.model in tried or d.by == "fallback" and d.model == model.id:
+            return False
+        info = self.catalog.get(d.model)
+        why = (f"{model.name or model.id} kept failing at the provider ({str(err)[:140]}), even after retries, "
+               f"so {info.name or info.id} is taking over.")
+        history.append({"from": model.id, "to": info.id, "reason": why, "by": "provider_error", "at": time.time(),
+                        "direction": "sideways"})
+        route.update({"escalations": history, "model": info.id, "name": info.name or info.id})
+        self.store.update_task(task_id, model=info.id, route=route)
+        self.store.set_run_model(task_id, info.id)
+        payload = {"task_id": task_id, "from": model.id, "from_name": model.name or model.id, "to": info.id,
+                   "name": info.name or info.id, "reason": why, "by": "provider_error", "direction": "sideways"}
+        await self.emit(task_id, "escalated", payload)
+        root = self._root(task_id)["id"]
+        if root != task_id:
+            await self.emit(root, "escalated", payload)
+        return True
 
     def _byok_only(self, model) -> list[str]:
         """While credits are out, pin a BYOK-covered model to your own providers (no shared capacity)."""

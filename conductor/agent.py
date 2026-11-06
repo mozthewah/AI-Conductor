@@ -18,7 +18,7 @@ from typing import Any
 
 from . import prompts
 from .config import Settings
-from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
+from .llm import CURRENT_TASK, INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
 from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .account import Account
@@ -62,6 +62,8 @@ class Conductor:
         self.benchmarks.remap(self.catalog.models)
         if hasattr(self.llm, "audit"):
             self.llm.audit = self.audit
+        if hasattr(self.llm, "credit_low"):
+            self.llm.credit_low = lambda: self.credits.low
         self.router = Router(self)
         self.credits = CreditMonitor(key=settings.openrouter_key, management_key=settings.openrouter_management_key,
                                      low=settings.credit_low, fetch=settings.fetch_catalog)
@@ -283,6 +285,14 @@ class Conductor:
     # ------------------------------------------------------------------ the loop
     async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None,
                   effort: str | None = None, announce: bool = True) -> str:
+        token = CURRENT_TASK.set(task_id)  # so side calls (supervisor, safety judge) are logged against it
+        try:
+            return await self._run(task_id, prompt, depth, route, effort, announce)
+        finally:
+            CURRENT_TASK.reset(token)
+
+    async def _run(self, task_id: str, prompt: str, depth: int, route: dict | None,
+                   effort: str | None, announce: bool) -> str:
         effort = effort or (self.settings.effort if depth == 0 else self.settings.subagent_effort)
         messages = self.store.load_messages(task_id)
 
@@ -350,7 +360,8 @@ class Conductor:
                     u = resp.get("usage") or {}
                     self.audit.write("model.call", "system", task_id, model=model.id, effort=effort,
                                      stop=resp.get("stop_reason"), tokens_in=u.get("input_tokens"),
-                                     cached=u.get("cache_read"),
+                                     cached=u.get("cache_read"), byok=byok_only or (
+                                         self.account.byok_for(model.id, model.canonical) if model.provider == "openrouter" else None) or None,
                                      tokens_out=u.get("output_tokens"), cost_usd=round(u.get("cost", 0.0), 6),
                                      ms=int((time.time() - started_call) * 1000), depth=depth)
                 except CreditError as ce:

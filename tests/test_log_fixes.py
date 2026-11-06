@@ -87,3 +87,62 @@ async def test_supervisor_sees_its_own_processes_and_files(tmp_path):
     await c._supervise(tid, [{"role": "user", "content": "Do the admin pages"}], [])
     assert "4242 (burrow-admin-8032)" in seen["prompt"] and "capture-admin.py" in seen["prompt"]
     assert "helper scripts" in seen["system"]
+
+
+# ---------------------------------------------------------------- second log
+def test_safety_ratings_from_the_log(tmp_path):
+    from conductor.safety import assess_shell
+    rate = lambda c: assess_shell(c, tmp_path).level
+    assert rate("cat a; sed -n 25,40p b.html; grep -n x c.go") == "safe"   # was "It edits text."
+    assert rate("sed -i 's/a/b/' x.html") == "low"
+    assert rate("ps aux | grep burrow || true") == "safe"                 # was "It no-op."
+    assert rate("sleep 1; curl -sI http://127.0.0.1:8041/setup") == "safe"  # was "makes a network request"
+    assert rate("curl -X POST http://localhost:8000/api -d x") == "low"
+    assert rate("curl -s https://example.com") == "medium"
+    assert rate("curl -X POST https://example.com -d x") == "high"
+    assert rate("curl -s http://127.0.0.1:1/ https://example.com") == "medium"
+
+
+def test_low_credits_cap_the_reply_reservation():
+    from conductor.llm import LOW_CREDIT_MAX_TOKENS, MessagesLLM
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k", max_tokens=64000)
+    m = ModelInfo("a/b", "openrouter", max_output=64000)
+    assert llm._request(m, "s", [{"role": "user", "content": "hi"}], [], "high", False, None)["max_tokens"] == 64000
+    llm.credit_low = lambda: True
+    assert llm._request(m, "s", [{"role": "user", "content": "hi"}], [], "high", False, None)["max_tokens"] == LOW_CREDIT_MAX_TOKENS
+
+
+async def test_in_flight_retry_reserves_less(monkeypatch):
+    from test_credits import err, scripted_http
+    from test_llm_wire import collect
+    from conductor.llm import MessagesLLM
+
+    async def no_sleep(s):
+        pass
+    monkeypatch.setattr("conductor.llm.asyncio.sleep", no_sleep)
+    seen = []
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k", http_client=scripted_http(
+        [(402, err("in_flight_budget_exhausted", "openrouter_in_flight_budget"), {"retry-after": "90"}), (200, None, None)], seen))
+    await collect(llm, ModelInfo("a/b", "openrouter", max_output=64000))
+    assert seen[0]["max_tokens"] == 64000 and seen[1]["max_tokens"] == 32000
+
+
+async def test_side_calls_are_logged_against_their_task(tmp_path):
+    c = make(tmp_path, FakeLLM([[tool_use("run_shell", command="frobnicate --all")], [text("ok")]], label=L()))
+    c.settings.approval = "high"
+    tid = c.start_task("go")
+    await asyncio.wait_for(c.wait(tid), 5)
+    from conductor.llm import CURRENT_TASK
+    assert CURRENT_TASK.get() is None  # nothing leaks out of the run
+    assert c.store.get_task(tid)["status"] == "done"
+
+
+def test_favicon_needs_no_sign_in(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from conductor.server import create_app
+    monkeypatch.delenv("CONDUCTOR_ACCESS_TOKEN", raising=False)
+    c = make(tmp_path, FakeLLM([]))
+    with TestClient(create_app(c, run_scheduler=False), client=("192.168.1.9", 1), follow_redirects=False) as phone:
+        r = phone.get("/favicon.ico")
+        assert r.status_code == 200 and "svg" in r.headers["content-type"]
+    assert not any(e["kind"] == "auth.sign_in_needed" for e in c.audit.read())

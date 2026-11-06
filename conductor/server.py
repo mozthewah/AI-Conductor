@@ -138,7 +138,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             if not access.same_origin(src, request.headers.get("host")):
                 state["c"].audit.write("auth.cross_site_blocked", "system", None, path=path, origin=src, client=ip)
                 return JSONResponse({"detail": "Blocked: request came from another site."}, status_code=403)
-        if access.is_local(ip) or path in ("/login", "/manifest.webmanifest"):
+        if access.is_local(ip) or path in ("/login", "/manifest.webmanifest", "/favicon.ico", "/static/icon.svg"):
             return await call_next(request)
         token = state["token"]
         key = request.query_params.get("key")
@@ -268,6 +268,10 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             asyncio.get_running_loop().create_task(later())
             result["restarting"] = True
         return result
+
+    @app.get("/favicon.ico")
+    async def favicon():
+        return FileResponse(WEB / "icon.svg", media_type="image/svg+xml")
 
     @app.get("/manifest.webmanifest")
     async def manifest():

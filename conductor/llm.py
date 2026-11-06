@@ -16,6 +16,7 @@ import re
 from typing import Any, Awaitable, Callable, Protocol
 
 import asyncio
+import contextvars
 import time
 
 import anthropic
@@ -56,6 +57,8 @@ class StreamError(Exception):
 
 
 TRANSIENT_STREAM_ERRORS = {"api_error", "overloaded_error", "rate_limit_error", "timeout_error"}
+LOW_CREDIT_MAX_TOKENS = 16000
+CURRENT_TASK: contextvars.ContextVar[str | None] = contextvars.ContextVar("conductor_task", default=None)
 RETRY_DELAYS = [2, 5, 12, 25]  # seconds; network drops and provider hiccups are usually brief
 
 
@@ -74,6 +77,10 @@ class MessagesLLM:
     def __init__(self, *, anthropic_enabled: bool, openrouter_key: str = "", max_tokens: int = 64000,
                  http_client=None):
         self.max_tokens = max_tokens
+        # OpenRouter reserves credit for the *largest possible* reply before a call starts, so a 64k cap
+        # on a frontier model can tie up more than a small balance holds. The agent points this at its
+        # credit monitor; when credits are low, replies are capped to keep reservations small.
+        self.credit_low = lambda: False
         extra = {"http_client": http_client} if http_client is not None else {}
         self._anthropic = anthropic.AsyncAnthropic(**extra) if anthropic_enabled else None
         self._openrouter = anthropic.AsyncAnthropic(
@@ -119,6 +126,8 @@ class MessagesLLM:
                 kw["thinking"] = {"type": "adaptive", "display": "updates" if model.is_claude else "summarized"}
                 kw["output_config"] = {"effort": effort}
             extra: dict[str, Any] = {}
+            if self.credit_low():
+                kw["max_tokens"] = min(kw["max_tokens"], LOW_CREDIT_MAX_TOKENS)
             if session_id:  # sticky provider routing for prompt-cache hits
                 extra["session_id"] = session_id[:256]
             if providers:  # run only on these providers (your own BYOK keys when credits are out)
@@ -161,8 +170,11 @@ class MessagesLLM:
                 if credit.kind == "in_flight" and waits < 8:
                     waits += 1
                     self.limiter.shrink()  # too much running at once for this balance: run fewer
-                    delay = min(credit.retry_after or 10.0, 60.0)
-                    await on_event("status", {"text": f"Lots of requests in flight for your balance; retrying in {delay:.0f}s."})
+                    if kw["max_tokens"] > 8192:  # and reserve less per call
+                        kw["max_tokens"] = max(8192, kw["max_tokens"] // 2)
+                    delay = min(credit.retry_after or 10.0, 60.0 if waits > 1 else 15.0)
+                    await on_event("status", {"text": f"Lots of requests in flight for your balance; retrying in {delay:.0f}s "
+                                                      f"with a smaller reply budget ({kw['max_tokens']:,} tokens)."})
                     await asyncio.sleep(delay)
                     continue
                 if credit.kind == "too_big" and kw["max_tokens"] > 4096:
@@ -236,12 +248,12 @@ class MessagesLLM:
                 final = await stream.get_final_message()
         except Exception as e:
             if self.audit:
-                self.audit.write("model.aux_error", "system", model=model.id, purpose=system[:60],
+                self.audit.write("model.aux_error", "system", CURRENT_TASK.get(), model=model.id, purpose=system[:60],
                                  error=f"{type(e).__name__}: {e}")
             raise
         if self.audit:
             u = final.usage
-            self.audit.write("model.aux_call", "system", model=model.id, purpose=system[:60],
+            self.audit.write("model.aux_call", "system", CURRENT_TASK.get(), model=model.id, purpose=system[:60],
                              tokens_in=u.input_tokens, tokens_out=u.output_tokens,
                              cost_usd=round(model.cost(u.input_tokens or 0, u.output_tokens or 0), 6),
                              ms=int((time.time() - started) * 1000))

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import urlsplit
 import shlex
 import time
 from dataclasses import dataclass
@@ -95,8 +96,8 @@ LOW_COMMANDS = {
     "mkdir": "creates folders", "touch": "creates files", "cp": "copies files", "mv": "moves files",
     "ln": "creates links", "tar": "packs/unpacks archives", "zip": "creates archives",
     "unzip": "unpacks archives", "gzip": "compresses files", "gunzip": "decompresses files",
-    "tee": "writes files", "sed": "edits text", "awk": "processes text", "cd": "changes directory",
-    "export": "sets a variable", "source": "loads settings", "true": "no-op", "sleep": "waits",
+    "tee": "writes files", "sed": "edits files in place", "awk": "edits files in place", "cd": "changes directory",
+    "export": "sets a variable", "source": "loads settings",
 }
 LOW_SUBCOMMANDS = [
     (("git", "add"), "stages files"), (("git", "init"), "creates a repo"), (("git", "clone"), "downloads a repo"),
@@ -109,7 +110,9 @@ SAFE_COMMANDS = {
     "tree", "sort", "uniq", "cut", "tr", "jq", "yq", "diff", "cmp", "md5sum", "sha256sum", "basename",
     "dirname", "realpath", "readlink", "column", "nl", "seq", "test", "[", "env", "printenv", "uptime",
     "free", "ps", "top", "lsof", "nproc", "find", "fd", "xxd", "hexdump", "od", "strings", "man", "help",
+    "true", "false", "sleep", "ss", "netstat",
 }
+LOCAL_HOST = re.compile(r"^(localhost|127(\.\d{1,3}){3}|\[?::1\]?|0\.0\.0\.0)$", re.I)
 SAFE_SUBCOMMANDS = [
     ("git", "status"), ("git", "log"), ("git", "diff"), ("git", "show"), ("git", "branch"), ("git", "remote"),
     ("git", "rev-parse"), ("git", "ls-files"), ("git", "blame"), ("pip", "list"), ("pip", "show"),
@@ -186,8 +189,21 @@ def _classify_segment(seg: str, toks: list[str], workspace: Path) -> tuple[str, 
     hit = next((why for (e, s), why in HIGH_SUBCOMMANDS if e == exe and s == sub), None)
     if hit:
         return "high", f"It {hit}.", True
-    if exe in ("curl", "wget") and re.search(r"(-X\s*(POST|PUT|PATCH|DELETE)|--data|-d\s|--upload-file|-T\s|-F\s|--form)", seg):
-        return "high", "It sends data to a website.", True
+    if exe in ("curl", "wget"):
+        hosts = [urlsplit(u if "://" in u else "http://" + u).hostname or ""
+                 for u in re.findall(r"https?://[^\s'\"]+|(?<![\w./-])(?:localhost|127\.\d+\.\d+\.\d+|\[::1\])(?::\d+)?[^\s'\"]*", seg)]
+        local = bool(hosts) and all(LOCAL_HOST.match(h) for h in hosts)
+        sends = re.search(r"(-X\s*(POST|PUT|PATCH|DELETE)|--data|-d\s|--upload-file|-T\s|-F\s|--form)", seg)
+        saves = re.search(r"(\s-o\s|--output|\s-O\b|--remote-name)", seg) or exe == "wget"
+        if local:
+            if sends:
+                return "low", "Sends a request to a server running on this computer.", True
+            return ("low", "Saves a page from a server on this computer.", True) if saves \
+                else ("safe", "Reads from a server running on this computer.", True)
+        if sends:
+            return "high", "It sends data to a website.", True
+    if exe in ("sed", "awk") and not re.search(r"(\s-i\b|\s-i[.\w]|--in-place|-i\s*inplace|inplace)", seg):
+        return ("low", "Reads files outside the workspace.", True) if outside_args else ("safe", "Read-only.", True)
     if (exe, sub) in SAFE_SUBCOMMANDS or (exe in SAFE_COMMANDS and not (exe == "find" and re.search(r"-delete|-exec", seg))) \
             or (sub in VERSION_FLAGS and len(toks) == 2):
         if outside_args and exe not in ("which", "type", "echo", "printf"):

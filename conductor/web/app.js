@@ -46,6 +46,7 @@ const ICONS = {
   down: '<path d="M7 13V4H4v9zM7 13l4 7c1.5 0 2.5-1 2.2-2.5L12.5 14H18a2 2 0 0 0 2-2.3l-1.2-6A2 2 0 0 0 16.8 4H7"/>',
   arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
   bulb: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   thought: '<path d="M7 18a4 4 0 0 1-.6-8A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1 .5 8z"/><circle cx="5" cy="21" r="1"/>',
 };
 const icon = (name) => svg(ICONS[name] || ICONS.sparkle);
@@ -280,9 +281,11 @@ async function showTask(id) {
     h("span", { class: "hint" }, "Side by side:"),
     (task.compares || []).map((c) => h("a", { class: "cmp" + (c.id === id ? " active" : ""), "data-nav": `/t/${c.id}`, href: `/t/${c.id}` },
       h("i", { class: `dot ${c.status}` }), shortModel(c.model) || "routing…", c.cost_usd ? h("small", {}, fmtCost(c.cost_usd)) : null)));
-  const thread = h("div", { class: "thread" });
+  const thread = h("div", { class: "thread" + (prefs.focusView ? " focus-view" : "") });
+  const liveStatus = h("div", { class: "live-status", hidden: true }, h("span", { class: "live-dot" }), h("span", { class: "live-text" }, "Working…"));
+  const setLive = (t) => { liveStatus.lastChild.textContent = t.length > 120 ? t.slice(0, 118) + "…" : t; };
   const inner = h("div", { class: "thread-inner" });
-  thread.append(inner);
+  thread.append(inner, liveStatus);
 
   // computer panel
   const panes = { plan: h("div", { class: "pane" }), browser: h("div", { class: "pane" }), files: h("div", { class: "pane" }), agents: h("div", { class: "pane" }) };
@@ -331,7 +334,14 @@ async function showTask(id) {
       inner.querySelectorAll(".thought").forEach((t) => t.classList.toggle("open", prefs.showThinking));
     } }, icon("thought"));
   const backLink = task.parent_id ? h("a", { class: "cmp", "data-nav": `/t/${task.parent_id}`, href: `/t/${task.parent_id}`, title: "Back to the main task" }, "← main task") : null;
-  const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, upSel, compareSel, thinkBtn,
+  const focusBtn = h("button", { class: "icon-btn" + (prefs.focusView ? " on" : ""),
+    title: "Focus view: only responses, updates, and anything that needs you",
+    onclick: () => {
+      prefs.focusView = !prefs.focusView; savePrefs();
+      focusBtn.classList.toggle("on", prefs.focusView);
+      thread.classList.toggle("focus-view", prefs.focusView);
+    } }, icon("eye"));
+  const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, upSel, compareSel, focusBtn, thinkBtn,
     h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => computer.classList.toggle("hidden") }, icon("panel")),
     h("button", { class: "icon-btn", title: "Delete task", onclick: async () => {
       if (!confirm("Delete this task and its history?")) return;
@@ -372,6 +382,8 @@ async function showTask(id) {
     pill.className = `pill ${s}`;
     pill.textContent = STATUS_LABEL[s] || s;
     comp.setRunning(s === "running" || s === "waiting" || s === "queued");
+    liveStatus.hidden = s !== "running";
+    if (s === "waiting") setLive("Waiting for you");
     if (!(s === "running" || s === "waiting")) inner.querySelectorAll(".cursor").forEach((e) => e.classList.remove("cursor"));
   }
   setStatus(task.running ? task.status : task.status === "running" ? "done" : task.status);
@@ -536,18 +548,25 @@ async function showTask(id) {
       setTimeout(() => input.focus(), 50);
     }
     v.requests[d.id] = card;
-    addAct(card);
+    addAct(card, "keep");
   }
 
   // ---------------------------------------------------------------- event handler
   function handle(ev) {
     const d = ev.data || {};
+    if (ev.type === "progress" || ev.type === "progress_delta") {
+      const key = `p:${d.turn}:${d.index}`;
+      const raw = ev.type === "progress" ? d.text : ((v.live[key] && v.live[key].raw) || "") + d.text;
+      setLive((raw || "").trim().split("\n")[0] || "Thinking…");
+    } else if (ev.type === "tool_call") setLive(`${d.summary}…`);
+    else if (ev.type === "server_tool") setLive(/search/.test(d.name || "") ? "Searching the web…" : "Reading a page…");
+    else if (ev.type === "part" && d.action === "started") setLive(`${d.name || shortModel(d.model)} is working on “${d.title}”…`);
     switch (ev.type) {
       case "user":
         if (d.queued) {  // said mid-task: show it in the running timeline, where it happened
           const badge = h("span", { class: "queued-badge" }, "queued · it'll see this at its next step");
           addAct(h("div", { class: "card midtask" }, h("div", { class: "title" }, icon("chat"), "You, while it worked", badge),
-            h("div", { class: "midtask-text" }, d.text)));
+            h("div", { class: "midtask-text" }, d.text)), "keep");
           (v.queued = v.queued || []).push(badge);
           scroll(true);
           break;
@@ -744,7 +763,7 @@ async function showTask(id) {
         break;
       }
       case "message":
-        addAct(h("div", { class: "card" }, h("div", { class: "title" }, icon("chat"), "Update"), md(d.text)));
+        addAct(h("div", { class: "card" }, h("div", { class: "title" }, icon("chat"), "Update"), md(d.text)), "keep");
         break;
       case "memory":
         addAct(h("span", {}, d.action === "saved" ? `Remembered: ${d.content}` : d.action === "updated" ? `Updated memory #${d.id}` : `Forgot memory #${d.id}`));
@@ -1034,6 +1053,24 @@ async function showSafety() {
     h("p", { class: "sev-reason" }, "Commands the rules don't recognize are rated by the router's small model, which explains its reasoning. If it can't decide, you're asked."),
     h("h2", { class: "section" }, "Always-allowed"), rules);
 }
+
+// ------------------------------------------------------------------ theme
+const THEMES = ["system", "light", "dark"];
+function applyTheme() {
+  const t = prefs.theme || "system";
+  if (t === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  const btn = $("#themeBtn");
+  if (btn) btn.replaceChildren(svg(t === "dark" ? '<path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/>'
+    : t === "light" ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+    : '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>'),
+    `Theme: ${t[0].toUpperCase() + t.slice(1)}`);
+}
+$("#themeBtn").addEventListener("click", () => {
+  prefs.theme = THEMES[(THEMES.indexOf(prefs.theme || "system") + 1) % THEMES.length];
+  savePrefs(); applyTheme();
+});
+applyTheme();
 
 // ------------------------------------------------------------------ boot
 (async () => {

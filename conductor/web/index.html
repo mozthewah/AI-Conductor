@@ -9,6 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
+  <script>try { var t = JSON.parse(localStorage.getItem("conductor.prefs") || "{}").theme; if (t && t !== "system") document.documentElement.setAttribute("data-theme", t); } catch (e) {}</script>
   <script src="/static/vendor/marked.min.js" defer></script>
   <script src="/static/vendor/purify.min.js" defer></script>
   <script src="/static/app.js" defer></script>
@@ -33,6 +34,7 @@
         <a data-nav="/files"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Files</a>
       </nav>
       <div class="model-chip" id="modelChip"></div>
+      <button class="theme-btn" id="themeBtn" type="button"></button>
     </aside>
     <button class="menu-btn" id="menuBtn" aria-label="Menu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
     <main id="main"></main>

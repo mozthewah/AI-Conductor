@@ -1,0 +1,387 @@
+"""The Conductor: runs tasks as an agent loop and broadcasts everything it does.
+
+Flow for one task:
+  build a frozen system prompt (memories + skill index)  ->
+  loop { stream a model turn -> run requested tools in parallel -> append results } ->
+  final answer -> reflect and learn (memories, episode summary, skills).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+from . import prompts
+from .config import Settings
+from .llm import INTERRUPTED_SENTINEL, LLM, ClaudeLLM, describe_api_error, text_of
+from .skills import SkillLibrary
+from .store import PROFILE_KINDS, Store, new_id
+from .tools import Tool, ToolContext, ToolError, build_registry, clip
+
+log = logging.getLogger("conductor")
+
+# Events that stream token-by-token are broadcast live but not persisted;
+# the finished block is persisted as its own event instead.
+EPHEMERAL = {"text_delta", "progress_delta", "tool_start", "text_start"}
+
+
+def server_tools() -> list[dict]:
+    return [
+        {"type": "web_search_20260209", "name": "web_search"},
+        {"type": "web_fetch_20260209", "name": "web_fetch"},
+    ]
+
+
+class Conductor:
+    def __init__(self, settings: Settings, llm: LLM | None = None, store: Store | None = None):
+        settings.ensure_dirs()
+        self.settings = settings
+        self.store = store or Store(settings.db_path)
+        self.skills = SkillLibrary(settings.skills_dir)
+        self.llm: LLM = llm or ClaudeLLM(settings.model, settings.effort, settings.max_tokens)
+        self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
+        self.browser_pool = None
+        self._subscribers: dict[str, set[asyncio.Queue]] = {}
+        self._running: dict[str, asyncio.Task] = {}
+        self._pending: dict[str, tuple[str, asyncio.Future, dict]] = {}
+
+    # ------------------------------------------------------------------ events
+    async def emit(self, task_id: str, type_: str, data: dict) -> None:
+        if type_ in EPHEMERAL:
+            ev = {"task_id": task_id, "seq": None, "type": type_, "data": data}
+        else:
+            ev = self.store.append_event(task_id, type_, data)
+        for q in list(self._subscribers.get(task_id, ())):
+            q.put_nowait(ev)
+
+    def subscribe(self, task_id: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._subscribers.setdefault(task_id, set()).add(q)
+        return q
+
+    def unsubscribe(self, task_id: str, q: asyncio.Queue) -> None:
+        self._subscribers.get(task_id, set()).discard(q)
+
+    # ------------------------------------------------------------------ prompts
+    def _profile(self) -> list[dict]:
+        rows = [m for m in self.store.list_memories(limit=200) if m["kind"] in PROFILE_KINDS]
+        return rows[:40]
+
+    def build_system_prompt(self, prompt: str, depth: int = 0) -> str:
+        profile = prompts.bullet(self._profile(), "(nothing yet)")
+        if depth > 0:
+            return prompts.SUBAGENT.format(today=prompts.today(), profile=profile,
+                                           skills=self.skills.index(), workspace=self.settings.workspace)
+        related = self.store.search_memories(prompt, limit=8, exclude_kinds=PROFILE_KINDS)
+        shell_note = ("run immediately." if self.settings.approval == "auto"
+                      else "need the user's approval each time, so batch related commands together.")
+        return prompts.CONDUCTOR.format(
+            today=prompts.today(), profile=profile,
+            related=prompts.bullet(related, "(none)"), skills=self.skills.index(),
+            workspace=self.settings.workspace, shell_note=shell_note,
+        )
+
+    def tool_list(self, depth: int) -> list[Tool]:
+        return [t for t in self.tools.values() if depth == 0 or not t.top_level_only]
+
+    def tool_specs(self, depth: int) -> list[dict]:
+        specs = [t.spec() for t in self.tool_list(depth)]
+        if self.settings.web_tools:
+            specs += server_tools()
+        return specs
+
+    # ------------------------------------------------------------------ public API
+    def start_task(self, prompt: str, origin: str = "user") -> str:
+        title = prompt.strip().splitlines()[0][:90] if prompt.strip() else "Untitled task"
+        task_id = self.store.create_task(title, origin=origin, system_prompt=self.build_system_prompt(prompt))
+        self._launch(task_id, prompt)
+        return task_id
+
+    def send_message(self, task_id: str, prompt: str) -> None:
+        if task_id in self._running:
+            raise RuntimeError("That task is still running - wait for it or cancel it first.")
+        if not self.store.get_task(task_id):
+            raise KeyError(task_id)
+        self._launch(task_id, prompt)
+
+    def is_running(self, task_id: str) -> bool:
+        return task_id in self._running
+
+    def cancel(self, task_id: str) -> bool:
+        t = self._running.get(task_id)
+        if t:
+            t.cancel()
+            return True
+        return False
+
+    async def wait(self, task_id: str) -> None:
+        t = self._running.get(task_id)
+        if t:
+            await asyncio.gather(t, return_exceptions=True)
+
+    def _launch(self, task_id: str, prompt: str) -> None:
+        self.store.update_task(task_id, status="running")
+        t = asyncio.create_task(self._run_top(task_id, prompt))
+        self._running[task_id] = t
+        t.add_done_callback(lambda _: self._running.pop(task_id, None))
+
+    async def _run_top(self, task_id: str, prompt: str) -> None:
+        answer = await self.run(task_id, prompt, depth=0)
+        task = self.store.get_task(task_id)
+        if task and task["status"] == "done" and self.settings.learning:
+            try:
+                await self.reflect(task_id)
+            except Exception as e:  # learning is best-effort
+                log.warning("reflection failed: %s", e)
+                await self.emit(task_id, "status", {"text": f"Skipped learning step ({describe_api_error(e)})"})
+        return answer
+
+    # ------------------------------------------------------------------ the loop
+    async def run(self, task_id: str, prompt: str, depth: int = 0) -> str:
+        task = self.store.get_task(task_id)
+        system = task["system_prompt"]
+        effort = self.settings.effort if depth == 0 else self.settings.subagent_effort
+        messages = self.store.load_messages(task_id)
+
+        # If a previous run was cancelled mid-tool, answer the dangling tool calls first
+        # (the transcript is append-only - we never rewrite earlier turns).
+        content: list[dict] = [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": True, "content": "Cancelled by the user."}
+            for tid in self._dangling_tool_ids(messages)
+        ]
+        content.append({"type": "text", "text": prompt})
+        self._append(task_id, messages, "user", content)
+        self.store.update_task(task_id, status="running")
+        await self.emit(task_id, "user", {"text": prompt})
+
+        ctx = ToolContext(conductor=self, task_id=task_id, depth=depth)
+        specs = self.tool_specs(depth)
+        answer = ""
+        try:
+            for _ in range(self.settings.max_steps):
+                turn = len(messages)
+
+                async def on_event(kind: str, data: dict, _turn=turn) -> None:
+                    await self.emit(task_id, kind, {**data, "turn": _turn})
+
+                resp = await self.llm.turn(system=system, messages=messages, tools=specs,
+                                           on_event=on_event, effort=effort)
+                blocks = resp["content"]
+                self._append(task_id, messages, "assistant", blocks)
+                usage = resp.get("usage") or {}
+                self.store.add_usage(task_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+                await self._emit_blocks(task_id, turn, blocks)
+
+                stop = resp.get("stop_reason")
+                if stop == "pause_turn":
+                    continue
+                if stop == "refusal":
+                    answer = text_of(blocks) or "I can't help with that request."
+                    await self.emit(task_id, "status", {"text": "The model declined this request."})
+                    break
+
+                tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+                if not tool_uses:
+                    answer = text_of(blocks)
+                    if stop == "max_tokens":
+                        answer += "\n\n_(Reply was cut off at the output limit - say \"continue\" to resume.)_"
+                    elif stop == "model_context_window_exceeded":
+                        answer += "\n\n_(This conversation is full - start a new task to keep going.)_"
+                    break
+
+                truncated = stop == "max_tokens"
+                results = await asyncio.gather(*[self._run_tool(ctx, b, truncated) for b in tool_uses])
+                self._append(task_id, messages, "user", list(results))
+            else:
+                answer = (text_of(messages[-1]["content"]) if messages[-1]["role"] == "assistant" else "")
+                answer += f"\n\n_(Stopped after {self.settings.max_steps} steps.)_"
+
+            self.store.update_task(task_id, status="done", answer=answer)
+            await self.emit(task_id, "done", {"answer": answer})
+            return answer
+        except asyncio.CancelledError:
+            self.store.update_task(task_id, status="cancelled")
+            await self.emit(task_id, "cancelled", {})
+            raise
+        except Exception as e:
+            log.exception("task %s failed", task_id)
+            msg = describe_api_error(e)
+            self.store.update_task(task_id, status="error", answer=msg)
+            await self.emit(task_id, "error", {"text": msg})
+            return f"Error: {msg}"
+
+    def _append(self, task_id: str, messages: list[dict], role: str, content: Any) -> None:
+        messages.append({"role": role, "content": content})
+        self.store.append_message(task_id, role, content)
+
+    @staticmethod
+    def _dangling_tool_ids(messages: list[dict]) -> list[str]:
+        if not messages or messages[-1]["role"] != "assistant":
+            return []
+        content = messages[-1]["content"]
+        return [b["id"] for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+    async def _emit_blocks(self, task_id: str, turn: int, blocks: list[dict]) -> None:
+        for i, b in enumerate(blocks):
+            t = b.get("type")
+            if t == "thinking" and b.get("thinking") and b["thinking"].strip() != INTERRUPTED_SENTINEL:
+                await self.emit(task_id, "progress", {"turn": turn, "index": i, "text": b["thinking"]})
+            elif t == "text" and b.get("text"):
+                await self.emit(task_id, "assistant_text", {"turn": turn, "index": i, "text": b["text"]})
+
+    async def _run_tool(self, ctx: ToolContext, block: dict, truncated: bool) -> dict:
+        tid, name, args = block["id"], block["name"], block.get("input")
+        tool = self.tools.get(name)
+
+        def result(content: Any, error: bool = False) -> dict:
+            r = {"type": "tool_result", "tool_use_id": tid, "content": content}
+            if error:
+                r["is_error"] = True
+            return r
+
+        if truncated:
+            return result("Your tool call was cut off at the output limit. Retry with smaller input "
+                          "(e.g. write a large file in parts with append).", True)
+        if tool is None or (ctx.depth > 0 and tool.top_level_only):
+            return result(f"Unknown tool '{name}'.", True)
+        problem = tool.validate(args)
+        if problem:
+            return result(json.dumps({"INVALID_INPUT": problem}), True)
+
+        await self.emit(ctx.task_id, "tool_call", {
+            "id": tid, "name": name, "summary": tool.describe(args), "risky": tool.risky,
+            "input": {k: (clip(v, 2000) if isinstance(v, str) else v) for k, v in args.items()},
+        })
+        try:
+            out = await tool.handler(ctx, args)
+            ok = True
+        except ToolError as e:
+            out, ok = str(e), False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("tool %s crashed", name)
+            out, ok = f"{type(e).__name__}: {e}", False
+
+        preview = out if isinstance(out, str) else next(
+            (b.get("text", "") for b in out if b.get("type") == "text"), "")
+        await self.emit(ctx.task_id, "tool_result", {"id": tid, "name": name, "ok": ok,
+                                                      "preview": clip(preview, 1500)})
+        return result(out, not ok)
+
+    # ------------------------------------------------------------------ sub-agents
+    async def run_subagent(self, parent_id: str, title: str, instructions: str) -> str:
+        child = self.store.create_task(title, parent_id=parent_id, origin="subagent",
+                                       system_prompt=self.build_system_prompt(instructions, depth=1))
+        await self.emit(parent_id, "subagent", {"action": "started", "id": child, "title": title})
+        answer = await self.run(child, instructions, depth=1)
+        status = self.store.get_task(child)["status"]
+        await self.emit(parent_id, "subagent", {"action": "finished", "id": child, "title": title,
+                                                "status": status, "preview": clip(answer, 400)})
+        return answer
+
+    # ------------------------------------------------------------------ human in the loop
+    def _root(self, task_id: str) -> dict:
+        task = self.store.get_task(task_id)
+        while task and task.get("parent_id"):
+            task = self.store.get_task(task["parent_id"])
+        return task
+
+    def interactive(self, task_id: str) -> bool:
+        root = self._root(task_id)
+        return bool(root) and root["origin"] == "user"
+
+    async def _wait_for_user(self, task_id: str, kind: str, payload: dict) -> dict | None:
+        if not self.interactive(task_id):
+            return None
+        root_id = self._root(task_id)["id"]
+        rid = new_id("r_")
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = (root_id, fut, {"kind": kind, **payload})
+        self.store.update_task(root_id, status="waiting")
+        await self.emit(root_id, "request", {"id": rid, "kind": kind, "from_task": task_id, **payload})
+        try:
+            res = await fut
+        finally:
+            self._pending.pop(rid, None)
+            self.store.update_task(root_id, status="running")
+        await self.emit(root_id, "request_resolved", {"id": rid, **res})
+        return res
+
+    def pending_requests(self, task_id: str | None = None) -> list[dict]:
+        return [{"id": rid, "task_id": tid, **p} for rid, (tid, _, p) in self._pending.items()
+                if task_id is None or tid == task_id]
+
+    def resolve_request(self, request_id: str, approved: bool = True, text: str = "") -> bool:
+        entry = self._pending.get(request_id)
+        if not entry or entry[1].done():
+            return False
+        entry[1].set_result({"approved": approved, "text": text})
+        return True
+
+    async def request_approval(self, task_id: str, tool: str, summary: str, args: dict) -> bool:
+        if self.settings.approval == "auto":
+            return True
+        res = await self._wait_for_user(task_id, "approval", {"tool": tool, "summary": summary})
+        return bool(res and res["approved"])
+
+    async def ask_user(self, task_id: str, question: str, options: list[str]) -> str | None:
+        res = await self._wait_for_user(task_id, "question", {"question": question, "options": options})
+        if not res or not res["approved"]:
+            return None
+        return res["text"] or "(no answer)"
+
+    # ------------------------------------------------------------------ learning
+    def _trace(self, task_id: str) -> str:
+        """A compact transcript for reflection: requests, actions, outcomes."""
+        lines: list[str] = []
+        for ev in self.store.load_events(task_id):
+            d, t = ev["data"], ev["type"]
+            if t == "user":
+                lines.append(f"USER: {d['text']}")
+            elif t == "progress":
+                lines.append(f"  (note) {d['text']}")
+            elif t == "tool_call":
+                lines.append(f"  -> {d['name']}: {clip(json.dumps(d['input']), 300)}")
+            elif t == "tool_result" and not d["ok"]:
+                lines.append(f"     ! error: {clip(d['preview'], 200)}")
+            elif t == "skill":
+                lines.append(f"  [skill {d['action']}: {d['name']}]")
+            elif t == "memory":
+                lines.append(f"  [memory {d['action']}: {d.get('content', '')}]")
+            elif t == "done":
+                lines.append(f"ASSISTANT FINAL: {clip(d['answer'], 3000)}")
+        return clip("\n".join(lines), 40_000)
+
+    async def reflect(self, task_id: str) -> dict:
+        await self.emit(task_id, "status", {"text": "Reflecting on what to remember..."})
+        existing = self.store.list_memories(limit=100)
+        out = await self.llm.structured(
+            system=prompts.REFLECT_SYSTEM,
+            prompt=prompts.REFLECT_PROMPT.format(
+                trace=self._trace(task_id),
+                memories="\n".join(f"- [{m['kind']}] {m['content']}" for m in existing if m["kind"] != "episode")
+                or "(none)",
+                skills=self.skills.index()),
+            schema=prompts.REFLECT_SCHEMA,
+            effort=self.settings.reflection_effort,
+        )
+        learned: dict[str, Any] = {"memories": [], "skill": None}
+        if out.get("summary"):
+            self.store.add_memory("episode", out["summary"], task_id)
+        for m in out.get("memories", [])[:5]:
+            mid = self.store.add_memory(m["kind"], m["content"], task_id)
+            learned["memories"].append({"id": mid, **m})
+        if out.get("save_skill") and out.get("skill_name") and out.get("skill_instructions"):
+            skill = self.skills.save(out["skill_name"], out.get("skill_description", ""), out["skill_instructions"])
+            learned["skill"] = {"name": skill.name, "description": skill.description}
+        await self.emit(task_id, "learned", learned)
+        return learned
+
+    async def shutdown(self) -> None:
+        for t in list(self._running.values()):
+            t.cancel()
+        if self.browser_pool:
+            await self.browser_pool.shutdown()

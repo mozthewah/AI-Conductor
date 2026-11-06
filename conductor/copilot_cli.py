@@ -195,3 +195,34 @@ class CopilotCLI:
     def stop_all(self) -> None:
         for key in list(self._procs):
             self.stop(key)
+
+
+# Copilot's own tool names -> the Claude Code names Conductor's safety rules know.
+COPILOT_TOOLS = {"bash": "Bash", "shell": "Bash", "powershell": "Bash", "run_in_terminal": "Bash",
+                 "view": "Read", "read": "Read", "read_file": "Read", "create": "Write", "write": "Write",
+                 "write_file": "Write", "edit": "Edit", "str_replace": "Edit", "str_replace_editor": "Edit",
+                 "apply_patch": "Edit", "glob": "Glob", "grep": "Grep", "rg": "Grep", "ls": "LS",
+                 "web_fetch": "WebFetch", "fetch": "WebFetch", "web_search": "WebSearch", "task": "Task"}
+
+
+def hook_request(body: dict) -> tuple[str, dict]:
+    """(tool, input) from a permission hook payload, whichever shape sent it: Claude Code / Claude-format
+    (tool_name, tool_input) or Copilot's own (toolName, toolArgs as a JSON string, or toolInput)."""
+    body = body or {}
+    tool = str(body.get("tool_name") or body.get("toolName") or body.get("tool") or "")
+    raw = next((body[k] for k in ("tool_input", "toolInput", "toolArgs", "input", "arguments") if body.get(k)), {})
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {"command": raw} if tool.lower() in ("bash", "shell", "powershell") else {"value": raw}
+    inp = dict(raw) if isinstance(raw, dict) else {"value": raw}
+    tool = COPILOT_TOOLS.get(tool.lower(), tool) if tool and not tool[0].isupper() else tool
+    if tool in ("Read", "Write", "Edit") and "file_path" not in inp:
+        p = inp.get("path") or inp.get("filePath") or inp.get("file")
+        if p:
+            inp["file_path"] = p
+    if tool == "Bash" and "command" not in inp:
+        inp["command"] = inp.get("cmd") or inp.get("script") or ""
+    return tool, inp
+

@@ -1029,8 +1029,16 @@ class Conductor:
     # ------------------------------------------------------------------ Claude Code (your subscription)
     def _continue_via(self, task_id: str, model, hands_off: bool) -> str | None:
         """Which subscription worker this task should keep running on (or start on, if preferred)."""
-        route = self.store.get_task(task_id).get("route") or {}
+        task = self.store.get_task(task_id)
+        route = task.get("route") or {}
         via = route.get("via")
+        if via and (model.provider == "local" or route.get("via_from", task.get("model")) != task.get("model")):
+            # The task was moved to another model since (by you, or to your own server): that model runs it now.
+            route = {k: v for k, v in route.items() if k not in ("via", "via_from", "cli_session", "copilot_session")}
+            self.store.update_task(task_id, route=route)
+            via = None
+        if model.provider == "local":
+            return None
         if hands_off and not self.credits.low:  # a composer goes back to composing once credits are fine
             return None
         if via == "claude_cli" and self._cli_ready(task_id):
@@ -1103,7 +1111,7 @@ class Conductor:
         resume = route.get("cli_session")
         if route.get("via") != "claude_cli":
             current = self.catalog.get(task.get("model") or self.settings.fallback_model)
-            route.update({"via": "claude_cli", "cli_model": alias})
+            route.update({"via": "claude_cli", "cli_model": alias, "via_from": task.get("model")})
             self.store.update_task(task_id, route=route)
             payload = {"task_id": task_id, "from": current.id, "from_name": current.name or current.id,
                        "to": f"claude-code/{alias}", "name": f"Claude Code ({alias.title()})", "by": "claude_cli",
@@ -1181,7 +1189,7 @@ class Conductor:
             if hands_off:
                 reason = (reason + " " if reason else "") + "Copilot will finish the rest of the request itself."
             current = self.catalog.get(task.get("model") or self.settings.fallback_model)
-            route.update({"via": "copilot", "copilot_model": model})
+            route.update({"via": "copilot", "copilot_model": model, "via_from": task.get("model")})
             self.store.update_task(task_id, route=route)
             payload = {"task_id": task_id, "from": current.id, "from_name": current.name or current.id,
                        "to": f"copilot/{model}", "name": f"GitHub Copilot ({model})", "by": "copilot",
@@ -1241,10 +1249,12 @@ class Conductor:
         self._append(task_id, messages, "assistant", [{"type": "text", "text": answer}], model=f"copilot/{model}")
         return answer
 
-    async def cli_permission(self, task_id: str, tool: str, inp: dict, show: bool = False) -> tuple[bool, str]:
+    async def cli_permission(self, task_id: str, tool: str, inp: dict, show: bool = False,
+                             raw: dict | None = None) -> tuple[bool, str]:
         """A subscription worker asks before a tool call. `show` also puts the step in the task (Copilot,
         whose own steps aren't streamed)."""
-        allowed, why = await self._cli_permission(task_id, tool, inp)
+        allowed, why = await self._cli_permission(task_id, tool, inp, who="Copilot" if show else "Claude Code",
+                                                  raw=raw)
         if show:
             from .claude_cli import TOOL_NAMES, describe
             await self.emit(task_id, "tool_call", {
@@ -1253,8 +1263,10 @@ class Conductor:
                 "input": {k: (v[:2000] if isinstance(v, str) else v) for k, v in (inp or {}).items()}})
         return allowed, why
 
-    async def _cli_permission(self, task_id: str, tool: str, inp: dict) -> tuple[bool, str]:
+    async def _cli_permission(self, task_id: str, tool: str, inp: dict, who: str = "Claude Code",
+                              raw: dict | None = None) -> tuple[bool, str]:
         """Claude Code asks before each tool call: rate it with Conductor's rules and ask the user if needed."""
+        from .claude_cli import describe
         from .safety import SECRET_PATHS, assess_shell
         ws = self.settings.workspace.resolve()
 
@@ -1282,8 +1294,18 @@ class Conductor:
             return True, ""
         if tool in ("WebFetch", "WebSearch", "TodoWrite", "Agent", "Task", "Skill", "ToolSearch"):
             return True, ""  # reading the web / planning / helpers (whose own tool calls come back here)
-        ok = await self.request_approval(task_id, "claude_cli", f"Claude Code: {tool}", {"tool": tool},
-                                         Assessment("medium", f"Claude Code wants to use {tool}."))
+        if not tool:  # couldn't tell what it wants: show what it sent rather than a blank
+            sent = json.dumps({k: v for k, v in (raw or {}).items() if k not in ("sessionId", "session_id", "cwd",
+                                                                               "timestamp", "transcript_path")},
+                              default=str)[:300]
+            ok = await self.request_approval(task_id, "claude_cli", f"{who}: an action it didn't name", {"request": sent},
+                                             Assessment("medium", f"{who} asked for permission without saying for "
+                                                                  f"what. It sent: {sent}"))
+            return ok, "" if ok else "Declined by the user's safety settings."
+        detail = describe(tool, inp) if inp else tool
+        ok = await self.request_approval(task_id, "claude_cli", f"{who}: {detail}", {"tool": tool, **{
+            k: (v[:500] if isinstance(v, str) else v) for k, v in list(inp.items())[:6]}},
+                                         Assessment("medium", f"{who} wants to use {tool}."))
         return ok, "" if ok else "Declined by the user's safety settings."
 
     def _call_cost(self, model, system: str, messages: list[dict], tools: list[dict], reply: int = 4096) -> float:

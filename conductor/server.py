@@ -290,8 +290,13 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         if not task_id:
             allowed, why = False, "This Claude Code run isn't one Conductor started."
         else:
-            allowed, why = await c().cli_permission(task_id, str(body.get("tool_name", "")), body.get("tool_input") or {},
-                                                    show=token in c()._copilot_tokens)
+            from .copilot_cli import hook_request
+            tool, inp = hook_request(body)
+            if not tool:  # an unfamiliar payload: keep a record so it can be understood
+                c().audit.write("cli.hook_unknown", "system", task_id, keys=sorted(body)[:20],
+                                sample=json.dumps(body, default=str)[:600])
+            allowed, why = await c().cli_permission(task_id, tool, inp, show=token in c()._copilot_tokens,
+                                                    raw=body)
         out = {"hookEventName": "PreToolUse", "permissionDecision": "allow" if allowed else "deny"}
         if why:
             out["permissionDecisionReason"] = why

@@ -184,3 +184,47 @@ def test_hook_file_is_inert_outside_conductor(tmp_path, monkeypatch):
     cfg = json.loads(p.read_text())
     entry = cfg["hooks"]["PermissionRequest"][0]
     assert cfg["version"] == 1 and entry["args"] == ["-m", "conductor.hook_relay"] and entry["timeoutSec"] >= 600
+
+
+def test_copilot_hook_payload_shapes():
+    assert copilot_cli.hook_request({"toolName": "bash", "toolArgs": '{"command": "gh repo list"}'}) == (
+        "Bash", {"command": "gh repo list"})
+    tool, inp = copilot_cli.hook_request({"toolName": "view", "toolInput": {"path": "/etc/passwd"}})
+    assert tool == "Read" and inp["file_path"] == "/etc/passwd"
+    assert copilot_cli.hook_request({"tool_name": "Bash", "tool_input": {"command": "ls"}}) == ("Bash", {"command": "ls"})
+    assert copilot_cli.hook_request({"toolName": "shell", "toolArgs": "ls -la"}) == ("Bash", {"command": "ls -la"})
+
+
+def test_copilot_hook_camelcase_is_shown_and_labelled(tmp_path, monkeypatch):
+    c = make(tmp_path, FakeLLM([]))
+    tid = c.store.create_task("t")
+    c.cli_runs["tok"] = tid
+    c._copilot_tokens.add("tok")
+    asked = []
+
+    async def approve(task_id, tool, summary, inp, assessment):
+        asked.append(summary)
+        return True
+    monkeypatch.setattr(c, "request_approval", approve)
+    with TestClient(create_app(c, run_scheduler=False)) as client:
+        client.post("/api/cli/hook/tok", json={"toolName": "bash", "toolArgs": '{"command": "rm -rf build"}'})
+        client.post("/api/cli/hook/tok", json={"toolName": "github-mcp-server-list_repos", "toolArgs": "{}"})
+        client.post("/api/cli/hook/tok", json={"something": "else"})
+    assert asked[0] == "Run: rm -rf build"
+    assert asked[1].startswith("Copilot: github-mcp-server-list_repos")
+    assert asked[2].startswith("Copilot: an action it didn't name")
+    shown = [e["data"]["summary"] for e in c.store.load_events(tid) if e["type"] == "tool_call"]
+    assert shown[0] == "$ rm -rf build"
+
+
+def test_moving_a_task_off_copilot_sticks(tmp_path):
+    c = make(tmp_path, FakeLLM([]))
+    tid = c.store.create_task("t")
+    c.store.update_task(tid, model=GPT.id, route={"via": "copilot", "via_from": GPT.id})
+    c.copilot.path = "/bin/true"
+    c.store.update_task(tid, model=OPUS.id)  # you picked another model
+    assert c._continue_via(tid, OPUS, False) is None
+    assert "via" not in c.store.get_task(tid)["route"]
+    local = ModelInfo("local/gemma", "local", "Gemma")
+    c.store.update_task(tid, model=local.id, route={"via": "copilot"})  # older tasks have no via_from
+    assert c._continue_via(tid, local, False) is None

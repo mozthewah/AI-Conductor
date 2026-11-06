@@ -26,3 +26,10 @@ def _no_headroom_proxy_probe(monkeypatch):
 def _no_real_headroom_proxy(monkeypatch):
     """Never launch a real Headroom proxy from tests."""
     monkeypatch.setattr("conductor.compression.HeadroomProxy.start", lambda self: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_copilot_cli(monkeypatch):
+    """Never launch a real GitHub Copilot CLI, or touch ~/.copilot, from tests."""
+    monkeypatch.setattr("conductor.copilot_cli.find", lambda path="": None)
+    monkeypatch.setattr("conductor.agent.install_copilot_hook", lambda: None)

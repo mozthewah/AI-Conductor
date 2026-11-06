@@ -153,6 +153,9 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_KEY_NAME` | – | Name of your OpenRouter API key, if `doctor` can't match it automatically |
 | `CONDUCTOR_CLAUDE_CLI` | `fallback` | Hand work to Claude Code on your subscription: `fallback`, `prefer`, `off` |
 | `CONDUCTOR_CLAUDE_PATH` | – | Path to the `claude` CLI if it isn't on PATH |
+| `CONDUCTOR_COPILOT` | `fallback` | Hand work to GitHub Copilot CLI on your Copilot subscription: `fallback`, `prefer`, `off` |
+| `CONDUCTOR_COPILOT_MODEL` | – | Force a Copilot model (default: the task's model if Copilot has it, else `auto`) |
+| `CONDUCTOR_COPILOT_HEADROOM` | `auto` | Run Copilot through Headroom once `headroom copilot-auth login` is done (`auto`, `off`) |
 | `CONDUCTOR_HEADROOM` | `auto` | Compress bulky tool output with Headroom when it's installed (`auto`, `on`, `off`) |
 | `CONDUCTOR_HEADROOM_PROXY` | `auto` | Headroom's proxy for the Claude Code fallback: `auto` (Conductor runs it), `connect` (you run it), `off`, or a URL |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
@@ -360,6 +363,31 @@ Conductor can hand work to it, and that runs on your subscription instead of Ope
   works from a background service too; `CONDUCTOR_CLAUDE_PATH` overrides.
 - `conductor doctor` shows whether it found the CLI. It's the CLI's documented headless mode
   (`claude -p`) running on your own machine for your own work.
+
+## GitHub Copilot fallback (your Copilot subscription)
+
+If the [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) is installed and signed in
+(`npm install -g @github/copilot`, then `copilot` and `/login`), Conductor can hand work to it too. Copilot
+carries GPT, Claude and Gemini models.
+
+- **When** (`CONDUCTOR_COPILOT=fallback`): the same situations as Claude Code (credits low or out, a step
+  too big, "too many requests in flight", the provider failing). GPT and Gemini tasks try Copilot first;
+  Claude tasks try Claude Code first, then Copilot. `prefer` sends GPT/Gemini/Claude specialists to
+  Copilot from the start; `off` never.
+- **Model**: the task's model if Copilot has it (e.g. `gpt-6.1-sol`), otherwise Copilot's `auto`.
+  `CONDUCTOR_COPILOT_MODEL` forces one.
+- **Safety**: Copilot runs without `--allow-all-tools`. Each action that needs permission goes through a
+  `PermissionRequest` hook to Conductor's safety levels (asking you in the app when needed), and shows up
+  in the task as it happens. The hook file is `~/.copilot/hooks/conductor-approvals.json`; it does nothing
+  unless Conductor started the run, so your own Copilot sessions are unaffected. If the hook isn't loaded,
+  Copilot's own rules apply, which in prompt mode deny anything not pre-approved.
+- **Through Headroom**: once Headroom has its own Copilot sign-in (`headroom copilot-auth login`), runs go
+  through `headroom wrap copilot --native` so Copilot's traffic is compressed too. Headroom marks this
+  route experimental; if a run fails through it, Conductor runs Copilot directly from then on.
+- **Usage**: runs count against your Copilot plan (AI credits or premium requests). If you hit the quota,
+  Conductor leaves Copilot alone for 30 minutes.
+- Each run gets the brief plus the work so far (Copilot can't load Conductor's safety hook into a resumed
+  session, so follow-ups start a fresh Copilot session with the full context).
 
 ## Saving tokens with Headroom
 

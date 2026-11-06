@@ -300,6 +300,22 @@ def doctor(args) -> None:
            "(run `claude` once and sign in with your Claude account if you haven't)")
     else:
         print("  Claude Code CLI not found (optional: install it to fall back to your Claude subscription)")
+    from . import copilot_cli
+    if s.copilot == "off":
+        print("  GitHub Copilot fallback is off (CONDUCTOR_COPILOT=off)")
+    elif (cp := copilot_cli.find(s.copilot_path)):
+        import subprocess
+        try:
+            ver = subprocess.run([cp, "--version"], capture_output=True, text=True, timeout=20).stdout.strip().splitlines()[0]
+        except Exception as e:
+            ver = f"version check failed: {e}"
+        ok(f"GitHub Copilot CLI found ({ver}); mode {s.copilot}. It runs on your Copilot subscription "
+           "(run `copilot` once and /login if you haven't)")
+        if s.copilot_headroom != "off":
+            print("  Copilot through Headroom: " + ("on (Headroom is signed in to Copilot)" if copilot_cli.headroom_copilot_ready()
+                  else "off until you run `headroom copilot-auth login` (optional; needs headroom-ai[proxy])"))
+    else:
+        print("  GitHub Copilot CLI not found (optional: npm install -g @github/copilot, to fall back to your Copilot subscription)")
     if s.browser:
         try:
             from .tools.browser import BrowserPool

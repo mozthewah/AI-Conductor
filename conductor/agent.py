@@ -26,6 +26,8 @@ from .benchmarks import Benchmarks
 from .account import Account
 from .claude_cli import ClaudeCLI, model_alias
 from .compression import Compressor, HeadroomProxy, proxy_url
+from .copilot_cli import CopilotCLI, install_hook as install_copilot_hook
+from .copilot_cli import model_name as copilot_model_name, serves as copilot_serves
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
@@ -84,6 +86,13 @@ class Conductor:
         self.compressor = Compressor(settings.headroom, settings.workspace)
         self._hr_proxy_failed = False         # Claude Code through Headroom's proxy didn't work: go direct
         self._cli_failed: set[str] = set()   # tasks Claude Code couldn't take this run (reason shown once)
+        self.copilot = CopilotCLI(settings.copilot_path, settings.copilot, settings.copilot_model,
+                                  settings.copilot_headroom)
+        self._copilot_failed: set[str] = set()
+        self._copilot_limited_until = 0.0
+        self._copilot_hr_failed = False
+        self._copilot_tokens: set[str] = set()  # hook tokens of Copilot runs (their steps are shown via the hook)
+        self._explained: set[str] = set()
         self.hr_proxy = HeadroomProxy(settings.headroom_proxy, settings.data_dir / "logs")
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
@@ -297,7 +306,9 @@ class Conductor:
     # ------------------------------------------------------------------ the loop
     async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None,
                   effort: str | None = None, announce: bool = True) -> str:
-        self._cli_failed.discard(task_id)  # each run gets a fresh chance at the Claude Code fallback
+        self._cli_failed.discard(task_id)  # each run gets a fresh chance at the subscription fallbacks
+        self._copilot_failed.discard(task_id)
+        self._explained.discard(task_id)
         token = CURRENT_TASK.set(task_id)  # so side calls (supervisor, safety judge) are logged against it
         try:
             return await self._run(task_id, prompt, depth, route, effort, announce)
@@ -352,8 +363,10 @@ class Conductor:
                         self._handoff_note(task_id, messages)
                         hedgy_turns, nudged_at = 0, None
                 model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
-                if self._wants_cli(task_id, model, hands_off):
-                    ans = await self._run_via_cli(task_id, messages, hands_off, "")
+                via = self._continue_via(task_id, model, hands_off)
+                if via:
+                    ans = await (self._run_via_cli(task_id, messages, hands_off, "") if via == "claude_cli"
+                                 else self._run_via_copilot(task_id, messages, hands_off, ""))
                     if ans is not None:
                         answer = ans
                         break
@@ -364,8 +377,8 @@ class Conductor:
                 byok_only: list[str] = []
                 if model.provider == "openrouter":
                     model, cli_why = await self._credit_check(task_id, model, hands_off)
-                    if cli_why:  # credits are short and Claude Code (your subscription) can take this
-                        ans = await self._run_via_cli(task_id, messages, hands_off, cli_why)
+                    if cli_why:  # credits are short and a subscription (Claude Code / Copilot) can take this
+                        ans = await self._run_subscription(task_id, model, messages, hands_off, cli_why)
                         if ans is not None:
                             answer = ans
                             break
@@ -394,27 +407,27 @@ class Conductor:
                     if ce.kind == "out":
                         self.credits.mark_out()
                         why = "OpenRouter credits are used up."
-                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                        if self._sub_first(model) and (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                             answer = ans
                             break
                         if byok_only or not await self._switch_to_byok(task_id, str(ce)):
-                            if (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                            if (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                                 answer = ans
                                 break
                             await self._pause_for_credits(task_id, ce)
                     elif ce.kind == "too_big":  # this call costs more than the balance, even with a small reply
                         need = self._call_cost(model, system, messages, specs)
                         why = f"The next step needs about ${need:.2f} of OpenRouter credit on hand."
-                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                        if self._sub_first(model) and (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                             answer = ans
                             break
                         if not await self._switch_for_budget(task_id, model, need, str(ce)):
-                            if (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                            if (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                                 answer = ans
                                 break
                             await self._pause_for_credits(task_id, ce, need=need)
-                    elif model.is_claude and self._cli_ready(task_id) and (ans := await self._run_via_cli(
-                            task_id, messages, hands_off, "OpenRouter keeps saying your balance can't cover more "
+                    elif self._sub_first(model) and self._sub_ready(task_id, model) and (ans := await self._run_subscription(
+                            task_id, model, messages, hands_off, "OpenRouter keeps saying your balance can't cover more "
                             "requests right now.")) is not None:
                         answer = ans
                         break
@@ -429,7 +442,7 @@ class Conductor:
                     from .llm import is_transient
                     if not byok_only and is_transient(call_err) and model.provider == "openrouter":
                         why = f"{model.name or model.id} kept failing at the provider."
-                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                        if self._sub_first(model) and (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                             answer = ans
                             break
                         if provider_switches < 2 and await self._switch_after_errors(task_id, model, call_err):
@@ -442,8 +455,8 @@ class Conductor:
                             "text": f"{model.name or model.id} didn't work on your own {', '.join(byok_only)} key "
                                     f"({str(call_err)[:120]}); trying another."})
                         if not await self._switch_to_byok(task_id, "Credits are used up."):
-                            if (ans := await self._run_via_cli(task_id, messages, hands_off,
-                                                               "Credits are used up and your own keys didn't work.")) is not None:
+                            if (ans := await self._run_subscription(task_id, model, messages, hands_off,
+                                                                    "Credits are used up and your own keys didn't work.")) is not None:
                                 answer = ans
                                 break
                             await self._pause_for_credits(task_id, CreditError("out", "Credits are used up, and "
@@ -796,8 +809,8 @@ class Conductor:
                                                   "byok": [b.get("provider") for b in self.account.byok_keys()]
                                                   if self.account.has_byok else []})
         level = st["level"]
-        cli = self._cli_ready(task_id)
-        if cli and model.is_claude and (level == "out" or (level == "low" and not hands_off)):
+        cli = self._any_sub_ready(task_id)
+        if self._sub_first(model) and self._sub_ready(task_id, model) and (level == "out" or (level == "low" and not hands_off)):
             have = f" (${st['available']:.2f} left)" if st.get("available") is not None else ""
             return model, ("OpenRouter credits are used up." if level == "out"
                            else f"OpenRouter credits are low{have}, so this saves them.")
@@ -811,15 +824,53 @@ class Conductor:
         return self.catalog.get(self.store.get_task(task_id).get("model") or model.id), None
 
     async def _explain_no_cli(self, task_id: str) -> None:
-        """Say (once per task run) why the Claude Code fallback isn't taking over."""
-        if task_id in self._cli_failed:
+        """Say (once per task run) why neither subscription fallback (Claude Code, Copilot) is taking over."""
+        if task_id in self._explained:
             return
-        self._cli_failed.add(task_id)
-        why = ("it's turned off (CONDUCTOR_CLAUDE_CLI=off)" if self.cli.mode == "off"
-               else "the `claude` command isn't visible to the Conductor process (start Conductor from a shell "
-                    "where `claude` works, or set CONDUCTOR_CLAUDE_PATH)" if not self.cli.exe
-               else "your Claude subscription's usage limit was reached recently")
-        await self.emit(self._root(task_id)["id"], "status", {"text": f"Couldn't hand this to Claude Code: {why}."})
+        self._explained.add(task_id)
+        claude = ("turned off (CONDUCTOR_CLAUDE_CLI=off)" if self.cli.mode == "off"
+                  else "the `claude` command isn't visible to Conductor (start Conductor from a shell where it "
+                       "works, or set CONDUCTOR_CLAUDE_PATH)" if not self.cli.exe
+                  else "its usage limit was reached recently" if time.time() < self._cli_limited_until
+                  else "it couldn't take this one")
+        copilot = ("turned off (CONDUCTOR_COPILOT=off)" if self.copilot.mode == "off"
+                   else "not installed (or set CONDUCTOR_COPILOT_PATH)" if not self.copilot.exe
+                   else "its quota was reached recently" if time.time() < self._copilot_limited_until
+                   else "it couldn't take this one")
+        await self.emit(self._root(task_id)["id"], "status", {
+            "text": f"Couldn't hand this to a subscription. Claude Code: {claude}. GitHub Copilot: {copilot}."})
+
+    def _copilot_ready(self, task_id: str) -> bool:
+        return (self.copilot.available and time.time() >= self._copilot_limited_until
+                and task_id not in self._copilot_failed)
+
+    def _sub_first(self, model) -> bool:
+        """Models a subscription carries go there before BYOK / cheaper-model switches."""
+        return model.is_claude or copilot_serves(model.id)
+
+    def _sub_ready(self, task_id: str, model) -> bool:
+        return ((model.is_claude and self._cli_ready(task_id))
+                or (copilot_serves(model.id) and self._copilot_ready(task_id)))
+
+    def _any_sub_ready(self, task_id: str) -> bool:
+        return self._cli_ready(task_id) or self._copilot_ready(task_id)
+
+    async def _run_subscription(self, task_id: str, model, messages: list[dict], hands_off: bool,
+                                reason: str) -> str | None:
+        """Hand the task to a subscription worker: Claude tasks try Claude Code, then Copilot; others try
+        Copilot, then Claude Code. Returns the answer, or None (with the reason shown) if neither can."""
+        order = ("claude", "copilot") if model.is_claude else ("copilot", "claude")
+        for worker in order:
+            if worker == "claude" and self._cli_ready(task_id):
+                ans = await self._run_via_cli(task_id, messages, hands_off, reason)
+            elif worker == "copilot" and self._copilot_ready(task_id):
+                ans = await self._run_via_copilot(task_id, messages, hands_off, reason)
+            else:
+                continue
+            if ans is not None:
+                return ans
+        await self._explain_no_cli(task_id)
+        return None
 
     def _cli_ready(self, task_id: str) -> bool:
         return (self.cli.available and time.time() >= self._cli_limited_until
@@ -898,13 +949,26 @@ class Conductor:
         return True
 
     # ------------------------------------------------------------------ Claude Code (your subscription)
-    def _wants_cli(self, task_id: str, model, hands_off: bool) -> bool:
-        if not self._cli_ready(task_id):
-            return False
+    def _continue_via(self, task_id: str, model, hands_off: bool) -> str | None:
+        """Which subscription worker this task should keep running on (or start on, if preferred)."""
         route = self.store.get_task(task_id).get("route") or {}
-        if hands_off:  # a composer only stays on Claude Code while credits are still short
-            return route.get("via") == "claude_cli" and self.credits.low
-        return route.get("via") == "claude_cli" or (self.cli.mode == "prefer" and model.is_claude)
+        via = route.get("via")
+        if hands_off and not self.credits.low:  # a composer goes back to composing once credits are fine
+            return None
+        if via == "claude_cli" and self._cli_ready(task_id):
+            return "claude_cli"
+        if via == "copilot" and self._copilot_ready(task_id):
+            return "copilot"
+        if hands_off:
+            return None
+        if self.cli.mode == "prefer" and model.is_claude and self._cli_ready(task_id):
+            return "claude_cli"
+        if self.copilot.mode == "prefer" and copilot_serves(model.id) and self._copilot_ready(task_id):
+            return "copilot"
+        return None
+
+    def _wants_cli(self, task_id: str, model, hands_off: bool) -> bool:  # (kept for older callers)
+        return self._continue_via(task_id, model, hands_off) == "claude_cli"
 
     def _proxy_for_cli(self) -> str | None:
         """Headroom's proxy URL if it's up; if Conductor manages it and it isn't running, (re)start it
@@ -1028,7 +1092,90 @@ class Conductor:
         self._append(task_id, messages, "assistant", [{"type": "text", "text": answer}], model=f"claude-code/{alias}")
         return answer
 
-    async def cli_permission(self, task_id: str, tool: str, inp: dict) -> tuple[bool, str]:
+    async def _run_via_copilot(self, task_id: str, messages: list[dict], hands_off: bool, reason: str) -> str | None:
+        """Hand this task to GitHub Copilot CLI on the user's Copilot subscription."""
+        if not self._copilot_ready(task_id):
+            return None
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        model = route.get("copilot_model") or copilot_model_name(task.get("model") or "", self.settings.copilot_model)
+        if route.get("via") != "copilot":
+            if hands_off:
+                reason = (reason + " " if reason else "") + "Copilot will finish the rest of the request itself."
+            current = self.catalog.get(task.get("model") or self.settings.fallback_model)
+            route.update({"via": "copilot", "copilot_model": model})
+            self.store.update_task(task_id, route=route)
+            payload = {"task_id": task_id, "from": current.id, "from_name": current.name or current.id,
+                       "to": f"copilot/{model}", "name": f"GitHub Copilot ({model})", "by": "copilot",
+                       "direction": "cli", "reason": (reason + " " if reason else "")
+                       + "Continuing on GitHub Copilot with your Copilot subscription."}
+            await self.emit(task_id, "escalated", payload)
+            if self._root(task_id)["id"] != task_id:
+                await self.emit(self._root(task_id)["id"], "escalated", payload)
+        hook_file = await asyncio.to_thread(install_copilot_hook)
+        token = secrets.token_urlsafe(18)
+        self.cli_runs[token] = task_id
+        self._copilot_tokens.add(token)
+        hook = f"{self.server_url}/api/cli/hook/{token}" if self.server_url and hook_file else None
+        preface = (f"You're a specialist working for Conductor, the user's AI assistant, in its workspace "
+                   f"({self.settings.workspace}). The user follows along in Conductor's app, so your final reply is "
+                   f"your report to them. Don't use port {self.settings.port} (Conductor runs there); stop any "
+                   "background servers you start. Some actions may be declined by the user's safety settings; if "
+                   "so, find another way or say what you need.\n\n")
+        prompt = preface + self._cli_prompt(task, messages, False)
+
+        async def on_event(kind: str, data: dict) -> None:
+            await self.emit(task_id, kind, data)
+        started = time.time()
+        via_hr = False
+        try:
+            via_hr = not self._copilot_hr_failed and await asyncio.to_thread(self.copilot.use_headroom)
+            run = lambda m, hr: self.copilot.run(task_id, prompt=prompt, model=m, cwd=str(self.settings.workspace),
+                                                 on_event=on_event, hook_url=hook, via_headroom=hr)
+            res = await run(model, via_hr)
+            if via_hr and res.is_error and not res.limited:
+                self._copilot_hr_failed = True
+                via_hr = False
+                await self.emit(task_id, "status", {"text": "Copilot didn't work through Headroom; running it directly."})
+                res = await run(model, False)
+            if res.is_error and res.error.startswith("model:") and model != "auto":
+                model = "auto"  # Copilot doesn't have that model: let it pick
+                route = dict(self.store.get_task(task_id).get("route") or {})
+                route["copilot_model"] = model
+                self.store.update_task(task_id, route=route)
+                res = await run(model, via_hr)
+        except FileNotFoundError:
+            return None
+        finally:
+            self.cli_runs.pop(token, None)
+            self._copilot_tokens.discard(token)
+        self.audit.write("model.call", "system", task_id, model=f"copilot/{model}", via="copilot", headroom=via_hr,
+                         ok=not res.is_error, ms=int((time.time() - started) * 1000), error=res.error or None,
+                         cost_usd=0.0)
+        if res.is_error:
+            self._copilot_failed.add(task_id)
+            if res.limited:
+                self._copilot_limited_until = time.time() + 30 * 60
+            await self.emit(task_id, "status", {"text": "GitHub Copilot couldn't continue: "
+                                                        + res.error.removeprefix("model:")})
+            return None
+        answer = res.text
+        self._append(task_id, messages, "assistant", [{"type": "text", "text": answer}], model=f"copilot/{model}")
+        return answer
+
+    async def cli_permission(self, task_id: str, tool: str, inp: dict, show: bool = False) -> tuple[bool, str]:
+        """A subscription worker asks before a tool call. `show` also puts the step in the task (Copilot,
+        whose own steps aren't streamed)."""
+        allowed, why = await self._cli_permission(task_id, tool, inp)
+        if show:
+            from .claude_cli import TOOL_NAMES, describe
+            await self.emit(task_id, "tool_call", {
+                "id": f"copilot-{secrets.token_hex(4)}", "name": TOOL_NAMES.get(tool, tool), "risky": False,
+                "summary": describe(tool, inp) + ("" if allowed else " (declined)"), "via": "copilot",
+                "input": {k: (v[:2000] if isinstance(v, str) else v) for k, v in (inp or {}).items()}})
+        return allowed, why
+
+    async def _cli_permission(self, task_id: str, tool: str, inp: dict) -> tuple[bool, str]:
         """Claude Code asks before each tool call: rate it with Conductor's rules and ask the user if needed."""
         from .safety import SECRET_PATHS, assess_shell
         ws = self.settings.workspace.resolve()
@@ -1434,6 +1581,7 @@ class Conductor:
     async def shutdown(self) -> None:
         import os, signal
         self.cli.stop_all()
+        self.copilot.stop_all()
         self.hr_proxy.stop()
         for p in list(self.processes.values()):
             try:

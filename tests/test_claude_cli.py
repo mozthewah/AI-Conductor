@@ -255,7 +255,7 @@ async def test_says_why_when_claude_code_cant_take_it(tmp_path, monkeypatch):
     c.credits.resume_now()
     assert not c.cli.available
     said = [e["data"]["text"] for e in seen if e["type"] == "status" and "Claude Code" in e["data"].get("text", "")]
-    assert said and "isn't visible to the Conductor process" in said[0]
+    assert said and "isn't visible to Conductor" in said[0]
     for t in list(c._running.values()):
         t.cancel()
 

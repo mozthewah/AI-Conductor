@@ -289,7 +289,8 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         if not task_id:
             allowed, why = False, "This Claude Code run isn't one Conductor started."
         else:
-            allowed, why = await c().cli_permission(task_id, str(body.get("tool_name", "")), body.get("tool_input") or {})
+            allowed, why = await c().cli_permission(task_id, str(body.get("tool_name", "")), body.get("tool_input") or {},
+                                                    show=token in c()._copilot_tokens)
         out = {"hookEventName": "PreToolUse", "permissionDecision": "allow" if allowed else "deny"}
         if why:
             out["permissionDecisionReason"] = why

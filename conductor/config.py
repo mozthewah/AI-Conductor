@@ -56,6 +56,10 @@ class Settings:
     headroom: str = "auto"                # compress bulky tool output with Headroom: auto (if installed) | on | off
     headroom_proxy: str = "auto"          # Headroom's proxy for Claude Code: auto (run it) | connect (yours) | off | URL
     claude_cli_path: str = ""             # where the `claude` CLI is, if it isn't on PATH
+    copilot: str = "fallback"             # GitHub Copilot CLI on your Copilot subscription: fallback | prefer | off
+    copilot_path: str = ""                # where the `copilot` CLI is, if it isn't on PATH
+    copilot_model: str = ""               # force a Copilot model (default: the task's model if Copilot has it, else auto)
+    copilot_headroom: str = "auto"        # run Copilot through Headroom when Headroom is signed in to Copilot: auto | off
     byok: str = "auto"                    # auto: lean on your own provider keys when credits run low/out;
                                           # prefer: also favour them while credits are fine; off: ignore
     effort: str = "high"
@@ -127,6 +131,10 @@ class Settings:
             headroom=os.environ.get("CONDUCTOR_HEADROOM", cls.headroom).lower(),
             headroom_proxy=os.environ.get("CONDUCTOR_HEADROOM_PROXY", cls.headroom_proxy),
             claude_cli_path=os.environ.get("CONDUCTOR_CLAUDE_PATH", ""),
+            copilot=os.environ.get("CONDUCTOR_COPILOT", cls.copilot).lower(),
+            copilot_path=os.environ.get("CONDUCTOR_COPILOT_PATH", ""),
+            copilot_model=os.environ.get("CONDUCTOR_COPILOT_MODEL", ""),
+            copilot_headroom=os.environ.get("CONDUCTOR_COPILOT_HEADROOM", cls.copilot_headroom).lower(),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),
             approval={"ask": "low", "auto": "high"}.get(
                 os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),

@@ -21,7 +21,8 @@ def serve(args) -> None:
 
     os.environ["CONDUCTOR_PORT"] = str(args.port)  # so tools know not to take this port
     print(f"{BOLD}AI Conductor{RESET} -> http://{args.host}:{args.port}")
-    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning")
+    # A short graceful window closes open live-update streams instead of dumping tracebacks on Ctrl+C.
+    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning", timeout_graceful_shutdown=2)
 
 
 async def _ainput(prompt: str) -> str:

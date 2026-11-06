@@ -124,3 +124,17 @@ async def test_fetch_results_are_reported():
     results = {d["id"]: d for k, d in events if k == "server_tool_result"}
     assert results["a"] == {"id": "a", "ok": False, "detail": "url_not_accessible"}
     assert results["b"]["ok"] and "characters" in results["b"]["detail"]
+
+
+async def test_view_image_returns_the_image_for_vision_models(tmp_path):
+    import base64
+    c, ctx = ctx_for(tmp_path)
+    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+    (tmp_path / "ws" / "mock.png").write_bytes(png)
+    out = await c.tools["view_image"].handler(ctx, {"path": "mock.png"})
+    assert out[1]["type"] == "image" and out[1]["source"]["media_type"] == "image/png"
+    from conductor.models import ModelInfo
+    c.catalog.models["x/blind"] = ModelInfo("x/blind", "openrouter", "Blind", vision=False)
+    c.store.update_task(ctx.task_id, model="x/blind")
+    with pytest.raises(ToolError, match="can't see images"):
+        await c.tools["view_image"].handler(ctx, {"path": "mock.png"})

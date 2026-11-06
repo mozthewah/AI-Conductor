@@ -75,6 +75,30 @@ async def edit_file(ctx: ToolContext, args: dict) -> str:
     return f"Edited {rel(ctx, p)}."
 
 
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp"}
+
+
+async def view_image(ctx: ToolContext, args: dict) -> list[dict]:
+    import base64
+    p = resolve(ctx, args["path"])
+    media = IMAGE_TYPES.get(p.suffix.lower())
+    if not p.is_file() or not media:
+        raise ToolError(f"No image at {args['path']} (supported: png, jpg, gif, webp).")
+    task = ctx.store.get_task(ctx.task_id)
+    model = ctx.conductor.catalog.get(task.get("model") or "")
+    if model.id in ctx.conductor.catalog.models and not model.vision:
+        raise ToolError(f"{model.name or model.id} can't see images. Use consult_expert (pick a vision model with "
+                        "find_model) to have one describe it, or hand this part to a model that can see.")
+    data = p.read_bytes()
+    if len(data) > 4_500_000:
+        raise ToolError(f"That image is {len(data) // 1_000_000} MB; the limit is about 4.5 MB. Make a smaller copy "
+                        "first (e.g. with ImageMagick or the browser tool's screenshot).")
+    return [{"type": "text", "text": f"{rel(ctx, p)} ({len(data) // 1024} KB)"},
+            {"type": "image", "source": {"type": "base64", "media_type": media,
+                                         "data": base64.standard_b64encode(data).decode()}}]
+
+
 async def list_files(ctx: ToolContext, args: dict) -> str:
     base = resolve(ctx, args.get("path", "."))
     if not base.is_dir():
@@ -233,6 +257,8 @@ TOOLS = [
     Tool("edit_file", "Replace one exact, unique snippet of text in a workspace file.",
          {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
          ["path", "old", "new"], edit_file, summarize=lambda a: f"Edited {a.get('path')}"),
+    Tool("view_image", "Look at an image file in the workspace (mockups, screenshots, charts, photos).",
+         {"path": {"type": "string"}}, ["path"], view_image, summarize=lambda a: f"Looked at {a.get('path')}"),
     Tool("list_files", "List files under a workspace directory (recursive).",
          {"path": {"type": "string", "description": "Directory, default '.'"}},
          [], list_files, summarize=lambda a: f"Listed {a.get('path', 'workspace')}"),

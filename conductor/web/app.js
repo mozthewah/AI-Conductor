@@ -55,7 +55,7 @@ const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", hand_down: "arrowDown", find_model: "search", report_blocked: "x", show_user: "eye", processes: "term", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", hand_down: "arrowDown", find_model: "search", view_image: "eye", report_blocked: "x", show_user: "eye", processes: "term", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -611,8 +611,21 @@ async function showTask(id) {
         el.replaceChildren(md(d.text));
         break;
       }
+      case "turn_reset": {  // a model call dropped and is being retried: discard its half-streamed output
+        for (const key of Object.keys(v.live)) {
+          if (key.startsWith(`p:${d.turn}:`) || key.startsWith(`a:${d.turn}:`)) {
+            const el = v.live[key];
+            (el.closest(".act") || el).remove();
+            delete v.live[key];
+          }
+        }
+        for (const [key, chip] of Object.entries(v.tools)) {
+          if (chip.turn === d.turn && chip.classList.contains("pending")) { (chip.closest(".act") || chip).remove(); delete v.tools[key]; }
+        }
+        break;
+      }
       case "tool_start":
-        if (!v.tools[d.id]) toolChip(d.id, `Preparing ${d.name.replace(/_/g, " ")}…`, TOOL_ICONS[d.name]);
+        if (!v.tools[d.id]) toolChip(d.id, `Preparing ${d.name.replace(/_/g, " ")}…`, TOOL_ICONS[d.name]).turn = d.turn;
         break;
       case "tool_call": {
         const chip = v.tools[d.id] || toolChip(d.id, d.summary, TOOL_ICONS[d.name]);

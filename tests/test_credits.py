@@ -161,3 +161,44 @@ async def test_low_credits_warn_once_and_route_cheaper(tmp_path):
 async def test_without_visibility_it_probes_instead_of_waiting_forever():
     m = CreditMonitor(key="", fetch=False)
     assert await m.wait_for_credits(poll=0.01) == "probe"
+
+
+
+def test_in_flight_wording_is_recognized_without_metadata():
+    body = {"error": {"code": 402, "message": "This request would exceed your available credits given your "
+                      "current in-flight requests. Retry after in-flight requests settle, or add credits."}}
+    assert classify_402(402, body).kind == "in_flight"
+
+
+async def test_in_flight_errors_never_pause_everything(tmp_path, monkeypatch):
+    """In-flight limits are about parallel requests, not an empty balance: no global 'out', no pause cards."""
+    async def no_sleep(s):
+        return None
+    monkeypatch.setattr("conductor.agent.asyncio.sleep", no_sleep)
+
+    class InFlightOnce(FakeLLM):
+        hits = 1
+
+        async def turn(self, **kw):
+            if self.hits:
+                self.hits -= 1
+                raise CreditError("in_flight", "would exceed your available credits given your current in-flight requests")
+            return await super().turn(**kw)
+
+    c = make(tmp_path, InFlightOnce([[text("done")]]))
+    tid = c.start_task("x")
+    await asyncio.wait_for(c.wait(tid), 5)
+    types = [e["type"] for e in c.store.load_events(tid)]
+    assert "paused" not in types and c.store.get_task(tid)["status"] == "done"
+    assert c.credits.status()["level"] != "out"
+
+
+async def test_limiter_narrows_on_in_flight_and_recovers():
+    from conductor.credits import AdaptiveLimiter
+    lim = AdaptiveLimiter(start=4, recover_after=0)
+    async with lim:
+        async with lim:
+            lim.shrink()
+    assert lim.limit == 1
+    await lim.succeeded()
+    assert lim.limit == 2

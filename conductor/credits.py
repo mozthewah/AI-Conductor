@@ -58,11 +58,54 @@ def classify_402(status: int, body, headers=None, message: str = "") -> CreditEr
         return None
     if status == 402 and not (source or any(w in text for w in money_words)):
         return CreditError("out", message or "Payment required.")
-    if source == "openrouter_in_flight_budget" or reason == "in_flight_budget_exhausted":
+    if (source == "openrouter_in_flight_budget" or reason == "in_flight_budget_exhausted"
+            or "in-flight" in text or "in flight" in text):
         return CreditError("in_flight", message, retry_after or 10.0)
     if reason == "weight_exceeds_budget" or affordable is not None or "fewer max_tokens" in text:
         return CreditError("too_big", message, affordable=affordable)
     return CreditError("out", message or "Out of credits.")
+
+
+class AdaptiveLimiter:
+    """Caps how many model calls run at once. OpenRouter's in-flight budget (on smaller balances) rejects
+    requests whose combined worst-case cost exceeds a share of your balance, so when that happens we
+    run fewer at a time, and slowly widen again while calls succeed."""
+
+    def __init__(self, start: int = 6, floor: int = 1, recover_after: float = 90.0):
+        self.limit, self.ceiling, self.floor = start, start, floor
+        self.active = 0
+        self.recover_after = recover_after
+        self._last_change = 0.0
+        self._cond: asyncio.Condition | None = None
+
+    def _c(self) -> asyncio.Condition:
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def __aenter__(self):
+        c = self._c()
+        async with c:
+            await c.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+
+    async def __aexit__(self, *exc):
+        c = self._c()
+        async with c:
+            self.active -= 1
+            c.notify_all()
+
+    def shrink(self) -> None:
+        self.limit = max(self.floor, min(self.limit, self.active) - 1 if self.active > 1 else self.floor)
+        self._last_change = time.time()
+
+    async def succeeded(self) -> None:
+        if self.limit < self.ceiling and time.time() - self._last_change > self.recover_after:
+            self.limit += 1
+            self._last_change = time.time()
+            c = self._c()
+            async with c:
+                c.notify_all()
 
 
 class CreditMonitor:

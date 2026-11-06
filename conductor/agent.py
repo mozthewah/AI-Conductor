@@ -322,7 +322,11 @@ class Conductor:
                                                web=self.settings.web_tools and not hands_off,
                                                session_id=task_id)
                 except CreditError as ce:
-                    await self._pause_for_credits(task_id, ce)
+                    if ce.kind == "out":
+                        await self._pause_for_credits(task_id, ce)
+                    else:  # in-flight budget still full after retries: a short breather, not a pause
+                        await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
+                        await asyncio.sleep(30)
                     continue  # nothing was appended, so the same step simply runs again
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks, model=model.id)

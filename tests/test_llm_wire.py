@@ -148,13 +148,48 @@ async def test_openrouter_non_reasoning_model_gets_no_thinking():
     assert "thinking" not in seen[0]["body"] and "output_config" not in seen[0]["body"]
 
 
-async def test_stream_error_event_raises():
+async def test_stream_error_event_raises_after_retries():
     from conductor.llm import StreamError
     seen = []
     events = [message_start("x"), {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}]
     llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k", http_client=mock(sse(events), seen))
     with pytest.raises(StreamError, match="busy"):
         await collect(llm, ModelInfo("a/b", "openrouter"))
+    assert len(seen) == 5  # first try + 4 retries for a transient provider error
+
+
+async def test_non_transient_stream_error_is_not_retried():
+    from conductor.llm import StreamError
+    seen = []
+    events = [message_start("x"), {"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}}]
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k", http_client=mock(sse(events), seen))
+    with pytest.raises(StreamError, match="bad"):
+        await collect(llm, ModelInfo("a/b", "openrouter"))
+    assert len(seen) == 1
+
+
+async def test_dropped_connection_mid_stream_is_retried():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:  # connection resets partway through the stream (what the SDK can't retry)
+            async def body():
+                yield sse([message_start("x"), *OR_STREAM[1:4]])
+                raise httpx2.ReadError("Connection reset by peer")
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body())
+        if len(calls) == 2:  # upstream hiccup reported inside the stream
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=sse([
+                message_start("x"), {"type": "error", "error": {"type": "api_error",
+                                     "message": "Model call failed: upstream returned an invalid response"}}]))
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=sse(OR_STREAM))
+
+    llm = MessagesLLM(anthropic_enabled=False, openrouter_key="k",
+                      http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+    out, events = await collect(llm, ModelInfo("a/b", "openrouter"))
+    assert out["stop_reason"] == "end_turn" and len(calls) == 3
+    kinds = [k for k, _ in events]
+    assert kinds.count("turn_reset") == 2 and any(k == "status" and "retrying" in d["text"] for k, d in events)
 
 
 async def test_structured_without_schema_support_parses_loose_json():

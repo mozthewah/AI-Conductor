@@ -43,12 +43,14 @@ class BrowserPool:
             self._pw = await async_playwright().start()
             exe = os.environ.get("CONDUCTOR_CHROMIUM")
             try:
-                self._browser = await self._pw.chromium.launch(executable_path=exe) if exe \
-                    else await self._pw.chromium.launch()
+                # Let Conductor close Chromium on shutdown rather than Ctrl+C killing it mid-read.
+                opts = {"handle_sigint": False, "handle_sigterm": False, "handle_sighup": False}
+                self._browser = await self._pw.chromium.launch(executable_path=exe, **opts) if exe \
+                    else await self._pw.chromium.launch(**opts)
             except Exception:
                 for path in FALLBACK_CHROMIUM:
                     if Path(path).exists():
-                        self._browser = await self._pw.chromium.launch(executable_path=path)
+                        self._browser = await self._pw.chromium.launch(executable_path=path, **opts)
                         break
                 else:
                     raise
@@ -68,12 +70,15 @@ class BrowserPool:
             await page.context.close()
 
     async def shutdown(self) -> None:
-        for tid in list(self._pages):
-            await self.close_page(tid)
-        if self._browser:
-            await self._browser.close()
-        if self._pw:
-            await self._pw.stop()
+        try:
+            for tid in list(self._pages):
+                await self.close_page(tid)
+            if self._browser:
+                await self._browser.close()
+            if self._pw:
+                await self._pw.stop()
+        except Exception:
+            pass  # already gone (e.g. killed with the process); nothing left to clean up
         self._browser = self._pw = None
 
     async def snap(self, task_id: str, page) -> tuple[str, bytes]:

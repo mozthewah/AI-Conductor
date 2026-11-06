@@ -18,8 +18,9 @@ from typing import Any, Awaitable, Callable, Protocol
 import asyncio
 
 import anthropic
+import httpx2
 
-from .credits import CreditError, classify_402
+from .credits import AdaptiveLimiter, CreditError, classify_402
 from .models import ModelInfo
 
 OnEvent = Callable[[str, dict], Awaitable[None]]
@@ -48,6 +49,25 @@ class LLM(Protocol):
 class StreamError(Exception):
     """An error event arrived mid-stream (after HTTP 200)."""
 
+    def __init__(self, message: str, etype: str = "error"):
+        super().__init__(message)
+        self.etype = etype
+
+
+TRANSIENT_STREAM_ERRORS = {"api_error", "overloaded_error", "rate_limit_error", "timeout_error"}
+RETRY_DELAYS = [2, 5, 12, 25]  # seconds; network drops and provider hiccups are usually brief
+
+
+def is_transient(exc: Exception) -> bool:
+    """Worth retrying: the connection dropped, or the provider had a momentary problem."""
+    if isinstance(exc, StreamError):
+        return exc.etype in TRANSIENT_STREAM_ERRORS or "upstream" in str(exc).lower()
+    if isinstance(exc, (httpx2.TransportError, anthropic.APIConnectionError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in (408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529)
+    return isinstance(exc, (ConnectionError, TimeoutError))
+
 
 class MessagesLLM:
     def __init__(self, *, anthropic_enabled: bool, openrouter_key: str = "", max_tokens: int = 64000,
@@ -58,6 +78,7 @@ class MessagesLLM:
         self._openrouter = anthropic.AsyncAnthropic(
             auth_token=openrouter_key, base_url=OPENROUTER_BASE_URL, default_headers=OPENROUTER_HEADERS, **extra,
         ) if openrouter_key else None
+        self.limiter = AdaptiveLimiter()  # parallel OpenRouter calls; narrows when the in-flight budget bites
 
     def _client(self, model: ModelInfo):
         client = self._anthropic if model.provider == "anthropic" else self._openrouter
@@ -107,12 +128,21 @@ class MessagesLLM:
         retries = 0
         plain = False
         waits = 0
+        drops = 0
         while True:
             try:
+                if model.provider == "openrouter":
+                    async with self.limiter:
+                        result = await self._stream(client, model, kw, on_event)
+                    await self.limiter.succeeded()
+                    return result
                 return await self._stream(client, model, kw, on_event)
             except anthropic.APIStatusError as e:
                 credit = classify_402(e.status_code, e.body, getattr(e.response, "headers", None), e.message)
                 if credit is None:
+                    if is_transient(e) and drops < len(RETRY_DELAYS):
+                        drops = await self._retry_after_drop(e, drops, on_event)
+                        continue
                     if not isinstance(e, anthropic.BadRequestError):
                         raise
                     if plain or model.provider != "openrouter" or "messages" not in str(e.body or e.message):
@@ -123,6 +153,7 @@ class MessagesLLM:
                     continue
                 if credit.kind == "in_flight" and waits < 8:
                     waits += 1
+                    self.limiter.shrink()  # too much running at once for this balance: run fewer
                     delay = min(credit.retry_after or 10.0, 60.0)
                     await on_event("status", {"text": f"Lots of requests in flight for your balance; retrying in {delay:.0f}s."})
                     await asyncio.sleep(delay)
@@ -133,6 +164,10 @@ class MessagesLLM:
                     await on_event("status", {"text": f"Credits are tight; retrying with a smaller reply budget ({kw['max_tokens']:,} tokens)."})
                     continue
                 raise credit
+            except (StreamError, httpx2.TransportError, anthropic.APIConnectionError, ConnectionError, TimeoutError) as e:
+                if not is_transient(e) or drops >= len(RETRY_DELAYS):
+                    raise
+                drops = await self._retry_after_drop(e, drops, on_event)
             except ValueError:
                 # Tool-input JSON that couldn't be parsed at all. It broke before the
                 # tool_use block completed, so there's nothing to answer; re-issue the turn.
@@ -140,6 +175,15 @@ class MessagesLLM:
                 if retries > 2:
                     raise
                 await on_event("status", {"text": "Retrying a garbled tool call..."})
+
+    async def _retry_after_drop(self, exc: Exception, drops: int, on_event: OnEvent) -> int:
+        delay = RETRY_DELAYS[drops]
+        what = "The connection dropped" if isinstance(exc, (httpx2.TransportError, anthropic.APIConnectionError,
+                                                             ConnectionError)) else "The model provider had a hiccup"
+        await on_event("turn_reset", {})  # discard the half-streamed attempt in the UI
+        await on_event("status", {"text": f"{what}; retrying in {delay}s (attempt {drops + 2} of {len(RETRY_DELAYS) + 1})."})
+        await asyncio.sleep(delay)
+        return drops + 1
 
     async def _stream(self, client, model: ModelInfo, kw: dict, on_event: OnEvent) -> dict:
         api = client.beta.messages if "betas" in kw else client.messages
@@ -257,7 +301,8 @@ class Accumulator:
             self._usage(e.get("usage"))
         elif etype == "error":
             err = e.get("error") or {}
-            raise StreamError(f"{err.get('type', 'error')}: {err.get('message', 'stream failed')}")
+            raise StreamError(f"{err.get('type', 'error')}: {err.get('message', 'stream failed')}",
+                              etype=err.get("type", "error"))
 
     def result(self) -> dict:
         content = [self.blocks[i] for i in sorted(self.blocks)]

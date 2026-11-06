@@ -67,6 +67,7 @@ class Settings:
     browser: bool = True
     fetch_catalog: bool = True
     port: int = 8765  # Conductor's own web server (tools must not take this port)
+    audit: bool = True  # write data/logs/audit-YYYY-MM-DD.jsonl
 
     @property
     def default_router_model(self) -> str:
@@ -124,6 +125,7 @@ class Settings:
             web_tools=_flag("CONDUCTOR_WEB_TOOLS", True),
             browser=_flag("CONDUCTOR_BROWSER", True),
             port=int(os.environ.get("CONDUCTOR_PORT", "8765")),
+            audit=_flag("CONDUCTOR_AUDIT", True),
         )
         s.data_dir = s.data_dir.resolve()
         s.workspace = s.workspace.resolve()

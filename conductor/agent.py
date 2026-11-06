@@ -19,6 +19,7 @@ from typing import Any
 from . import prompts
 from .config import Settings
 from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
+from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
@@ -46,6 +47,7 @@ class Conductor:
         settings.ensure_dirs()
         self.settings = settings
         self.store = store or Store(settings.db_path)
+        self.audit = AuditLog(settings.data_dir / "logs", enabled=settings.audit)
         self.skills = SkillLibrary(settings.skills_dir)
         self.catalog = Catalog(settings.data_dir, has_openrouter=bool(settings.openrouter_key),
                                has_anthropic=settings.anthropic_key, fetch=settings.fetch_catalog).load()
@@ -54,6 +56,8 @@ class Conductor:
         self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
                                      fetch=settings.fetch_catalog).load()
         self.benchmarks.remap(self.catalog.models)
+        if hasattr(self.llm, "audit"):
+            self.llm.audit = self.audit
         self.router = Router(self)
         self.credits = CreditMonitor(key=settings.openrouter_key, management_key=settings.openrouter_management_key,
                                      low=settings.credit_low, fetch=settings.fetch_catalog)
@@ -76,6 +80,9 @@ class Conductor:
             ev = {"task_id": task_id, "seq": None, "type": type_, "data": data}
         else:
             ev = self.store.append_event(task_id, type_, data)
+            kind, actor = EVENT_KINDS.get(type_, (f"event.{type_}", "system"))
+            self.audit.write(kind, actor, task_id, **{(f"{k}_" if k in ("kind", "actor", "task", "ts") else k): v
+                                                     for k, v in data.items() if k != "turn"})
         for q in list(self._subscribers.get(task_id, ())):
             q.put_nowait(ev)
 
@@ -316,18 +323,31 @@ class Conductor:
 
                 if model.provider == "openrouter":
                     await self._credit_check(task_id)
+                started_call = time.time()
                 try:
                     resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
                                                on_event=on_event, effort=effort,
                                                web=self.settings.web_tools and not hands_off,
                                                session_id=task_id)
+                    u = resp.get("usage") or {}
+                    self.audit.write("model.call", "system", task_id, model=model.id, effort=effort,
+                                     stop=resp.get("stop_reason"), tokens_in=u.get("input_tokens"),
+                                     tokens_out=u.get("output_tokens"), cost_usd=round(u.get("cost", 0.0), 6),
+                                     ms=int((time.time() - started_call) * 1000), depth=depth)
                 except CreditError as ce:
+                    self.audit.write("model.credit_limit", "system", task_id, model=model.id, credit_kind=ce.kind,
+                                     error=str(ce), ms=int((time.time() - started_call) * 1000))
                     if ce.kind == "out":
                         await self._pause_for_credits(task_id, ce)
                     else:  # in-flight budget still full after retries: a short breather, not a pause
                         await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
                         await asyncio.sleep(30)
                     continue  # nothing was appended, so the same step simply runs again
+                except Exception as call_err:
+                    self.audit.write("model.error", "system", task_id, model=model.id,
+                                     error=f"{type(call_err).__name__}: {call_err}",
+                                     ms=int((time.time() - started_call) * 1000))
+                    raise
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks, model=model.id)
                 usage = resp.get("usage") or {}
@@ -746,6 +766,7 @@ class Conductor:
             "id": tid, "name": name, "summary": tool.describe(args), "risky": tool.risky,
             "input": {k: (clip(v, 2000) if isinstance(v, str) else v) for k, v in args.items()},
         })
+        tool_started = time.time()
         try:
             out = await tool.handler(ctx, args)
             ok = True
@@ -760,6 +781,7 @@ class Conductor:
         preview = out if isinstance(out, str) else next(
             (b.get("text", "") for b in out if b.get("type") == "text"), "")
         await self.emit(ctx.task_id, "tool_result", {"id": tid, "name": name, "ok": ok,
+                                                      "ms": int((time.time() - tool_started) * 1000),
                                                       "preview": clip(preview, 1500)})
         return result(out, not ok)
 

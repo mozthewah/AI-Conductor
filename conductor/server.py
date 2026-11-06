@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -59,16 +61,64 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state["c"] = conductor or Conductor(Settings.from_env())
+        s = state["c"].settings
+        state["c"].audit.write("system.start", "system", model=s.model, approval=state["c"].policy.threshold,
+                               compose=s.compose, budget=s.router_budget, port=s.port, workspace=str(s.workspace),
+                               providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key})
         sched = asyncio.create_task(scheduler.run_forever(state["c"])) if run_scheduler else None
         yield
         if sched:
             sched.cancel()
-        await state["c"].shutdown()
+        state["c"].audit.write("system.stop", "system")
+        try:
+            await state["c"].shutdown()
+        except Exception:
+            pass
 
     app = FastAPI(title="AI Conductor", lifespan=lifespan)
 
     def c() -> Conductor:
         return state["c"]
+
+    # Routine polling the page does every few seconds; logging it would bury everything else.
+    quiet_gets = re.compile(r"^/api/(tasks|tasks/[\w-]+|credits|config|models|leaderboard|safety|schedules|skills|memories|files)$")
+
+    @app.middleware("http")
+    async def audit_requests(request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/static") or path == "/api/audit/ui" or "c" not in state:
+            return await call_next(request)
+        started = time.time()
+        body = None
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and path.startswith("/api/"):
+            raw = await request.body()
+            try:
+                body = json.loads(raw) if raw else None
+            except ValueError:
+                body = f"<{len(raw)} bytes>"
+            if isinstance(body, dict):  # what was asked matters less than that it happened
+                body = {k: (f"<{len(v)} chars>" if k in ("prompt", "text", "content", "instructions") and isinstance(v, str)
+                            else v) for k, v in body.items()}
+        response = await call_next(request)
+        if not (request.method == "GET" and quiet_gets.match(path)):
+            state["c"].audit.write("http.request", "user", None, method=request.method, path=path,
+                                   query=str(request.url.query) or None, status=response.status_code,
+                                   ms=int((time.time() - started) * 1000), body=body,
+                                   client=request.client.host if request.client else None)
+        return response
+
+    @app.post("/api/audit/ui")
+    async def audit_ui(request: Request):
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except ValueError:
+            raise HTTPException(400, "bad payload")
+        for ev in (payload.get("events") or [])[:200]:
+            if isinstance(ev, dict):
+                c().audit.write(f"ui.{str(ev.get('action', 'event'))[:20]}", "user", ev.get("task"),
+                                label=ev.get("label"), element=ev.get("element"), value=ev.get("value"),
+                                page=ev.get("path"), client_ts=ev.get("t"))
+        return {"ok": True}
 
     def task_or_404(task_id: str) -> dict:
         t = c().store.get_task(task_id)

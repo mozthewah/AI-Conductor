@@ -16,6 +16,7 @@ import re
 from typing import Any, Awaitable, Callable, Protocol
 
 import asyncio
+import time
 
 import anthropic
 import httpx2
@@ -79,6 +80,7 @@ class MessagesLLM:
             auth_token=openrouter_key, base_url=OPENROUTER_BASE_URL, default_headers=OPENROUTER_HEADERS, **extra,
         ) if openrouter_key else None
         self.limiter = AdaptiveLimiter()  # parallel OpenRouter calls; narrows when the in-flight budget bites
+        self.audit = None  # set by the Conductor; logs the small one-shot calls (routing, checks, reflection)
 
     def _client(self, model: ModelInfo):
         client = self._anthropic if model.provider == "anthropic" else self._openrouter
@@ -221,8 +223,21 @@ class MessagesLLM:
         else:
             kw["messages"][0]["content"] = (
                 f"{prompt}\n\nReply with only a JSON object matching this schema:\n{json.dumps(schema)}")
-        async with client.messages.stream(**kw) as stream:
-            final = await stream.get_final_message()
+        started = time.time()
+        try:
+            async with client.messages.stream(**kw) as stream:
+                final = await stream.get_final_message()
+        except Exception as e:
+            if self.audit:
+                self.audit.write("model.aux_error", "system", model=model.id, purpose=system[:60],
+                                 error=f"{type(e).__name__}: {e}")
+            raise
+        if self.audit:
+            u = final.usage
+            self.audit.write("model.aux_call", "system", model=model.id, purpose=system[:60],
+                             tokens_in=u.input_tokens, tokens_out=u.output_tokens,
+                             cost_usd=round(model.cost(u.input_tokens or 0, u.output_tokens or 0), 6),
+                             ms=int((time.time() - started) * 1000))
         if final.stop_reason == "refusal":
             return {}
         text = "".join(b.text for b in final.content if b.type == "text")

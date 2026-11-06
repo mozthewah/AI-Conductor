@@ -144,6 +144,7 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_LEARNING` | `on` | Reflect after tasks and save memories and skills |
 | `CONDUCTOR_WEB_TOOLS` | `on` | Hosted web search and fetch |
 | `CONDUCTOR_BROWSER` | `on` | Local Chromium browser tool |
+| `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
 | `CONDUCTOR_CHROMIUM` | – | Path to a Chromium binary, if Playwright can't find one |
@@ -285,6 +286,33 @@ Conductor watches your OpenRouter credits and handles running low or out without
     own once credits are back, or right away when you press **Resume**. If it can't see your
     balance, it retries every couple of minutes instead; that's free, since OpenRouter rejects
     unfunded requests before any model runs. Nothing is redone or lost.
+
+## Audit log
+
+Everything Conductor does is written locally, one JSON object per line, to
+`data/logs/audit-YYYY-MM-DD.jsonl` (a new file each day; nothing leaves your machine):
+
+- **You:** messages you send, buttons/links you click, pages you open, dropdowns and toggles you change
+  (`ui.click`, `ui.view`, `ui.select`, `ui.toggle`), and every API request the page makes (`http.request`
+  with method, path, status, and time taken).
+- **The models:** which model was picked and why (`route.decided`), every model call with tokens, cost,
+  and duration (`model.call`), escalations and hand-downs, replies, plans, sub-agent parts.
+- **Actions:** every tool call and its result with timing (`tool.call` / `tool.result`), files changed,
+  browser screenshots, approvals (auto or yours), credit pauses/resumes, errors, server start/stop.
+
+Each entry has a millisecond timestamp, who did it (`user` / `model` / `system`), and the task id. Content
+is kept to a short preview: what you typed into a prompt is logged as its length (`"<412 chars>"`), long
+text is trimmed to 300 characters, and anything that looks like an API key or token is redacted. The
+page's routine background polling isn't logged, so the file stays readable.
+
+```bash
+conductor audit                  # last 50 entries
+conductor audit -n 200 --kind tool        # just tool calls/results
+conductor audit --task t_7f9d --kind ui   # what you clicked in one task
+conductor audit --json | jq .    # raw lines
+```
+
+Turn it off with `CONDUCTOR_AUDIT=off`. Old files aren't deleted automatically; remove them whenever.
 
 ## Troubleshooting
 

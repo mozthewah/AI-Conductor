@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 
@@ -189,6 +190,38 @@ def doctor(args) -> None:
             bad(f"Browser: {str(e).splitlines()[0]} (run `playwright install chromium`, or set CONDUCTOR_BROWSER=off)")
 
 
+def audit(args) -> None:
+    """Print recent audit-log entries: what happened, who did it, when."""
+    from .audit import AuditLog
+
+    s = Settings.from_env()
+    log = AuditLog(s.data_dir / "logs", enabled=False)
+    if not log.dir.is_dir():
+        print(f"No audit log yet ({log.dir}).")
+        return
+    rows = log.read(days=args.days)
+    if args.task:
+        rows = [r for r in rows if str(r.get("task", "")).startswith(args.task)]
+    if args.kind:
+        rows = [r for r in rows if str(r.get("kind", "")).startswith(args.kind)]
+    if args.json:
+        for r in rows[-args.lines:]:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+    skip = {"ts", "kind", "actor", "task"}
+    for r in rows[-args.lines:]:
+        ts = str(r.get("ts", ""))
+        when = ts[:10] + " " + ts[11:23] if len(ts) >= 23 else ts
+        detail = r.get("summary") or r.get("label") or r.get("text") or r.get("path") or ""
+        extra = " ".join(", ".join(f"{k}={v}" for k, v in r.items() if k not in skip and v != detail
+                                   and not isinstance(v, (dict, list))).split())[:160]
+        detail = " ".join(str(detail).split())
+        colour = RED if r.get("ok") is False or "error" in str(r.get("kind")) else (CYAN if r.get("actor") == "user" else "")
+        print(f"{DIM}{when}{RESET} {colour}{r.get('actor', '?'):6} {r.get('kind', '?'):24}{RESET} "
+              f"{DIM}{r.get('task', '') or '':10}{RESET} {str(detail)[:90]}  {DIM}{extra}{RESET}")
+    print(f"{DIM}({min(len(rows), args.lines)} of {len(rows)} entries; files in {log.dir}){RESET}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="conductor", description="Your self-hosted AI conductor.")
     sub = p.add_subparsers(dest="cmd")
@@ -196,12 +229,20 @@ def main() -> None:
     s.add_argument("--host", default=os.environ.get("CONDUCTOR_HOST", "127.0.0.1"))
     s.add_argument("--port", type=int, default=int(os.environ.get("CONDUCTOR_PORT", "8765")))
     sub.add_parser("doctor", help="check keys, models, benchmarks, and the browser")
+    au = sub.add_parser("audit", help="show the local audit log")
+    au.add_argument("-n", "--lines", type=int, default=50, help="how many entries (default 50)")
+    au.add_argument("--task", help="only this task id (prefix ok)")
+    au.add_argument("--kind", help="only kinds starting with this, e.g. tool, ui, http, model")
+    au.add_argument("--days", type=int, default=7, help="how many daily files to read (default 7)")
+    au.add_argument("--json", action="store_true", help="raw JSON lines")
     ch = sub.add_parser("chat", help="chat in the terminal")
     ch.add_argument("--auto", action="store_true", help="auto-approve everything up to high risk (critical still asks)")
     ch.add_argument("prompt", nargs="*")
     args = p.parse_args()
     if args.cmd == "chat":
         chat(args)
+    elif args.cmd == "audit":
+        audit(args)
     elif args.cmd == "doctor":
         doctor(args)
     else:

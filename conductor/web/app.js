@@ -134,6 +134,35 @@ function modelSelect(roster, { auto = true, placeholder } = {}) {
 }
 const main = $("#main");
 
+// ---- audit: clicks, views, and choices go to the local audit log (data/logs/audit-*.jsonl) ----
+const uiLog = [];
+function audit(action, label, extra = {}) {
+  uiLog.push({ action, label: String(label || "").replace(/\s+/g, " ").trim().slice(0, 100),
+               path: location.pathname, task: state.taskId || undefined, t: new Date().toISOString(), ...extra });
+  if (uiLog.length >= 50) flushAudit();
+}
+function flushAudit() {
+  if (!uiLog.length) return;
+  const body = JSON.stringify({ events: uiLog.splice(0) });
+  try {
+    if (!navigator.sendBeacon || !navigator.sendBeacon("/api/audit/ui", new Blob([body], { type: "application/json" })))
+      fetch("/api/audit/ui", { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+  } catch {}
+}
+setInterval(flushAudit, 3000);
+addEventListener("pagehide", flushAudit);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushAudit(); });
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("button, a, summary, [data-nav], [role=button], .tab, .chip, .tool-head, .thought, .route-head, .fb, .stat, .task-item");
+  if (!el) return;
+  audit("click", el.getAttribute("aria-label") || el.title || el.textContent, { element: el.tagName.toLowerCase() });
+}, true);
+document.addEventListener("change", (e) => {
+  const el = e.target;
+  if (el.matches("select")) audit("select", el.title || el.name || el.getAttribute("aria-label") || "", { value: el.value });
+  else if (el.matches("input[type=checkbox], input[type=radio]")) audit("toggle", el.title || el.name || el.closest("label")?.textContent || "", { value: String(el.checked) });
+}, true);
+
 function navigate(path) {
   if (location.pathname !== path) history.pushState({}, "", path);
   route();
@@ -146,6 +175,7 @@ document.addEventListener("click", (e) => {
 $("#menuBtn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
 
 function route() {
+  audit("view", location.pathname);
   if (state.es) { state.es.close(); state.es = null; }
   state.taskId = null;
   const p = location.pathname;

@@ -793,6 +793,12 @@ async function showTask(id) {
             h("div", { class: "sev-reason" }, "It keeps working on your provider account instead of pausing. Once you add credits, it goes back to normal routing.")), "keep");
           break;
         }
+        if (d.direction === "cli") {
+          addAct(h("div", { class: "card escalated down" }, h("div", { class: "title" }, icon("term"),
+            "Continuing on ", h("b", {}, d.name || "Claude Code"), d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
+            h("div", { class: "sev-reason" }, d.reason)), "keep");
+          break;
+        }
         if (d.direction === "sideways") {
           addAct(h("div", { class: "card escalated down" }, h("div", { class: "title" }, icon("route"),
             "Switched to ", h("b", {}, d.name || shortModel(d.to)), d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),

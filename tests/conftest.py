@@ -8,3 +8,9 @@ import pytest
 def _no_retry_waits(monkeypatch):
     """Retry backoff is real seconds in production; tests don't need to wait."""
     monkeypatch.setattr("conductor.llm.RETRY_DELAYS", [0, 0, 0, 0])
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_cli(monkeypatch):
+    """Never launch the real `claude` CLI from tests (it may be installed on the machine)."""
+    monkeypatch.setattr("conductor.claude_cli.find", lambda path="": None)

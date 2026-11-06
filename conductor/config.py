@@ -52,6 +52,8 @@ class Settings:
     openrouter_management_key: str = ""  # optional: lets Conductor see the account balance
     key_name: str = ""                    # name of OPENROUTER_API_KEY on openrouter.ai, if auto-matching fails
     credit_low: float = 2.0               # USD; below this, warn and lean on cheaper models
+    claude_cli: str = "fallback"          # Claude Code on your subscription: fallback | prefer | off
+    claude_cli_path: str = ""             # where the `claude` CLI is, if it isn't on PATH
     byok: str = "auto"                    # auto: lean on your own provider keys when credits run low/out;
                                           # prefer: also favour them while credits are fine; off: ignore
     effort: str = "high"
@@ -119,6 +121,8 @@ class Settings:
             key_name=os.environ.get("CONDUCTOR_KEY_NAME", ""),
             credit_low=float(os.environ.get("CONDUCTOR_CREDIT_LOW", cls.credit_low)),
             byok=os.environ.get("CONDUCTOR_BYOK", cls.byok).lower(),
+            claude_cli=os.environ.get("CONDUCTOR_CLAUDE_CLI", cls.claude_cli).lower(),
+            claude_cli_path=os.environ.get("CONDUCTOR_CLAUDE_PATH", ""),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),
             approval={"ask": "low", "auto": "high"}.get(
                 os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),

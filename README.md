@@ -151,6 +151,8 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_ACCESS_TOKEN` | auto | Passcode for other devices (default: generated into `data/access_token`) |
 | `CONDUCTOR_STAY_AWAKE` | `off` | Keep the computer from sleeping while serving (same as `serve --stay-awake`) |
 | `CONDUCTOR_KEY_NAME` | – | Name of your OpenRouter API key, if `doctor` can't match it automatically |
+| `CONDUCTOR_CLAUDE_CLI` | `fallback` | Hand work to Claude Code on your subscription: `fallback`, `prefer`, `off` |
+| `CONDUCTOR_CLAUDE_PATH` | – | Path to the `claude` CLI if it isn't on PATH |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -330,6 +332,28 @@ All of this shows on the Models page under **Your OpenRouter account** (with a R
 `conductor doctor`, and to the models through `check_credits`. It's cached in `data/account.json` and
 refreshed every 30 minutes. Which providers serve each model is read with your normal key, and
 re-checked every 6 hours.
+
+## Claude Code fallback (your Claude subscription)
+
+If the [Claude Code](https://code.claude.com) CLI is installed and signed in with your Claude account,
+Conductor can hand work to it, and that runs on your subscription instead of OpenRouter credits.
+
+- **When** (`CONDUCTOR_CLAUDE_CLI=fallback`, the default): a Claude task that can't continue on OpenRouter
+  (credits out, a step too big for the balance, the provider failing) continues on Claude Code instead
+  of pausing. Other models try your BYOK keys or a cheaper model first, and use Claude Code as the last
+  step before pausing. A composer that runs out of credits hands the rest of the request to Claude Code,
+  which finishes it alone, without hiring other models.
+- **`prefer`**: Claude specialists run on Claude Code from the start, to save credits. **`off`**: never.
+- **Continuity**: Claude Code gets the brief plus the work done so far, and follow-up messages resume the
+  same Claude Code session.
+- **Safety**: every tool call it makes (shell, edits, reads) goes through Conductor's own safety levels
+  via a hook, and asks you in the app when it's above your auto-approve level, just like Conductor's
+  own tools. (In `conductor chat`, where there's no web server to ask, it gets file tools only and no shell.)
+- **Billing**: Conductor removes `ANTHROPIC_API_KEY` from Claude Code's environment and doesn't use
+  `--bare`, so it runs on your subscription login, not an API account. Your plan's usage limits apply:
+  if you hit one, Conductor stops using Claude Code for 30 minutes and falls back to pausing.
+- `conductor doctor` shows whether it found the CLI. It's the CLI's documented headless mode
+  (`claude -p`) running on your own machine for your own work.
 
 ## Use it from your phone (or any device on your Wi-Fi)
 

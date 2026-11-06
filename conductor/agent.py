@@ -13,7 +13,9 @@ import json
 import logging
 import math
 import re
+import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from . import prompts
@@ -22,6 +24,7 @@ from .llm import CURRENT_TASK, INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_
 from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .account import Account
+from .claude_cli import ClaudeCLI, model_alias
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
@@ -73,6 +76,10 @@ class Conductor:
         self.account.note_catalog(self.catalog)
         self._account_refresh: asyncio.Task | None = None
         self._byok_note_pending: set[str] = set()
+        self.cli = ClaudeCLI(settings.claude_cli_path, settings.claude_cli)
+        self.cli_runs: dict[str, str] = {}   # hook token -> task id, while Claude Code runs a task
+        self._cli_limited_until = 0.0         # subscription usage limit reached: don't retry until then
+        self.server_url: str | None = None    # set by the web server; Claude Code's safety hook calls it
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
@@ -339,6 +346,11 @@ class Conductor:
                         self._handoff_note(task_id, messages)
                         hedgy_turns, nudged_at = 0, None
                 model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
+                if self._wants_cli(task_id, model, hands_off):
+                    ans = await self._run_via_cli(task_id, messages, hands_off, "")
+                    if ans is not None:
+                        answer = ans
+                        break
 
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
@@ -369,11 +381,25 @@ class Conductor:
                                      error=str(ce), ms=int((time.time() - started_call) * 1000))
                     if ce.kind == "out":
                         self.credits.mark_out()
+                        why = "OpenRouter credits are used up."
+                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                            answer = ans
+                            break
                         if byok_only or not await self._switch_to_byok(task_id, str(ce)):
+                            if (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                                answer = ans
+                                break
                             await self._pause_for_credits(task_id, ce)
                     elif ce.kind == "too_big":  # this call costs more than the balance, even with a small reply
                         need = self._call_cost(model, system, messages, specs)
+                        why = f"The next step needs about ${need:.2f} of OpenRouter credit on hand."
+                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                            answer = ans
+                            break
                         if not await self._switch_for_budget(task_id, model, need, str(ce)):
+                            if (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                                answer = ans
+                                break
                             await self._pause_for_credits(task_id, ce, need=need)
                     else:  # in-flight budget still full after retries: a short breather, not a pause
                         await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
@@ -384,17 +410,25 @@ class Conductor:
                                      error=f"{type(call_err).__name__}: {call_err}",
                                      ms=int((time.time() - started_call) * 1000), byok_only=byok_only or None)
                     from .llm import is_transient
-                    if not byok_only and is_transient(call_err) and model.provider == "openrouter" \
-                            and provider_switches < 2 and await self._switch_after_errors(task_id, model, call_err):
-                        provider_switches += 1
-                        self._handoff_note(task_id, messages)
-                        continue
+                    if not byok_only and is_transient(call_err) and model.provider == "openrouter":
+                        why = f"{model.name or model.id} kept failing at the provider."
+                        if model.is_claude and (ans := await self._run_via_cli(task_id, messages, hands_off, why)) is not None:
+                            answer = ans
+                            break
+                        if provider_switches < 2 and await self._switch_after_errors(task_id, model, call_err):
+                            provider_switches += 1
+                            self._handoff_note(task_id, messages)
+                            continue
                     if byok_only:  # e.g. the model isn't enabled on your provider account: try another, or pause
                         self.account.failed[model.id] = str(call_err)[:200]
                         await self.emit(self._root(task_id)["id"], "status", {
                             "text": f"{model.name or model.id} didn't work on your own {', '.join(byok_only)} key "
                                     f"({str(call_err)[:120]}); trying another."})
                         if not await self._switch_to_byok(task_id, "Credits are used up."):
+                            if (ans := await self._run_via_cli(task_id, messages, hands_off,
+                                                               "Credits are used up and your own keys didn't work.")) is not None:
+                                answer = ans
+                                break
                             await self._pause_for_credits(task_id, CreditError("out", "Credits are used up, and "
                                                                                "none of your own provider keys worked for this."))
                         continue
@@ -813,6 +847,147 @@ class Conductor:
         self._byok_note_pending.add(task_id)
         return True
 
+    # ------------------------------------------------------------------ Claude Code (your subscription)
+    def _wants_cli(self, task_id: str, model, hands_off: bool) -> bool:
+        if not self.cli.available or time.time() < self._cli_limited_until:
+            return False
+        route = self.store.get_task(task_id).get("route") or {}
+        if hands_off:  # a composer only stays on Claude Code while credits are still short
+            return route.get("via") == "claude_cli" and self.credits.low
+        return route.get("via") == "claude_cli" or (self.cli.mode == "prefer" and model.is_claude)
+
+    def _cli_prompt(self, task: dict, messages: list[dict], resuming: bool) -> str:
+        """What Claude Code gets: on a resumed session just what's new, else the brief plus progress so far."""
+        if resuming:
+            new = []
+            for m in reversed(messages):
+                if m["role"] == "assistant":
+                    break
+                new.append(text_of(m["content"]) if isinstance(m["content"], list) else str(m["content"]))
+            return "\n\n".join(reversed([t for t in new if t.strip()])) or "Continue where you left off."
+        first = messages[0]["content"] if messages else task.get("title", "")
+        brief = first if isinstance(first, str) else text_of(first)
+        steps = []
+        for m in messages[1:]:
+            if not isinstance(m["content"], list):
+                steps.append(f"[{m['role']}] {str(m['content'])[:600]}")
+                continue
+            for b in m["content"]:
+                kind = b.get("type")
+                if kind == "text" and b.get("text", "").strip():
+                    steps.append(f"[{m['role']}] {b['text'][:600]}")
+                elif kind == "tool_use":
+                    steps.append(f"[did] {b.get('name')}: {json.dumps(b.get('input', {}), default=str)[:300]}")
+                elif kind == "tool_result":
+                    content = b.get("content")
+                    content = content if isinstance(content, str) else text_of(content) if isinstance(content, list) else ""
+                    steps.append(f"[result{' (error)' if b.get('is_error') else ''}] {str(content)[:300]}")
+        progress = clip("\n".join(steps)[-16000:], 16000) if steps else ""
+        return (f"{brief}\n\n" + (f"---\nWork already done on this, most recent last:\n{progress}\n---\n"
+                                    "Continue from where it stopped; don't redo finished steps. " if progress else "")
+                + "When you're done, reply with a short report: what you did, files changed, how you checked it, "
+                  "and anything left open.")
+
+    async def _run_via_cli(self, task_id: str, messages: list[dict], hands_off: bool, reason: str) -> str | None:
+        """Hand this task to Claude Code on the user's subscription. Returns its answer, or None if it can't."""
+        if not self.cli.available or time.time() < self._cli_limited_until:
+            return None
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        if hands_off and route.get("via") != "claude_cli":
+            # The composer can't hire other models from inside Claude Code, so it finishes the rest itself.
+            reason = (reason + " " if reason else "") + "Claude Code will finish the rest of the request itself."
+        alias = route.get("cli_model") or model_alias(task.get("model") or "", route.get("difficulty", "medium"))
+        resume = route.get("cli_session")
+        if route.get("via") != "claude_cli":
+            current = self.catalog.get(task.get("model") or self.settings.fallback_model)
+            route.update({"via": "claude_cli", "cli_model": alias})
+            self.store.update_task(task_id, route=route)
+            payload = {"task_id": task_id, "from": current.id, "from_name": current.name or current.id,
+                       "to": f"claude-code/{alias}", "name": f"Claude Code ({alias.title()})", "by": "claude_cli",
+                       "direction": "cli", "reason": (reason + " " if reason else "")
+                       + "Continuing on Claude Code with your Claude subscription."}
+            await self.emit(task_id, "escalated", payload)
+            if self._root(task_id)["id"] != task_id:
+                await self.emit(self._root(task_id)["id"], "escalated", payload)
+        token = secrets.token_urlsafe(18)
+        self.cli_runs[token] = task_id
+        turn = len(messages)
+        counter = {"i": 0}
+
+        async def on_event(kind: str, data: dict) -> None:
+            if kind == "text":
+                counter["i"] += 1
+                await self.emit(task_id, "assistant_text", {"turn": turn, "index": counter["i"], "text": data["text"]})
+            else:
+                await self.emit(task_id, kind, data)
+
+        system = (f"You're a specialist working for Conductor, the user's AI assistant, in its workspace "
+                  f"({self.settings.workspace}). The user follows along in Conductor's app, not your terminal, "
+                  f"so your final reply is your report to them. Don't use port {self.settings.port} (Conductor "
+                  "runs there), and stop any background servers you start once you're done. Some actions may "
+                  "be declined by the user's safety settings; if so, find another way or say what you need.")
+        started = time.time()
+        try:
+            res = await self.cli.run(task_id, prompt=self._cli_prompt(task, messages, bool(resume)), model=alias,
+                                     system=system, cwd=str(self.settings.workspace), on_event=on_event,
+                                     hook_url=f"{self.server_url}/api/cli/hook/{token}" if self.server_url else None,
+                                     resume=resume, max_turns=self.settings.max_steps)
+        except FileNotFoundError:
+            return None
+        finally:
+            self.cli_runs.pop(token, None)
+        self.audit.write("model.call", "system", task_id, model=f"claude-code/{res.model or alias}", via="claude_cli",
+                         ok=not res.is_error, turns=res.turns, ms=int((time.time() - started) * 1000),
+                         error=res.error or None, cost_usd=0.0)
+        if res.limited:
+            self._cli_limited_until = time.time() + 30 * 60
+            await self.emit(self._root(task_id)["id"], "status", {
+                "text": "Your Claude subscription's usage limit is reached, so Claude Code can't take this right now."})
+            return None
+        if res.is_error and not res.text:
+            await self.emit(task_id, "status", {"text": f"Claude Code couldn't continue: {res.error}"})
+            return None
+        route = dict(self.store.get_task(task_id).get("route") or {})
+        route["cli_session"] = res.session_id or resume
+        self.store.update_task(task_id, route=route)
+        answer = res.text or "(Claude Code finished without a report.)"
+        self._append(task_id, messages, "assistant", [{"type": "text", "text": answer}], model=f"claude-code/{alias}")
+        return answer
+
+    async def cli_permission(self, task_id: str, tool: str, inp: dict) -> tuple[bool, str]:
+        """Claude Code asks before each tool call: rate it with Conductor's rules and ask the user if needed."""
+        from .safety import SECRET_PATHS, assess_shell
+        ws = self.settings.workspace.resolve()
+
+        def outside(path: str) -> bool:
+            try:
+                return not Path(path).expanduser().resolve().is_relative_to(ws)
+            except (OSError, ValueError):
+                return True
+        if tool == "Bash":
+            cmd = inp.get("command", "")
+            ok = await self.request_approval(task_id, "run_shell", f"Run: {cmd}", {"command": cmd},
+                                             assess_shell(cmd, self.settings.workspace))
+            return ok, "" if ok else "Declined by the user's safety settings."
+        path = str(inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or "")
+        if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            a = (Assessment("high", "It writes outside the workspace.") if outside(path)
+                 else Assessment("low", "It writes a file in the workspace."))
+            ok = await self.request_approval(task_id, "write_file", f"Edit {path}", {"path": path}, a)
+            return ok, "" if ok else "Declined by the user's safety settings."
+        if tool in ("Read", "Glob", "Grep", "LS"):
+            if path and SECRET_PATHS.search(path):
+                ok = await self.request_approval(task_id, "read_file", f"Read {path}", {"path": path},
+                                                 Assessment("high", "It reads credentials."))
+                return ok, "" if ok else "Declined: that's a credentials file."
+            return True, ""
+        if tool in ("WebFetch", "WebSearch", "TodoWrite", "Agent", "Task", "Skill", "ToolSearch"):
+            return True, ""  # reading the web / planning / helpers (whose own tool calls come back here)
+        ok = await self.request_approval(task_id, "claude_cli", f"Claude Code: {tool}", {"tool": tool},
+                                         Assessment("medium", f"Claude Code wants to use {tool}."))
+        return ok, "" if ok else "Declined by the user's safety settings."
+
     def _call_cost(self, model, system: str, messages: list[dict], tools: list[dict], reply: int = 4096) -> float:
         """Roughly what OpenRouter will want on hand for one call: the whole prompt plus a small reply."""
         chars = len(system) + len(json.dumps(messages, default=str)) + len(json.dumps(tools, default=str))
@@ -1185,6 +1360,7 @@ class Conductor:
 
     async def shutdown(self) -> None:
         import os, signal
+        self.cli.stop_all()
         for p in list(self.processes.values()):
             try:
                 os.killpg(p["pgid"], signal.SIGTERM)

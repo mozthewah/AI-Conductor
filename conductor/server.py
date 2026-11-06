@@ -71,6 +71,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
                                compose=s.compose, budget=s.router_budget, port=s.port, workspace=str(s.workspace),
                                providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key})
         state["token"] = access.load_token(s.data_dir)  # passcode for other devices on your network
+        state["c"].server_url = f"http://127.0.0.1:{s.port}"  # Claude Code's safety hook calls back here
         state["c"].refresh_account()  # BYOK keys, guardrails, activity (background; cached 30 min)
         sched = asyncio.create_task(scheduler.run_forever(state["c"])) if run_scheduler else None
         yield
@@ -269,6 +270,25 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             asyncio.get_running_loop().create_task(later())
             result["restarting"] = True
         return result
+
+    @app.post("/api/cli/hook/{token}")
+    async def cli_hook(token: str, request: Request):
+        """Claude Code's PreToolUse hook: Conductor's safety levels decide (and ask you when needed)."""
+        if not access.is_local(request.client.host if request.client else ""):
+            raise HTTPException(403)
+        task_id = c().cli_runs.get(token)
+        try:
+            body = json.loads(await request.body() or b"{}")
+        except ValueError:
+            body = {}
+        if not task_id:
+            allowed, why = False, "This Claude Code run isn't one Conductor started."
+        else:
+            allowed, why = await c().cli_permission(task_id, str(body.get("tool_name", "")), body.get("tool_input") or {})
+        out = {"hookEventName": "PreToolUse", "permissionDecision": "allow" if allowed else "deny"}
+        if why:
+            out["permissionDecisionReason"] = why
+        return {"hookSpecificOutput": out}
 
     @app.get("/favicon.ico")
     async def favicon():

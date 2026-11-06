@@ -262,6 +262,19 @@ def doctor(args) -> None:
                     bad(f"Roster model {b['model']} is blocked by it ({b['why']}); the router will skip it")
     else:
         print("  OPENROUTER_MANAGEMENT_KEY not set (optional: balance, BYOK, guardrails, 30-day spend)")
+    from .claude_cli import find as find_claude
+    if s.claude_cli == "off":
+        print("  Claude Code fallback is off (CONDUCTOR_CLAUDE_CLI=off)")
+    elif (exe := find_claude(s.claude_cli_path)):
+        import subprocess
+        try:
+            ver = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20).stdout.strip()
+        except Exception as e:
+            ver = f"version check failed: {e}"
+        ok(f"Claude Code found ({ver}); mode {s.claude_cli}. It runs on your Claude subscription login "
+           "(run `claude` once and sign in with your Claude account if you haven't)")
+    else:
+        print("  Claude Code CLI not found (optional: install it to fall back to your Claude subscription)")
     if s.browser:
         try:
             from .tools.browser import BrowserPool

@@ -100,6 +100,9 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         t.pop("system_prompt", None)
         t["running"] = c().is_running(task_id)
         t["children"] = c().store.child_tasks(task_id)
+        team = [c().store.get_task(ch["id"]) for ch in t["children"]]
+        t["team_cost_usd"] = sum(x["cost_usd"] for x in team if x)
+        t["team_tokens"] = sum(x["input_tokens"] + x["output_tokens"] for x in team if x)
         t["pending"] = c().pending_requests(task_id)
         t["compares"] = c().store.compares(task_id)
         run = c().store.get_run(task_id)
@@ -184,7 +187,9 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     def models():
         overall = {r["model"]: r for r in c().store.model_stats()}
         return {
-            "roster": [{**m.to_dict(), "stats": overall.get(m.id)} for m in c().catalog.roster()],
+            "roster": [{**m.to_dict(), "stats": overall.get(m.id), "benchmarks": c().benchmarks.summary(m.id)}
+                       for m in c().catalog.roster()],
+            "benchmarks_fetched_at": c().benchmarks.fetched_at,
             "catalog_size": len(c().catalog.models), "catalog_fetched_at": c().catalog.fetched_at,
         }
 
@@ -212,10 +217,11 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
 
     @app.get("/api/leaderboard")
     def leaderboard():
-        rows = c().store.model_stats()
+        rows = c().store.leaderboard()
         for r in rows:
             m = c().catalog.get(r["model"])
             r["name"] = m.name or m.id
+            r["skill"] = r["category"]
             r["score"] = round(r["reward"] / r["runs"], 3) if r["runs"] else None
         return rows
 

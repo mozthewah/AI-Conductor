@@ -17,6 +17,7 @@ from typing import Any
 from . import prompts
 from .config import Settings
 from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
+from .benchmarks import Benchmarks
 from .models import Catalog
 from .router import Router
 from .skills import SkillLibrary
@@ -40,6 +41,8 @@ class Conductor:
                                has_anthropic=settings.anthropic_key, fetch=settings.fetch_catalog).load()
         self.llm: LLM = llm or MessagesLLM(anthropic_enabled=settings.anthropic_key,
                                            openrouter_key=settings.openrouter_key, max_tokens=settings.max_tokens)
+        self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
+                                     fetch=settings.fetch_catalog).load()
         self.router = Router(self)
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
@@ -69,10 +72,10 @@ class Conductor:
         rows = [m for m in self.store.list_memories(limit=200) if m["kind"] in PROFILE_KINDS]
         return rows[:40]
 
-    def build_system_prompt(self, prompt: str, depth: int = 0) -> str:
+    def build_system_prompt(self, prompt: str, depth: int = 0, role: str = "") -> str:
         profile = prompts.bullet(self._profile(), "(nothing yet)")
         if depth > 0:
-            return prompts.SUBAGENT.format(today=prompts.today(), profile=profile,
+            return prompts.SUBAGENT.format(today=prompts.today(), profile=profile, role=role or "a focused helper",
                                            skills=self.skills.index(), workspace=self.settings.workspace)
         related = self.store.search_memories(prompt, limit=8, exclude_kinds=PROFILE_KINDS)
         shell_note = ("run immediately." if self.settings.approval == "auto"
@@ -145,26 +148,40 @@ class Conductor:
         self._running[task_id] = t
         t.add_done_callback(lambda _: self._running.pop(task_id, None))
 
-    async def _route(self, task_id: str, prompt: str, *, pinned: str | None, budget: str,
-                     by: str | None = None) -> None:
+    async def _route(self, task_id: str, prompt: str, *, pinned: str | None = None, budget: str = "balanced",
+                     by: str | None = None, part: dict | None = None) -> None:
         """Pick this task's model once; it sticks for the life of the task."""
-        if self.store.get_task(task_id).get("model"):
+        task = self.store.get_task(task_id)
+        if task.get("model"):
             return
-        await self.emit(task_id, "status", {"text": "Choosing a model..."})
         try:
-            decision = await self.router.route(prompt, pinned=pinned, budget=budget)
+            if part is not None:
+                decision = self.router.route_part(
+                    skill=part.get("skill", "other"), domain=part.get("domain", "general"),
+                    difficulty=part.get("difficulty", "medium"), priority=part.get("priority", "core"),
+                    exclude=set(part.get("exclude") or []), pinned=self.settings.subagent_model)
+            else:
+                await self.emit(task_id, "status", {"text": "Choosing a model..."})
+                decision = await self.router.route(prompt, pinned=pinned, budget=budget)
         except Exception as e:
             log.warning("routing failed: %s", e)
             from .router import Decision
-            decision = Decision(self.settings.fallback_model, "other", "medium", "Router unavailable.", "fallback")
+            decision = Decision(self.settings.fallback_model, "other", "general", "medium",
+                                "Router unavailable.", "fallback")
         if by:
             decision.by = by
             decision.reason = "Side-by-side comparison run."
         info = self.catalog.get(decision.model)
-        route = {**decision.to_dict(), "name": info.name or info.id}
-        self.store.update_task(task_id, model=decision.model, route=route)
-        self.store.start_run(task_id, decision.model, decision.category, decision.difficulty, decision.by)
-        await self.emit(task_id, "routed", route)
+        route = {**decision.to_dict(), "name": info.name or info.id, **({"part_id": part["id"]} if part else {})}
+        fields: dict[str, Any] = {"model": decision.model, "route": route}
+        if decision.mode == "conduct" and task.get("parent_id") is None:
+            # Settled before the first model turn, so the system prompt is still unsent.
+            fields["system_prompt"] = task["system_prompt"] + prompts.CONDUCT_MODE
+        self.store.update_task(task_id, **fields)
+        self.store.start_run(task_id, decision.model, decision.skill, decision.difficulty, decision.by,
+                             domain=decision.domain, mode=decision.mode, parent_id=task.get("parent_id"))
+        if part is None:
+            await self.emit(task_id, "routed", route)
 
     async def _run_top(self, task_id: str, prompt: str, model: str | None = None, by: str | None = None) -> None:
         started = time.time()
@@ -186,10 +203,9 @@ class Conductor:
         return answer
 
     # ------------------------------------------------------------------ the loop
-    async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None) -> str:
-        task = self.store.get_task(task_id)
-        system = task["system_prompt"]
-        effort = self.settings.effort if depth == 0 else self.settings.subagent_effort
+    async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None,
+                  effort: str | None = None) -> str:
+        effort = effort or (self.settings.effort if depth == 0 else self.settings.subagent_effort)
         messages = self.store.load_messages(task_id)
 
         # If a previous run was cancelled mid-tool, answer the dangling tool calls first
@@ -204,7 +220,9 @@ class Conductor:
         await self.emit(task_id, "user", {"text": prompt})
         if route is not None:
             await self._route(task_id, prompt, **route)
-        model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
+        task = self.store.get_task(task_id)
+        system = task["system_prompt"]
+        model = self.catalog.get(task.get("model") or self.settings.fallback_model)
 
         ctx = ToolContext(conductor=self, task_id=task_id, depth=depth)
         specs = self.tool_specs(depth)
@@ -323,23 +341,57 @@ class Conductor:
                                                       "preview": clip(preview, 1500)})
         return result(out, not ok)
 
-    # ------------------------------------------------------------------ sub-agents
-    async def run_subagent(self, parent_id: str, title: str, instructions: str) -> str:
-        child = self.store.create_task(title, parent_id=parent_id, origin="subagent",
-                                       system_prompt=self.build_system_prompt(instructions, depth=1))
+    # ------------------------------------------------------------------ specialists
+    def part_tasks(self, parent_id: str, part_id: str | None = None) -> list[dict]:
+        """Specialist runs under a conducted task (latest last), optionally for one part id."""
+        out = []
+        for child in self.store.child_tasks(parent_id):
+            t = self.store.get_task(child["id"])
+            pid = (t.get("route") or {}).get("part_id")
+            if pid and (part_id is None or pid == part_id):
+                out.append(t)
+        return out
+
+    async def run_part(self, parent_id: str, part: dict, brief: str) -> dict:
+        """Hire the best model for one part, run it, and report back to the conductor."""
+        skill, domain = part.get("skill", "other"), part.get("domain", "general")
+        role = (f"the {skill.replace('_', ' ')} specialist"
+                f"{'' if domain in ('', 'general') else ' (' + domain + ')'}")
+        child = self.store.create_task(part["title"], parent_id=parent_id, origin="subagent",
+                                       system_prompt=self.build_system_prompt(brief, depth=1, role=role))
         started = time.time()
-        await self.emit(parent_id, "subagent", {"action": "started", "id": child, "title": title})
+        effort = self.settings.effort if part.get("priority", "core") == "core" else self.settings.subagent_effort
         try:
-            answer = await self.run(child, instructions, depth=1,
-                                    route={"pinned": self.settings.subagent_model,
-                                           "budget": self.settings.subagent_budget})
+            await self._route(child, brief, part=part)
+            t = self.store.get_task(child)
+            await self.emit(parent_id, "part", {"action": "started", "part_id": part["id"], "task_id": child,
+                                                "title": part["title"], "skill": skill, "domain": domain,
+                                                "model": t["model"], "name": t["route"].get("name"),
+                                                "reason": t["route"].get("reason")})
+            answer = await self.run(child, brief, depth=1, effort=effort)
         finally:
             t = self.store.get_task(child)
             self.store.finish_run(child, t["status"], t["cost_usd"], time.time() - started)
-        status, model = t["status"], t.get("model")
-        await self.emit(parent_id, "subagent", {"action": "finished", "id": child, "title": title, "model": model,
-                                                "status": status, "preview": clip(answer, 400)})
-        return answer
+        await self.emit(parent_id, "part", {"action": "finished", "part_id": part["id"], "task_id": child,
+                                            "title": part["title"], "model": t.get("model"), "status": t["status"],
+                                            "preview": clip(answer, 400)})
+        return {"task_id": child, "model": t.get("model"), "status": t["status"], "answer": answer}
+
+    async def revise_part(self, parent_id: str, task_id: str, notes: str) -> dict:
+        """Send a specialist's work back to the same model, in the same conversation."""
+        started = time.time()
+        cost_before = self.store.get_task(task_id)["cost_usd"]
+        t = self.store.get_task(task_id)
+        await self.emit(parent_id, "part", {"action": "revising", "part_id": t["route"].get("part_id"),
+                                            "task_id": task_id, "model": t["model"], "notes": clip(notes, 400)})
+        answer = await self.run(task_id, f"The conductor reviewed your work and wants changes:\n\n{notes}",
+                                depth=1, effort=self.settings.effort)
+        t = self.store.get_task(task_id)
+        self.store.finish_run(task_id, t["status"], t["cost_usd"] - cost_before, time.time() - started)
+        await self.emit(parent_id, "part", {"action": "finished", "part_id": t["route"].get("part_id"),
+                                            "task_id": task_id, "model": t["model"], "status": t["status"],
+                                            "preview": clip(answer, 400)})
+        return {"task_id": task_id, "model": t["model"], "status": t["status"], "answer": answer}
 
     # ------------------------------------------------------------------ human in the loop
     def _root(self, task_id: str) -> dict:

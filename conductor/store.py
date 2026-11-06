@@ -118,6 +118,11 @@ class Store:
         self._db.commit()
 
     def _migrate(self) -> None:
+        run_cols = {r[1] for r in self._db.execute("PRAGMA table_info(runs)")}
+        for name, ddl in [("domain", "TEXT NOT NULL DEFAULT 'general'"), ("review", "REAL"),
+                          ("parent_id", "TEXT"), ("mode", "TEXT NOT NULL DEFAULT 'direct'")]:
+            if name not in run_cols:
+                self._db.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(tasks)")}
         for name, ddl in [("model", "TEXT"), ("route_json", "TEXT NOT NULL DEFAULT '{}'"),
                           ("compare_of", "TEXT"), ("cost_usd", "REAL NOT NULL DEFAULT 0")]:
@@ -191,9 +196,16 @@ class Store:
                          " ORDER BY created_at", (root, root))
 
     # -- router learning ---------------------------------------------------
-    def start_run(self, task_id: str, model: str, category: str, difficulty: str, routed_by: str) -> None:
-        self._exec("INSERT OR REPLACE INTO runs (task_id, model, category, difficulty, routed_by, created_at)"
-                   " VALUES (?, ?, ?, ?, ?, ?)", (task_id, model, category, difficulty, routed_by, time.time()))
+    def start_run(self, task_id: str, model: str, category: str, difficulty: str, routed_by: str,
+                  domain: str = "general", mode: str = "direct", parent_id: str | None = None) -> None:
+        """category = the skill (coding, ui_design, research...)."""
+        self._exec("INSERT OR REPLACE INTO runs (task_id, model, category, domain, difficulty, routed_by, mode,"
+                   " parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (task_id, model, category, domain, difficulty, routed_by, mode, parent_id, time.time()))
+
+    def set_review(self, task_id: str, score: float) -> bool:
+        """The conductor's verdict on a specialist's work (0-1)."""
+        return self._exec("UPDATE runs SET review = ? WHERE task_id = ?", (score, task_id)).rowcount > 0
 
     def finish_run(self, task_id: str, status: str, cost: float, seconds: float) -> None:
         self._exec("UPDATE runs SET status = ?, cost_usd = cost_usd + ?, seconds = seconds + ? WHERE task_id = ?",
@@ -205,8 +217,21 @@ class Store:
     def get_run(self, task_id: str) -> dict | None:
         return self._one("SELECT * FROM runs WHERE task_id = ?", (task_id,))
 
-    _REWARD = ("CASE WHEN feedback > 0 THEN 1.0 WHEN feedback < 0 THEN 0.0 WHEN status = 'done' THEN 0.7"
-               " WHEN status = 'cancelled' THEN 0.4 ELSE 0.0 END")
+    # Strongest signal first: your thumbs, then the conductor's review, then "it finished".
+    _REWARD = ("CASE WHEN feedback > 0 THEN 1.0 WHEN feedback < 0 THEN 0.0 WHEN review IS NOT NULL THEN review"
+               " WHEN status = 'done' THEN 0.7 WHEN status = 'cancelled' THEN 0.4 ELSE 0.0 END")
+
+    def run_stats(self) -> list[dict]:
+        return self._all(
+            f"SELECT model, category, domain, COUNT(*) AS runs, SUM({self._REWARD}) AS reward FROM runs"
+            " WHERE status != 'running' GROUP BY model, category, domain")
+
+    def leaderboard(self) -> list[dict]:
+        return self._all(
+            f"SELECT model, category, domain, COUNT(*) AS runs, SUM({self._REWARD}) AS reward,"
+            " SUM(feedback > 0) AS up, SUM(feedback < 0) AS down, SUM(status = 'error') AS errors,"
+            " AVG(review) AS avg_review, AVG(cost_usd) AS avg_cost, AVG(seconds) AS avg_seconds"
+            " FROM runs WHERE status != 'running' GROUP BY model, category, domain ORDER BY category, domain")
 
     def model_stats(self, category: str | None = None) -> list[dict]:
         where = "WHERE status != 'running'" + (" AND category = ?" if category else "")

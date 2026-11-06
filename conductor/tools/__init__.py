@@ -58,7 +58,7 @@ class Tool:
     required: list[str]
     handler: Handler
     risky: bool = False          # needs approval when CONDUCTOR_APPROVAL=ask
-    top_level_only: bool = False  # hidden from sub-agents (delegate, schedule...)
+    top_level_only: bool = False  # hidden from specialists (assign, review, schedule...)
     summarize: Callable[[dict], str] | None = None
     extra: dict = field(default_factory=dict)
 

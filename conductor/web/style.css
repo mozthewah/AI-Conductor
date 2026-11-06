@@ -244,6 +244,19 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .search-results { margin-bottom: 16px; }
 .search-results .file-row button { flex: none; }
 
+.part-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.part-row:last-child { border-bottom: 0; }
+.part-row .dot { margin-top: 7px; }
+.part-row .grow { flex: 1; min-width: 0; }
+.part-title { font-weight: 500; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.part-meta { font-size: 12.5px; color: var(--ink-3); }
+.skill-chip { font-size: 11px; font-weight: 500; background: var(--sunk); color: var(--ink-2); border-radius: 6px; padding: 1px 7px; }
+.part-fb { display: flex; gap: 4px; }
+.part-fb .fb { padding: 3px 5px; }
+.part-fb .fb svg { width: 14px; height: 14px; }
+.card.team { padding-bottom: 4px; }
+.dot.queued { background: var(--line); }
+
 @media (max-width: 1100px) {
   .computer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 20; width: min(400px, 92vw); box-shadow: var(--shadow); }
 }

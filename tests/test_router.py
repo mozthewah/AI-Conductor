@@ -13,6 +13,11 @@ STRONG = ModelInfo("lab/strong", "openrouter", "Strong", 1, 5, tier="strong")
 FAST = ModelInfo("lab/fast", "openrouter", "Fast", 0.05, 0.4, tier="fast", vision=True)
 
 
+def L(skill, difficulty="medium", domain="general", vision=False, parts=None):
+    return {"skill": skill, "domain": domain, "difficulty": difficulty, "needs_vision": vision,
+            "parts": parts or [{"skill": skill, "domain": domain}], "summary": ""}
+
+
 def conductor(tmp_path, label, script=(), **kw):
     s = Settings(data_dir=tmp_path / "d", workspace=tmp_path / "ws", approval="auto", browser=False,
                  fetch_catalog=False, explore=0.0, openrouter_key="k", **kw)
@@ -23,25 +28,27 @@ def conductor(tmp_path, label, script=(), **kw):
 
 
 async def test_easy_chat_goes_cheap_hard_coding_goes_strong(tmp_path):
-    c = conductor(tmp_path, {"category": "chat", "difficulty": "easy", "needs_vision": False, "summary": ""})
+    c = conductor(tmp_path, L("chat", "easy"))
     d = await c.router.route("what's 2+2", seed=1)
-    assert d.model == FAST.id and d.category == "chat"
-    c.llm.label = {"category": "coding", "difficulty": "hard", "needs_vision": False, "summary": ""}
-    d = await c.router.route("refactor my compiler", seed=1)
-    assert d.model == FRONTIER.id
+    assert d.model == FAST.id and d.skill == "chat" and d.mode == "direct"
+    c.llm.label = L("coding", "medium")
     d = await c.router.route("refactor my compiler", seed=1, budget="frugal")
-    assert d.model in (STRONG.id, FRONTIER.id)
+    assert d.model in (STRONG.id, FAST.id) and d.mode == "direct"
+    # hard work gets a conductor, chosen quality-first
+    c.llm.label = L("coding", "hard")
+    d = await c.router.route("rewrite my compiler", seed=1)
+    assert d.mode == "conduct" and d.model == FRONTIER.id
     assert len(d.candidates) == 3 and d.reason
 
 
 async def test_vision_filters_candidates(tmp_path):
-    c = conductor(tmp_path, {"category": "analysis", "difficulty": "medium", "needs_vision": True, "summary": ""})
+    c = conductor(tmp_path, L("analysis", vision=True))
     d = await c.router.route("what's in this screenshot", seed=3)
     assert d.model in (FRONTIER.id, FAST.id)
 
 
 async def test_router_learns_from_feedback(tmp_path):
-    label = {"category": "writing", "difficulty": "medium", "needs_vision": False, "summary": ""}
+    label = L("writing")
     c = conductor(tmp_path, label)
     before = (await c.router.route("draft an email", seed=0)).model
     loser = before
@@ -60,25 +67,25 @@ async def test_router_learns_from_feedback(tmp_path):
 
 
 async def test_pinned_model_skips_classifier(tmp_path):
-    c = conductor(tmp_path, {"category": "chat", "difficulty": "easy", "needs_vision": False, "summary": ""})
+    c = conductor(tmp_path, L("chat", "easy"))
     d = await c.router.route("hello", pinned=STRONG.id)
     assert d.model == STRONG.id and d.by == "pinned" and not c.llm.structured_calls
 
 
 async def test_classifier_failure_falls_back_to_rules(tmp_path):
-    c = conductor(tmp_path, {"category": "bogus"})
+    c = conductor(tmp_path, {"skill": "bogus"})
     d = await c.router.route("please debug this python function that crashes")
-    assert d.category == "coding"
-    assert heuristic_label("book me a table on opentable")["category"] == "browsing"
+    assert d.skill == "coding"
+    assert heuristic_label("book me a table on opentable")["skill"] == "browsing"
 
 
 async def test_task_records_route_cost_and_compare(tmp_path):
-    label = {"category": "chat", "difficulty": "easy", "needs_vision": False, "summary": ""}
+    label = L("chat", "easy")
     c = conductor(tmp_path, label, script=[[text("4")], [text("four")]])
     tid = c.start_task("what's 2+2")
     await c.wait(tid)
     t = c.store.get_task(tid)
-    assert t["model"] == FAST.id and t["route"]["category"] == "chat" and t["cost_usd"] > 0
+    assert t["model"] == FAST.id and t["route"]["skill"] == "chat" and t["cost_usd"] > 0
     run = c.store.get_run(tid)
     assert run["status"] == "done" and run["seconds"] >= 0
     assert c.llm.calls[0]["model"] == FAST.id
@@ -91,13 +98,12 @@ async def test_task_records_route_cost_and_compare(tmp_path):
     assert c.feedback(cid, 1) and c.store.get_run(cid)["feedback"] == 1
 
 
-async def test_subagents_are_routed_frugally(tmp_path):
+async def test_supporting_parts_are_routed_frugally(tmp_path):
     from fakes import tool_use
-    label = {"category": "research", "difficulty": "medium", "needs_vision": False, "summary": ""}
-    c = conductor(tmp_path, label, script=[
-        [tool_use("delegate", tasks=[{"title": "A", "instructions": "look up A"}])],
+    c = conductor(tmp_path, L("research"), script=[
+        [tool_use("assign", parts=[{"id": "a", "title": "A", "skill": "research", "domain": "general",
+                                    "priority": "supporting", "instructions": "look up A"}])],
         [text("A report")], [text("done")]])
-    c.store.update_task  # noqa
     tid = c.start_task("research A", model=FRONTIER.id)
     await c.wait(tid)
     child = c.store.child_tasks(tid)[0]

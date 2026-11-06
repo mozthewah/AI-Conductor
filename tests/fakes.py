@@ -24,7 +24,7 @@ class FakeLLM:
 
     def __init__(self, script: list, reflection: dict | None = None, label: dict | None = None):
         self.script = list(script)
-        self.label = label or {"category": "chat", "difficulty": "easy", "needs_vision": False, "summary": "x"}
+        self.label = label or {"skill": "chat", "domain": "general", "difficulty": "easy", "needs_vision": False, "parts": [{"skill": "chat", "domain": "general"}], "summary": "x"}
         self.calls: list[dict] = []
         self.reflection = reflection or {"summary": "Did a thing.", "memories": [], "save_skill": False,
                                          "skill_name": "", "skill_description": "", "skill_instructions": ""}
@@ -48,6 +48,6 @@ class FakeLLM:
 
     async def structured(self, *, system, prompt, schema, effort="low", model=None):
         self.structured_calls.append({"prompt": prompt, "model": model.id if model else None})
-        if "category" in schema["properties"]:
+        if "skill" in schema["properties"] or "category" in schema["properties"]:
             return self.label
         return self.reflection

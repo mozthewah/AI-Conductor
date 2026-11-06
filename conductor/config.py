@@ -36,7 +36,9 @@ class Settings:
     subagent_model: str = "auto"
     router_model: str = ""          # cheap classifier; default picked from available keys
     router_budget: str = "balanced"  # frugal | balanced | best
-    subagent_budget: str = "frugal"
+    subagent_budget: str = "frugal"   # supporting parts (reading, lookups)
+    part_budget: str = "best"         # core parts of a conducted request: quality first
+    conductor_budget: str = "best"    # the model that splits, reviews, and integrates
     explore: float = 0.1             # chance the router tries a less-proven model
     anthropic_key: bool = False
     openrouter_key: str = ""
@@ -86,6 +88,8 @@ class Settings:
             router_model=os.environ.get("CONDUCTOR_ROUTER_MODEL", ""),
             router_budget=os.environ.get("CONDUCTOR_BUDGET", cls.router_budget).lower(),
             subagent_budget=os.environ.get("CONDUCTOR_SUBAGENT_BUDGET", cls.subagent_budget).lower(),
+            part_budget=os.environ.get("CONDUCTOR_PART_BUDGET", cls.part_budget).lower(),
+            conductor_budget=os.environ.get("CONDUCTOR_LEAD_BUDGET", cls.conductor_budget).lower(),
             explore=float(os.environ.get("CONDUCTOR_EXPLORE", cls.explore)),
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
             openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),

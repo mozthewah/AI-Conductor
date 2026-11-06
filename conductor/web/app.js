@@ -49,7 +49,7 @@ const icon = (name) => svg(ICONS[name] || ICONS.sparkle);
 const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
-  recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", delegate: "users",
+  recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
   ask_user: "chat", message_user: "chat", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
@@ -234,7 +234,7 @@ async function showTask(id) {
   try { task = await api(`/api/tasks/${id}`); } catch { main.replaceChildren(h("div", { class: "page" }, h("div", { class: "empty" }, "Task not found."))); return; }
 
   const v = {
-    exchange: null, live: {}, tools: {}, subs: {}, requests: {}, files: new Map(), shots: [],
+    exchange: null, live: {}, tools: {}, subs: {}, parts: {}, teamCards: [], requests: {}, files: new Map(), shots: [],
     plan: task.plan || [], status: task.status, userPickedTab: false, replayed: false,
   };
   const pill = h("span", { class: `pill ${task.status}` }, STATUS_LABEL[task.status] || task.status);
@@ -269,7 +269,7 @@ async function showTask(id) {
     for (const [k, b] of Object.entries(tabBtns)) b.classList.toggle("active", k === name);
     paneHost.replaceChildren(panes[name]);
   };
-  for (const [k, label] of [["plan", "Plan"], ["browser", "Browser"], ["files", "Files"], ["agents", "Agents"]]) {
+  for (const [k, label] of [["plan", "Plan"], ["browser", "Browser"], ["files", "Files"], ["agents", "Team"]]) {
     tabBtns[k] = h("button", { class: "tab", onclick: () => showTab(k, true) }, label, h("span", { class: "count", hidden: true }));
     tabs.append(tabBtns[k]);
   }
@@ -283,7 +283,8 @@ async function showTask(id) {
   });
   comp.onStop = () => api(`/api/tasks/${id}/cancel`, { method: "POST" });
 
-  const head = h("div", { class: "task-head" }, title, modelChip, pill, compareSel,
+  const backLink = task.parent_id ? h("a", { class: "cmp", "data-nav": `/t/${task.parent_id}`, href: `/t/${task.parent_id}`, title: "Back to the main task" }, "← main task") : null;
+  const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, compareSel,
     h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => computer.classList.toggle("hidden") }, icon("panel")),
     h("button", { class: "icon-btn", title: "Delete task", onclick: async () => {
       if (!confirm("Delete this task and its history?")) return;
@@ -308,7 +309,11 @@ async function showTask(id) {
         h("span", { class: "hint cost-line" }));
       api(`/api/tasks/${id}`).then((t) => {
         const c = bar.querySelector(".cost-line");
-        if (c) c.textContent = `${shortModel(t.model)} · ${fmtCost(t.cost_usd)} · ${((t.input_tokens + t.output_tokens) / 1000).toFixed(1)}k tokens`;
+        if (!c) return;
+        const tokens = (t.input_tokens + t.output_tokens + (t.team_tokens || 0)) / 1000;
+        c.textContent = t.team_cost_usd
+          ? `${fmtCost(t.cost_usd + t.team_cost_usd)} total (conductor ${fmtCost(t.cost_usd)} + ${t.children.length} specialist run(s) ${fmtCost(t.team_cost_usd)}) · ${tokens.toFixed(1)}k tokens`
+          : `${shortModel(t.model)} · ${fmtCost(t.cost_usd)} · ${tokens.toFixed(1)}k tokens`;
       }).catch(() => {});
     };
     paint();
@@ -404,16 +409,55 @@ async function showTask(id) {
     }
     setCount("files", v.files.size);
   }
+  const skillLabel = (p) => `${(p.skill || "").replace(/_/g, " ")}${p.domain && p.domain !== "general" ? " · " + p.domain : ""}`;
+  const partStatus = (p) => {
+    const a = p.attempts[p.attempts.length - 1];
+    if (p.verdict === "accepted") return { cls: "done", text: p.revisions ? `accepted after ${p.revisions} revision(s)` : "accepted" };
+    if (p.verdict === "revising") return { cls: "running", text: `revising (${p.revisions})` };
+    if (!a) return { cls: "queued", text: p.depends_on && p.depends_on.length ? `waits for ${p.depends_on.join(", ")}` : "queued" };
+    if (a.status === "running") return { cls: "running", text: "working" };
+    if (a.status === "done") return { cls: "waiting", text: "awaiting review" };
+    return { cls: a.status, text: STATUS_LABEL[a.status] || a.status };
+  };
+  function partRow(p, withFeedback) {
+    const a = p.attempts[p.attempts.length - 1];
+    const st = partStatus(p);
+    const row = h("div", { class: "part-row" },
+      h("i", { class: `dot ${st.cls}` }),
+      h("div", { class: "grow" },
+        h("div", { class: "part-title" }, p.title, h("span", { class: "skill-chip" }, skillLabel(p))),
+        h("div", { class: "part-meta" },
+          a ? h("a", { "data-nav": `/t/${a.task_id}`, href: `/t/${a.task_id}` }, a.name || shortModel(a.model)) : "not started",
+          p.attempts.length > 1 ? ` (after ${p.attempts.slice(0, -1).map((x) => shortModel(x.model)).join(", ")})` : "",
+          ` · ${st.text}`)));
+    if (withFeedback && a && a.status !== "running") {
+      const fb = (val, ic) => h("button", { class: "fb" + (a.feedback === val ? (val > 0 ? " on" : " on bad") : ""), title: val > 0 ? "Great work on this part" : "Poor work on this part",
+        onclick: async (e) => { e.stopPropagation(); const nv = a.feedback === val ? 0 : val;
+          try { await api(`/api/tasks/${a.task_id}/feedback`, { method: "POST", body: { value: nv } }); a.feedback = nv || null; renderAgents(); } catch (err) { alert(err.message); } } }, icon(ic));
+      row.append(h("div", { class: "part-fb" }, fb(1, "up"), fb(-1, "down")));
+    }
+    return row;
+  }
   function renderAgents() {
     const p = panes.agents;
     p.replaceChildren();
+    const parts = Object.values(v.parts);
     const subs = Object.values(v.subs);
-    if (!subs.length) { p.append(h("div", { class: "empty" }, "Parallel sub-agents I spin up will be listed here.")); return; }
+    for (const card of v.teamCards) {
+      card.body.replaceChildren(...card.ids.map((id) => partRow(v.parts[id], false)));
+    }
+    if (!parts.length && !subs.length) {
+      p.append(h("div", { class: "empty" }, "When a request needs several kinds of work, the conductor hires a specialist model for each part. They'll show up here, and you can rate each one."));
+      setCount("agents", 0);
+      return;
+    }
+    if (parts.length) p.append(h("div", { class: "hint", style: "margin-bottom:8px" }, "Each part went to the model the router rated best for that kind of work. Rate parts to teach it."));
+    for (const part of parts) p.append(partRow(part, true));
     for (const s of subs) {
       p.append(h("div", { class: "file-row", style: "cursor:pointer", onclick: () => navigate(`/t/${s.id}`) },
         h("i", { class: `dot ${s.status}` }), h("span", {}, s.title), h("small", {}, STATUS_LABEL[s.status] || s.status)));
     }
-    setCount("agents", subs.length);
+    setCount("agents", parts.length + subs.length);
   }
   renderPlan(); renderBrowser(); renderFiles(); renderAgents();
 
@@ -530,6 +574,38 @@ async function showTask(id) {
       case "artifact":
         v.files.set(d.path, d.action); renderFiles();
         break;
+      case "plan_parts": {
+        const card = { ids: d.parts.map((x) => x.id), body: h("div") };
+        for (const x of d.parts) v.parts[x.id] = { ...x, attempts: (v.parts[x.id] || {}).attempts || [], verdict: null, revisions: 0 };
+        v.teamCards.push(card);
+        addAct(h("div", { class: "card team" }, h("div", { class: "title" }, icon("users"), `Split into ${d.parts.length} part(s), each to its best model`), card.body));
+        renderAgents();
+        if (!v.userPickedTab && v.replayed) showTab("agents");
+        break;
+      }
+      case "part": {
+        const part = v.parts[d.part_id] || (v.parts[d.part_id] = { id: d.part_id, title: d.title || d.part_id, attempts: [], verdict: null, revisions: 0 });
+        let a = part.attempts.find((x) => x.task_id === d.task_id);
+        if (d.action === "started") {
+          if (d.skill) { part.skill = d.skill; part.domain = d.domain; }
+          a = { task_id: d.task_id, model: d.model, name: d.name, status: "running", feedback: null };
+          part.attempts.push(a);
+          part.verdict = null;
+        } else if (a && d.action === "finished") {
+          a.status = d.status; a.preview = d.preview;
+          if (part.verdict === "revising") part.verdict = null;
+        } else if (d.action === "revising") {
+          part.verdict = "revising"; part.revisions += 1; if (a) a.status = "running";
+          addAct(h("span", {}, `Sent “${part.title}” back to ${shortModel(d.model)}: ${d.notes}`));
+        } else if (d.action === "accepted") {
+          part.verdict = "accepted";
+        } else if (d.action === "reassigned") {
+          part.verdict = null;
+          addAct(h("span", {}, `Took “${part.title}” away from ${shortModel(d.model)}: ${d.notes}`));
+        }
+        renderAgents();
+        break;
+      }
       case "subagent": {
         let s = v.subs[d.id];
         if (!s) {
@@ -579,12 +655,12 @@ async function showTask(id) {
         if (d.skill) bits.push(`learned the skill “${d.skill.name}”`);
         if (d.memories && d.memories.length) bits.push(`remembered ${d.memories.map((m) => `“${m.content}”`).join(", ")}`);
         if (bits.length) addBlock(h("div", { class: "card learned" }, "✦ From this task I ", bits.join(" and "), "."));
-        v.pendingFeedback = !task.parent_id;
+        v.pendingFeedback = true;
         break;
       }
       case "done":
         if (v.replayed) { setStatus("done"); refreshTasks(); }
-        v.pendingFeedback = !task.parent_id;
+        v.pendingFeedback = true;
         break;
       case "error":
         addBlock(h("div", { class: "card", style: "border-color:var(--bad)" }, h("div", { class: "title", style: "color:var(--bad)" }, icon("x"), "Something went wrong"), d.text));
@@ -601,7 +677,9 @@ async function showTask(id) {
           h("span", {}, shortModel(c.model)), h("small", {}, `quality ${Math.round(c.quality * 100)}% · ~${fmtCost(c.est_cost)} · ${c.runs} runs`)));
         card.append(
           h("div", { class: "route-head", onclick: () => card.classList.toggle("open") }, icon("route"),
-            h("span", {}, "Routed to ", h("b", {}, d.name || shortModel(d.model)), ` · ${d.category} · ${d.difficulty}`, d.est_cost ? ` · ~${fmtCost(d.est_cost)}` : "")),
+            d.mode === "conduct"
+              ? h("span", {}, h("b", {}, d.name || shortModel(d.model)), " is conducting · ", (d.parts || []).map((x) => `${x.skill.replace(/_/g, " ")}${x.domain !== "general" ? " (" + x.domain + ")" : ""}`).join(" + "))
+              : h("span", {}, "Routed to ", h("b", {}, d.name || shortModel(d.model)), ` · ${(d.skill || d.category || "").replace(/_/g, " ")}${d.domain && d.domain !== "general" ? " · " + d.domain : ""} · ${d.difficulty}`, d.est_cost ? ` · ~${fmtCost(d.est_cost)}` : "")),
           h("div", { class: "route-body" }, h("div", {}, d.reason), cands.length ? h("div", { class: "cands" }, cands) : null));
         addAct(card);
         break;
@@ -758,8 +836,9 @@ async function showModels() {
     const rows = await api("/api/leaderboard");
     lbEl.replaceChildren();
     if (!rows.length) { lbEl.append(h("div", { class: "empty" }, "No results yet. Finish a few tasks (and use 👍/👎) and the scoreboard fills in.")); return; }
-    for (const cat of [...new Set(rows.map((r) => r.category))]) {
-      const rs = rows.filter((r) => r.category === cat).sort((a, b) => b.score - a.score);
+    const key = (r) => `${r.category.replace(/_/g, " ")}${r.domain && r.domain !== "general" ? " · " + r.domain : ""}`;
+    for (const cat of [...new Set(rows.map(key))]) {
+      const rs = rows.filter((r) => key(r) === cat).sort((a, b) => b.score - a.score);
       lbEl.append(h("h3", { class: "lb-cat" }, cat), h("div", { class: "md" }, h("table", {},
         h("thead", {}, h("tr", {}, ["Model", "Score", "Tasks", "👍", "👎", "Errors", "Avg cost", "Avg time"].map((x) => h("th", {}, x)))),
         h("tbody", {}, rs.map((r) => h("tr", {},

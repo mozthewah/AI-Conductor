@@ -119,18 +119,21 @@ async def test_use_skill_and_followup_message(settings):
     assert c.skills.get("greet").uses == 1
 
 
-async def test_subagents_run_in_parallel(settings):
+async def test_assigned_parts_run_in_parallel(settings):
     def lead(_):
-        return [tool_use("delegate", tasks=[{"title": "A", "instructions": "do A"},
-                                              {"title": "B", "instructions": "do B"}])]
-    sub = lambda msgs: [text(f"report for {msgs[0]['content'][-1]['text']}")]
+        return [tool_use("assign", parts=[{"id": "a", "title": "A", "skill": "research", "domain": "general",
+                                           "instructions": "do A"},
+                                          {"id": "b", "title": "B", "skill": "research", "domain": "general",
+                                           "priority": "supporting", "instructions": "do B"}])]
+    sub = lambda msgs: [text("report for " + msgs[0]["content"][-1]["text"].split("\n")[-1])]
     llm = FakeLLM([lead, sub, sub, [text("Combined.")]])
     c = Conductor(settings, llm=llm)
     tid = await run_to_end(c, "research")
     kids = c.store.child_tasks(tid)
     assert {k["title"] for k in kids} == {"A", "B"} and all(k["status"] == "done" for k in kids)
-    # sub-agents don't get delegate / schedule tools, and run at sub-agent effort
-    assert "delegate" not in llm.calls[1]["tools"] and llm.calls[1]["effort"] == "medium"
+    # specialists don't get conductor tools; core parts run at full effort, supporting at sub-agent effort
+    assert "assign" not in llm.calls[1]["tools"]
+    assert sorted(cl["effort"] for cl in llm.calls[1:3]) == ["high", "medium"]
     final_input = llm.calls[3]["messages"][-1]["content"][0]["content"]
     assert "report for do A" in final_input and "report for do B" in final_input
 

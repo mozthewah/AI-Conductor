@@ -22,7 +22,7 @@ at it from your results.
 | **Researches** | Hosted web search + fetch (OpenRouter's for any model, Anthropic's for direct Claude), with cited sources |
 | **Uses a computer** | A real Chromium tab per task (Playwright): click, type, read, and screenshots streamed to the UI |
 | **Does real work** | Files and a shell inside `./workspace`, so it can write reports, build and test scripts, and crunch data |
-| **Delegates** | `delegate` runs up to 6 sub-agents in parallel, each with its own tools and transcript |
+| **Conducts** | Splits multi-part requests, hires the best model per part, reviews their work, and integrates it |
 | **Remembers** | SQLite + full-text search. Facts about you are injected into every task; past-task summaries are recalled when relevant |
 | **Learns skills** | Reusable procedures saved as Markdown in `data/skills/`, listed in every task's prompt and loaded on demand |
 | **Reflects** | After each task, a short review decides what's worth remembering and whether a new skill was learned |
@@ -48,22 +48,48 @@ conductor chat "summarize the files in my workspace"
 conductor chat --auto                 # don't ask before shell commands
 ```
 
+## The conductor: the best model for each part
+
+Conductor doesn't use one model for everything. When a request needs several kinds of work
+(say, *design and build an app*, or *find travel deals and budget the trip*), a **conductor** model
+takes charge:
+
+1. **Splits** the request into parts. Each part gets a skill (`coding`, `ui_design`,
+   `architecture`, `research`, `writing`, `analysis`, `planning`, `browsing`) and a domain
+   (`travel`, `finance`, `health`, … or `general`), plus what it depends on.
+2. **Hires** the best model for each part from the router, so design might go to one model and the
+   code to another. Independent parts run in parallel. A part that depends on another waits, then
+   gets that part's output and files.
+3. **Reviews** every part: **accept** it, **revise** it (the same model fixes it, in the same
+   conversation), or **reassign** it (a different model takes over).
+4. **Integrates** the result and tells you which model did what.
+
+Simple, single-kind requests skip the conductor and go straight to the best model for that work.
+The **Team** tab shows every part, its model, and its review status, and you can 👍/👎 each part.
+
 ## Models and the router
 
 Every model talks through the same Anthropic Messages format: Anthropic natively, everything else
 through [OpenRouter's Messages-compatible endpoint](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message.md).
 So tools, streaming, the browser, memory, and skills work the same whichever model runs a task.
 
-**How a model gets picked (once per task, then it sticks):**
+**How a model gets picked for a piece of work (skill + domain):**
 
-1. **Classify.** A small model (Claude Haiku 5.5 by default, about a hundredth of a cent per task) labels the
-   request: category (coding, research, writing, analysis, browsing, planning, chat) and difficulty.
-2. **Score.** Each roster model gets an expected quality for that category. It starts from a prior
-   based on its price tier vs. the task's difficulty, then is updated by your actual results:
-   finished OK = 0.7, 👍 = 1, 👎 = 0, error = 0.
-3. **Pick.** Expected quality minus a cost penalty sized by `CONDUCTOR_BUDGET`. About 10% of the time it
-   samples instead of taking the top score (Thompson sampling), so it keeps learning about models it
-   hasn't tried much.
+1. **Classify.** A small model (Claude Haiku 5.5 by default, about a hundredth of a cent per request) labels
+   the request: main skill, domain, difficulty, and the distinct kinds of work involved. More than
+   one kind, or hard work, gets a conductor.
+2. **Start from benchmarks.** OpenRouter's benchmark feed gives a day-one ranking per skill:
+   Design Arena for `ui_design`, coding indexes for `coding`, search evals for `research`, agentic
+   scores for `browsing` and conducting, and general intelligence for the rest. It's fetched with your
+   key and cached daily. Models without benchmark data fall back to their price tier.
+3. **Learn from you.** Results update each model's score: 👍 = 1, 👎 = 0, the conductor's review
+   (accepted first try 0.9, after revisions less, reassigned 0.1), and otherwise finished OK = 0.7.
+   Results count fully for the exact skill + domain, half for the same skill in other domains, and a
+   quarter for the same domain with other skills. So if Kimi keeps nailing finance analysis, it gets
+   the edge on new finance work too.
+4. **Pick.** Expected quality minus a cost penalty set by the budget. Core parts and the conductor
+   default to quality first (`best`), supporting parts lean cheap. About 10% of the time it samples
+   instead of taking the top score (Thompson sampling), so it keeps learning about less-proven models.
 
 **What you see:**
 - A model picker on the composer (Auto, or pin a model)
@@ -84,7 +110,10 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `ANTHROPIC_API_KEY` | – | Enables Claude direct from Anthropic (optional if you use OpenRouter) |
 | `CONDUCTOR_MODEL` | `auto` | `auto` = router picks per task; or pin an id like `openai/gpt-6.1-sol` or `claude-opus-5-5` |
 | `CONDUCTOR_BUDGET` | `balanced` | `frugal` / `balanced` / `best`: how much the router weighs cost |
-| `CONDUCTOR_SUBAGENT_MODEL` / `_BUDGET` | `auto` / `frugal` | Same, for sub-agents |
+| `CONDUCTOR_LEAD_BUDGET` | `best` | Budget for picking the conductor |
+| `CONDUCTOR_PART_BUDGET` | `best` | Budget for core parts |
+| `CONDUCTOR_SUBAGENT_BUDGET` | `frugal` | Budget for supporting parts |
+| `CONDUCTOR_SUBAGENT_MODEL` | `auto` | Pin every specialist to one model instead |
 | `CONDUCTOR_ROUTER_MODEL` | `anthropic/claude-haiku-5.5` | The classifier |
 | `CONDUCTOR_EXPLORE` | `0.1` | Share of tasks where the router tries a less-proven model |
 | `CONDUCTOR_EFFORT` | `high` | Reasoning effort for models that support it (`low` … `max`). Sub-agents run at `medium` |
@@ -115,7 +144,9 @@ you ──► Conductor.start_task
 - `conductor/agent.py` – the loop, sub-agents, approvals and questions, reflection
 - `conductor/llm.py` – streaming client for Anthropic + OpenRouter (the only file that talks to model APIs)
 - `conductor/models.py` – live OpenRouter catalog, prices, capabilities, and the roster
-- `conductor/router.py` – classification, scoring, and the learning model picker
+- `conductor/router.py` – classification (skill, domain, parts), scoring, and the learning model picker
+- `conductor/benchmarks.py` – OpenRouter benchmark feed, turned into per-skill starting scores
+- `conductor/tools/agents.py` – the conductor's `assign` / `review` tools (parts, dependencies, revisions)
 - `conductor/tools/` – one module per capability; add your own by appending a `Tool`
 - `conductor/store.py` – SQLite: tasks, transcripts, event log, memory (FTS5), schedules, router run log
 - `conductor/skills.py` – the Markdown skill library

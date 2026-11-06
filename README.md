@@ -116,6 +116,8 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_SUBAGENT_MODEL` | `auto` | Pin every specialist to one model instead |
 | `CONDUCTOR_ROUTER_MODEL` | `anthropic/claude-haiku-5.5` | The classifier |
 | `CONDUCTOR_EXPLORE` | `0.1` | Share of tasks where the router tries a less-proven model |
+| `CONDUCTOR_AUTO_ESCALATE` | `on` | Move tasks to a stronger model when they outgrow or struggle on the current one |
+| `CONDUCTOR_EXPERT_MODEL` | `auto` | Who `consult_expert` asks (auto = the best available for the work) |
 | `CONDUCTOR_EFFORT` | `high` | Reasoning effort for models that support it (`low` … `max`). Sub-agents run at `medium` |
 | `CONDUCTOR_APPROVAL` | `low` | Auto-approve actions up to `safe` / `low` / `medium` / `high` (critical always asks). Also editable on the Safety page |
 | `CONDUCTOR_UNATTENDED_APPROVAL` | `low` | Same, for scheduled runs; anything above it is declined |
@@ -168,6 +170,30 @@ TOOLS = [Tool("get_weather", "Current weather for a city.",
 
 Then add `tools += weather.TOOLS` in `build_registry` (`conductor/tools/__init__.py`).
 Set `risky=True` and call `await ctx.approve(...)` in the handler for anything that should ask first.
+
+## Calling up to a stronger model
+
+A task starts on the model the router picks for the first message. But a conversation can grow:
+"do you have access to my repos?" can turn into "clone it, install Go, and get the design reviewed".
+Conductor moves up a tier when that happens:
+
+- **Follow-ups are re-triaged.** If a new message is harder (or a heavier kind of work) than the
+  task was routed for, the task moves to the best model for the new work.
+- **It notices when a model struggles.** Repeating the same call three times, or three failing steps
+  in a row, hands the task to a stronger model with a note to step back and change approach.
+- **Models can ask for help.** `consult_expert` sends one hard question (with context) to a top model
+  and returns its advice, while the task stays on the cheaper model. `escalate` hands over the
+  whole task.
+- **You can do it too.** The **⬆ Stronger model** menu on every task switches models mid-conversation.
+
+The new model sees the whole conversation. The earlier model's private reasoning notes are left
+out (only the model that wrote them can read them), and its web-tool records become plain-text
+summaries. Being escalated away from counts against a model for that kind of work, so the router
+learns not to start there next time. Automatic upgrades are capped at two per task
+(`CONDUCTOR_AUTO_ESCALATE=off` disables them).
+
+Reasoning notes in the activity feed are collapsed to a one-line preview. Click one to expand it,
+or use the 💭 button on a task to show them all.
 
 ## Approvals by risk level
 

@@ -122,6 +122,17 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         except ValueError as e:
             raise HTTPException(400, str(e))
 
+    @app.post("/api/tasks/{task_id}/escalate")
+    async def escalate(task_id: str, body: ModelChoice):
+        task_or_404(task_id)
+        reason = "You asked for a stronger model."
+        if c().request_escalation(task_id, reason, by="user", target=body.model):
+            return {"ok": True, "pending": True}
+        new = await c().escalate(task_id, reason, by="user", target=body.model)
+        if not new:
+            raise HTTPException(409, "Already on the strongest available model for this kind of work.")
+        return {"ok": True, "model": new}
+
     @app.post("/api/tasks/{task_id}/feedback")
     def feedback(task_id: str, body: Feedback):
         task_or_404(task_id)

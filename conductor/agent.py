@@ -47,6 +47,7 @@ class Conductor:
         self.router = Router(self)
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
+        self._escalate_next: dict[str, tuple[str, str, str | None]] = {}  # task -> (reason, by, target)
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -222,18 +223,26 @@ class Conductor:
         self._append(task_id, messages, "user", content)
         self.store.update_task(task_id, status="running")
         await self.emit(task_id, "user", {"text": prompt})
-        if route is not None:
-            await self._route(task_id, prompt, **route)
+        if not self.store.get_task(task_id).get("model"):
+            if route is not None:
+                await self._route(task_id, prompt, **route)
+        elif depth == 0:  # a follow-up: check it hasn't outgrown the current model
+            await self._reroute_followup(task_id, prompt)
         task = self.store.get_task(task_id)
         system = task["system_prompt"]
-        model = self.catalog.get(task.get("model") or self.settings.fallback_model)
 
         ctx = ToolContext(conductor=self, task_id=task_id, depth=depth)
         specs = self.tool_specs(depth)
         answer = ""
+        seen_calls: dict[str, int] = {}
+        failing_turns = 0
         try:
             for _ in range(self.settings.max_steps):
                 turn = len(messages)
+                if task_id in self._escalate_next:
+                    reason, by, target = self._escalate_next.pop(task_id)
+                    await self.escalate(task_id, reason, by=by, target=target)
+                model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
 
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
@@ -242,7 +251,7 @@ class Conductor:
                                            on_event=on_event, effort=effort, web=self.settings.web_tools,
                                            session_id=task_id)
                 blocks = resp["content"]
-                self._append(task_id, messages, "assistant", blocks)
+                self._append(task_id, messages, "assistant", blocks, model=model.id)
                 usage = resp.get("usage") or {}
                 self.store.add_usage(task_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0),
                                      usage.get("cost", 0.0))
@@ -266,8 +275,27 @@ class Conductor:
                     break
 
                 truncated = stop == "max_tokens"
-                results = await asyncio.gather(*[self._run_tool(ctx, b, truncated) for b in tool_uses])
-                self._append(task_id, messages, "user", list(results))
+                results = list(await asyncio.gather(*[self._run_tool(ctx, b, truncated) for b in tool_uses]))
+
+                # Signs the model is struggling: the same call over and over, or turn after turn of errors.
+                stuck = None
+                for b in blocks:
+                    if b.get("type") in ("tool_use", "server_tool_use") and b.get("name") not in ("update_plan",):
+                        sig = b.get("name", "") + json.dumps(b.get("input", {}), sort_keys=True)
+                        seen_calls[sig] = seen_calls.get(sig, 0) + 1
+                        if seen_calls[sig] == 3:
+                            stuck = f"it repeated the same {b.get('name')} call three times"
+                failing_turns = failing_turns + 1 if results and all(r.get("is_error") for r in results) else 0
+                if failing_turns >= 3:
+                    stuck = "three steps in a row failed"
+                if stuck and self.settings.auto_escalate and task_id not in self._escalate_next:
+                    self._escalate_next[task_id] = (f"The model seemed stuck: {stuck}.", "auto", None)
+                    results.append({"type": "text", "text": (
+                        f"[Conductor note: {stuck}, so a stronger model is taking over from here. "
+                        "Step back, look at what has been tried, and take a different approach.]")})
+                    seen_calls.clear()
+                    failing_turns = 0
+                self._append(task_id, messages, "user", results)
             else:
                 answer = (text_of(messages[-1]["content"]) if messages[-1]["role"] == "assistant" else "")
                 answer += f"\n\n_(Stopped after {self.settings.max_steps} steps.)_"
@@ -286,9 +314,91 @@ class Conductor:
             await self.emit(task_id, "error", {"text": msg})
             return f"Error: {msg}"
 
-    def _append(self, task_id: str, messages: list[dict], role: str, content: Any) -> None:
-        messages.append({"role": role, "content": content})
-        self.store.append_message(task_id, role, content)
+    def _append(self, task_id: str, messages: list[dict], role: str, content: Any, model: str | None = None) -> None:
+        messages.append({"role": role, "content": content, **({"model": model} if model else {})})
+        self.store.append_message(task_id, role, content, model=model)
+
+    # ------------------------------------------------------------------ escalation
+    def request_escalation(self, task_id: str, reason: str, by: str = "user", target: str | None = None) -> bool:
+        """Upgrade a task's model: before its next step if running, else for the next message."""
+        if task_id in self._running or self.store.get_task(task_id).get("parent_id"):
+            self._escalate_next[task_id] = (reason, by, target)
+            return True
+        return False
+
+    def stronger_model(self, task: dict) -> str | None:
+        """The best model for this task's kind of work, if it's clearly better than the current one."""
+        route = task.get("route") or {}
+        skill, domain = route.get("skill", "other"), route.get("domain", "general")
+        if route.get("mode") == "conduct":
+            skill, domain = "orchestration", "general"
+        current = task.get("model")
+        pick = self.router.pick(skill=skill, domain=domain, difficulty="hard", budget="best",
+                                exclude={current} if current else None)
+        if pick.by == "fallback" or pick.model == current:
+            return None
+        roster = [m.id for m in self.catalog.roster()]
+        table = self.router._stats()
+        cur = self.catalog.get(current or "")
+        cur_q = self.router.estimate(cur, skill, domain, "hard", roster, table)[0] if current else 0
+        new_q = next((c["quality"] for c in pick.candidates if c["model"] == pick.model), 0)
+        return pick.model if new_q > cur_q + 0.02 else None
+
+    async def escalate(self, task_id: str, reason: str, by: str = "auto", target: str | None = None) -> str | None:
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        history = list(route.get("escalations") or [])
+        if by in ("auto", "model") and len(history) >= self.settings.max_escalations:
+            return None
+        current = task.get("model")
+        new = target if target and target != "auto" else self.stronger_model(task)
+        if not new or new == current:
+            await self.emit(self._root(task_id)["id"], "status", {
+                "text": f"Wanted a stronger model ({reason.rstrip('.')}), but {self.catalog.get(current or '').name or current} "
+                        "is already the best available for this."})
+            return None
+        info = self.catalog.get(new)
+        history.append({"from": current, "to": new, "reason": reason, "by": by, "at": time.time()})
+        route.update({"escalations": history, "model": new, "name": info.name or new})
+        self.store.update_task(task_id, model=new, route=route)
+        # Teach the router: the earlier model wasn't enough for this kind of work.
+        if current:
+            ghost = f"{task_id}#esc{len(history)}"
+            self.store.start_run(ghost, current, route.get("skill", "other"), route.get("difficulty", "medium"),
+                                 "escalated", domain=route.get("domain", "general"), mode=route.get("mode", "direct"),
+                                 parent_id=task.get("parent_id"))
+            self.store.finish_run(ghost, "done", 0.0, 0.0)
+            self.store.set_review(ghost, 0.3 if by != "user" else 0.2)
+        self.store.set_run_model(task_id, new)
+        payload = {"task_id": task_id, "from": current, "from_name": self.catalog.get(current or "").name or current,
+                   "to": new, "name": info.name or new, "reason": reason, "by": by}
+        await self.emit(task_id, "escalated", payload)
+        if task.get("parent_id"):
+            await self.emit(self._root(task_id)["id"], "escalated", payload)
+        return new
+
+    async def _reroute_followup(self, task_id: str, prompt: str) -> None:
+        """A follow-up can be much bigger than the first message; move up if it outgrew the model."""
+        task = self.store.get_task(task_id)
+        route = task.get("route") or {}
+        if not self.settings.auto_escalate or route.get("by") == "pinned" or route.get("mode") == "conduct":
+            return
+        try:
+            label = await self.router.classify(prompt)
+        except Exception:
+            return
+        from .router import DIFFICULTIES
+        old_d = route.get("difficulty", "medium")
+        old_rank = DIFFICULTIES.index(old_d) if old_d in DIFFICULTIES else 1
+        new_rank = DIFFICULTIES.index(label["difficulty"])
+        if new_rank <= old_rank and label["skill"] == route.get("skill"):
+            return
+        route = {**route, "skill": label["skill"], "domain": label["domain"],
+                 "difficulty": DIFFICULTIES[max(old_rank, new_rank)]}
+        self.store.update_task(task_id, route=route)
+        if new_rank > old_rank or old_d == "easy":
+            await self.escalate(task_id, f"The work grew into {label['skill'].replace('_', ' ')} "
+                                         f"({label['difficulty']}) beyond the first question.", by="auto")
 
     @staticmethod
     def _dangling_tool_ids(messages: list[dict]) -> list[str]:

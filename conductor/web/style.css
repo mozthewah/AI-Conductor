@@ -99,7 +99,8 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .task-view { flex: 1; display: flex; min-height: 0; }
 .thread-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .task-head { display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid var(--line); }
-.task-head h2 { font: 500 19px/1.3 var(--serif); margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-head { flex-wrap: wrap; row-gap: 8px; }
+.task-head h2 { font: 500 19px/1.3 var(--serif); margin: 0; flex: 1 1 240px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--sunk); color: var(--ink-2); white-space: nowrap; }
 .pill.running { background: var(--accent-soft); color: var(--accent-ink); }
 .pill.waiting { background: var(--warn-soft); color: var(--warn); }
@@ -275,6 +276,21 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .sev-option .sev { margin-left: 0; align-self: flex-start; }
 .sev-option small { color: var(--ink-3); font-size: 12px; }
 .sev-option.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* ---------- reasoning notes & escalation ---------- */
+.thought { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; cursor: pointer; color: var(--ink-2); }
+.thought > svg { width: 14px; height: 14px; color: var(--ink-3); flex: none; transform: translateY(2px); }
+.thought .thought-preview { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thought .thought-full { display: none; white-space: pre-wrap; flex-basis: 100%; padding: 8px 10px; border-left: 2px solid var(--line); margin: 4px 0 2px 2px; background: var(--sunk); border-radius: 0 8px 8px 0; font-size: 13.5px; }
+.thought.open .thought-preview { display: none; }
+.thought.open .thought-full { display: block; flex-basis: calc(100% - 24px); margin-top: 0; }
+.thought:not(.long) { cursor: default; }
+.thought:hover .thought-preview { color: var(--ink); }
+.act.progress::before { border-color: var(--line); }
+.icon-btn.on { color: var(--accent); border-color: var(--accent); }
+.card.escalated { border-color: var(--accent); background: var(--accent-soft); box-shadow: none; }
+.card.escalated .title svg { color: var(--accent); }
+.up-select { max-width: 150px; }
 
 @media (max-width: 1100px) {
   .computer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 20; width: min(400px, 92vw); box-shadow: var(--shadow); }

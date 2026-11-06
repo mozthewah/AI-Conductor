@@ -44,13 +44,16 @@ const ICONS = {
   route: '<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h8a3 3 0 0 0 0-6H8a3 3 0 0 1 0-6h8"/>',
   up: '<path d="M7 11v9H4v-9zM7 11l4-7c1.5 0 2.5 1 2.2 2.5L12.5 10H18a2 2 0 0 1 2 2.3l-1.2 6A2 2 0 0 1 16.8 20H7"/>',
   down: '<path d="M7 13V4H4v9zM7 13l4 7c1.5 0 2.5-1 2.2-2.5L12.5 14H18a2 2 0 0 0 2-2.3l-1.2-6A2 2 0 0 0 16.8 4H7"/>',
+  arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  bulb: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/>',
+  thought: '<path d="M7 18a4 4 0 0 1-.6-8A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1 .5 8z"/><circle cx="5" cy="21" r="1"/>',
 };
 const icon = (name) => svg(ICONS[name] || ICONS.sparkle);
 const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -95,6 +98,24 @@ function autosize(ta) {
 
 // ------------------------------------------------------------------ app state
 const state = { config: null, tasks: [], es: null, taskId: null, roster: null };
+const prefs = (() => { try { return JSON.parse(localStorage.getItem("conductor.prefs") || "{}"); } catch { return {}; } })();
+const savePrefs = () => { try { localStorage.setItem("conductor.prefs", JSON.stringify(prefs)); } catch {} };
+function thoughtNote(text) {
+  // A reasoning/progress note, collapsed to one line unless opened (or "show reasoning" is on).
+  const preview = h("span", { class: "thought-preview" });
+  const full = h("div", { class: "thought-full" });
+  const el = h("div", { class: "thought" + (prefs.showThinking ? " open" : ""), title: "Click to expand",
+    onclick: (e) => { if (!e.target.closest("a")) el.classList.toggle("open"); } }, icon("thought"), preview, full);
+  el.setText = (t) => {
+    el.raw = t;
+    const first = t.trim().split(/\n/)[0];
+    preview.textContent = first.length > 110 ? first.slice(0, 108) + "…" : first + (t.trim().includes("\n") ? " …" : "");
+    full.textContent = t;
+    el.classList.toggle("long", t.length > 110 || t.trim().includes("\n"));
+  };
+  el.setText(text || "");
+  return el;
+}
 const fmtCost = (c) => c == null ? "" : c < 0.01 ? `$${Number(c).toFixed(4)}` : `$${Number(c).toFixed(2)}`;
 const fmtSecs = (s) => s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 const shortModel = (id) => (id || "").split("/").pop();
@@ -284,8 +305,25 @@ async function showTask(id) {
   });
   comp.onStop = () => api(`/api/tasks/${id}/cancel`, { method: "POST" });
 
+  const upSel = modelSelect(roster, { auto: false, placeholder: "⬆ Stronger model…" });
+  upSel.classList.add("compare-select", "up-select");
+  upSel.insertBefore(h("option", { value: "auto" }, "Best available for this work"), upSel.options[1]);
+  upSel.addEventListener("change", async () => {
+    if (!upSel.value) return;
+    try {
+      const r = await api(`/api/tasks/${id}/escalate`, { method: "POST", body: { model: upSel.value } });
+      if (r.pending) addAct(h("span", { style: "color:var(--ink-3)" }, "A stronger model will take over from the next step."));
+    } catch (e) { alert(e.message); }
+    upSel.value = "";
+  });
+  const thinkBtn = h("button", { class: "icon-btn" + (prefs.showThinking ? " on" : ""), title: "Show reasoning notes expanded",
+    onclick: () => {
+      prefs.showThinking = !prefs.showThinking; savePrefs();
+      thinkBtn.classList.toggle("on", prefs.showThinking);
+      inner.querySelectorAll(".thought").forEach((t) => t.classList.toggle("open", prefs.showThinking));
+    } }, icon("thought"));
   const backLink = task.parent_id ? h("a", { class: "cmp", "data-nav": `/t/${task.parent_id}`, href: `/t/${task.parent_id}`, title: "Back to the main task" }, "← main task") : null;
-  const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, compareSel,
+  const head = h("div", { class: "task-head" }, backLink, title, modelChip, pill, upSel, compareSel, thinkBtn,
     h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => computer.classList.toggle("hidden") }, icon("panel")),
     h("button", { class: "icon-btn", title: "Delete task", onclick: async () => {
       if (!confirm("Delete this task and its history?")) return;
@@ -504,17 +542,16 @@ async function showTask(id) {
       case "progress_delta": {
         const key = `p:${d.turn}:${d.index}`;
         let el = v.live[key];
-        if (!el) { el = addAct("", "progress"); el.raw = ""; v.live[key] = el; }
-        el.raw += d.text;
-        el.textContent = el.raw;
+        if (!el) { el = thoughtNote(""); addAct(el, "progress"); v.live[key] = el; }
+        el.setText((el.raw || "") + d.text);
         scroll();
         break;
       }
       case "progress": {
         const key = `p:${d.turn}:${d.index}`;
-        const el = v.live[key] || addAct("", "progress");
-        el.textContent = d.text;
-        v.live[key] = el;
+        let el = v.live[key];
+        if (!el) { el = thoughtNote(""); addAct(el, "progress"); v.live[key] = el; }
+        el.setText(d.text);
         break;
       }
       case "text_delta": {
@@ -540,6 +577,7 @@ async function showTask(id) {
       case "tool_call": {
         const chip = v.tools[d.id] || toolChip(d.id, d.summary, TOOL_ICONS[d.name]);
         chip.label.textContent = d.summary;
+        if (d.name === "consult_expert") v.lastConsult = chip;
         chip.body.textContent = JSON.stringify(d.input, null, 2);
         break;
       }
@@ -553,15 +591,16 @@ async function showTask(id) {
         break;
       }
       case "server_tool":
-        if (!v.tools[d.id]) toolChip(d.id, d.name === "web_search" ? "Searching the web…" : "Reading a page…", TOOL_ICONS[d.name]);
+        if (!v.tools[d.id]) toolChip(d.id, /search/.test(d.name || "") ? "Searching the web…" : "Reading a page…", /search/.test(d.name || "") ? "search" : "globe");
         break;
       case "server_tool_input": {
         const chip = v.tools[d.id] || toolChip(d.id, "", TOOL_ICONS[d.name]);
         const inp = d.input || {};
-        chip.label.textContent = d.name === "web_search" ? `Searched “${inp.query || ""}”` : `Read ${inp.url || "a page"}`;
+        const isSearch = /search/.test(d.name || "") || (inp.query && !inp.url);
+        chip.label.textContent = isSearch ? `Searched “${inp.query || inp.q || ""}”` : `Read ${inp.url || "a page"}`;
         chip.body.textContent = JSON.stringify(inp, null, 2);
         chip.classList.remove("pending");
-        chip.setIcon(TOOL_ICONS[d.name] || "globe");
+        chip.setIcon(isSearch ? "search" : "globe");
         break;
       }
       case "sources":
@@ -632,6 +671,27 @@ async function showTask(id) {
         requestCard(d);
         if (v.replayed) setStatus("waiting");
         break;
+      case "escalated": {
+        if (d.task_id === id) setModel({ model: d.to, name: d.name, reason: d.reason });
+        const who = d.by === "user" ? "You moved this" : d.by === "model" ? "The model asked to hand this" : "Moved this";
+        addAct(h("div", { class: "card escalated" }, h("div", { class: "title" }, icon("arrowUp"),
+          `${who} up to `, h("b", {}, d.name || shortModel(d.to)), d.from ? h("small", { class: "sub-model" }, `from ${d.from_name || shortModel(d.from)}`) : null),
+          h("div", { class: "sev-reason" }, d.reason)));
+        if (d.task_id === id) compareSel.querySelectorAll("option").forEach((o) => { o.hidden = o.value === d.to; });
+        break;
+      }
+      case "consulted": {
+        if (d.action === "asking") {
+          if (v.lastConsult) v.lastConsult.label.textContent = `Asking ${d.name} for advice…`;
+        } else if (v.lastConsult) {
+          const chip = v.lastConsult;
+          chip.classList.remove("pending");
+          chip.setIcon("bulb");
+          chip.label.textContent = `Advice from ${d.name}${d.cost ? " · " + fmtCost(d.cost) : ""}`;
+          chip.body.textContent += `\n\nA: ${d.answer}`;
+        }
+        break;
+      }
       case "approval": {
         const el = addAct(h("span", { class: "auto-approval" + (d.allowed ? "" : " denied") }, icon("shield"),
           h("span", { class: `sev sev-${d.level}` }, d.level), d.allowed ? " Auto-allowed: " : " Declined: ",

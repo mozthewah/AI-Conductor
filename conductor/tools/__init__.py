@@ -103,7 +103,7 @@ def clip(text: str, limit: int = MAX_RESULT_CHARS) -> str:
 
 
 def build_registry(settings) -> list[Tool]:
-    from . import agents, browser, memory, planning, schedule, skills, workspace
+    from . import agents, browser, expert, memory, planning, schedule, skills, workspace
 
     tools: list[Tool] = []
     tools += planning.TOOLS
@@ -113,5 +113,6 @@ def build_registry(settings) -> list[Tool]:
     tools += memory.TOOLS
     tools += skills.TOOLS
     tools += agents.TOOLS
+    tools += expert.TOOLS
     tools += schedule.TOOLS
     return tools

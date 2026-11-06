@@ -40,6 +40,9 @@ class Settings:
     part_budget: str = "best"         # core parts of a conducted request: quality first
     conductor_budget: str = "best"    # the model that splits, reviews, and integrates
     explore: float = 0.1             # chance the router tries a less-proven model
+    auto_escalate: bool = True       # move a task to a stronger model when it outgrows/struggles
+    max_escalations: int = 2         # automatic upgrades per task (you can always upgrade by hand)
+    expert_model: str = "auto"       # who consult_expert asks; auto = best available for the work
     anthropic_key: bool = False
     openrouter_key: str = ""
     effort: str = "high"
@@ -94,6 +97,8 @@ class Settings:
             part_budget=os.environ.get("CONDUCTOR_PART_BUDGET", cls.part_budget).lower(),
             conductor_budget=os.environ.get("CONDUCTOR_LEAD_BUDGET", cls.conductor_budget).lower(),
             explore=float(os.environ.get("CONDUCTOR_EXPLORE", cls.explore)),
+            auto_escalate=_flag("CONDUCTOR_AUTO_ESCALATE", True),
+            expert_model=os.environ.get("CONDUCTOR_EXPERT_MODEL", cls.expert_model),
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
             openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),

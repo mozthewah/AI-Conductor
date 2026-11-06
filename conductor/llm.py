@@ -261,16 +261,54 @@ class Accumulator:
 
 
 def adapt_messages(messages: list[dict], model: ModelInfo) -> list[dict]:
-    """Per-model view of the stored transcript. Deterministic, so the prefix stays cache-stable."""
-    if model.vision:
-        return messages
+    """Per-model view of the stored transcript.
+
+    Deterministic for a given model, so its prefix stays cache-stable and append-only.
+    When a task switches models mid-way, turns written by the earlier model are shown to
+    the new one without that model's private reasoning blocks (which only the model that
+    wrote them can read) and with provider-specific web-tool blocks turned into plain text.
+    """
     out = []
     for m in messages:
         content = m["content"]
         if isinstance(content, list):
-            content = [_strip_images(b) for b in content]
-        out.append({**m, "content": content})
+            if m["role"] == "assistant" and m.get("model") and m["model"] != model.id:
+                content = _foreign_turn(content)
+            if not model.vision:
+                content = [_strip_images(b) for b in content]
+        out.append({"role": m["role"], "content": content})
     return out
+
+
+def _foreign_turn(blocks: list[dict]) -> list[dict]:
+    kept: list[dict] = []
+    notes: list[str] = []
+    for b in blocks:
+        t = b.get("type", "")
+        if t in ("thinking", "redacted_thinking", "fallback"):
+            continue
+        if t == "server_tool_use":
+            notes.append(f"[{b.get('name', 'tool')}: {json.dumps(b.get('input', {}))[:300]}]")
+            continue
+        if t.endswith("_tool_result"):
+            items = b.get("content") if isinstance(b.get("content"), list) else []
+            found = [f"- {r.get('title', '')} {r.get('url', '')}".strip() for r in items if isinstance(r, dict)][:8]
+            notes.append("[results]\n" + "\n".join(found) if found else "[result received]")
+            continue
+        if t in ("text", "tool_use"):
+            if notes and t == "text":
+                kept.append({"type": "text", "text": "\n".join(notes)})
+                notes = []
+            kept.append({k: v for k, v in b.items() if k != "citations"} if t == "text" else b)
+            continue
+    if notes:
+        kept.insert(0, {"type": "text", "text": "\n".join(notes)})
+    if not kept:
+        kept = [{"type": "text", "text": "(continuing)"}]
+    # tool_use must come last in an assistant turn
+    texts = [b for b in kept if b["type"] == "text"]
+    uses = [b for b in kept if b["type"] == "tool_use"]
+    return texts + uses
 
 
 def _strip_images(block: dict) -> dict:

@@ -118,6 +118,9 @@ class Store:
         self._db.commit()
 
     def _migrate(self) -> None:
+        msg_cols = {r[1] for r in self._db.execute("PRAGMA table_info(messages)")}
+        if "model" not in msg_cols:  # which model wrote each assistant turn (for mid-task model switches)
+            self._db.execute("ALTER TABLE messages ADD COLUMN model TEXT")
         run_cols = {r[1] for r in self._db.execute("PRAGMA table_info(runs)")}
         for name, ddl in [("domain", "TEXT NOT NULL DEFAULT 'general'"), ("review", "REAL"),
                           ("parent_id", "TEXT"), ("mode", "TEXT NOT NULL DEFAULT 'direct'")]:
@@ -203,6 +206,9 @@ class Store:
                    " parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (task_id, model, category, domain, difficulty, routed_by, mode, parent_id, time.time()))
 
+    def set_run_model(self, task_id: str, model: str) -> None:
+        self._exec("UPDATE runs SET model = ? WHERE task_id = ?", (model, task_id))
+
     def set_review(self, task_id: str, score: float) -> bool:
         """The conductor's verdict on a specialist's work (0-1)."""
         return self._exec("UPDATE runs SET review = ? WHERE task_id = ?", (score, task_id)).rowcount > 0
@@ -250,17 +256,23 @@ class Store:
         self._exec("DELETE FROM tasks WHERE id = ?", (task_id,))
 
     # -- transcript (append-only: the API ties thinking to exact history) --
-    def append_message(self, task_id: str, role: str, content: Any) -> None:
+    def append_message(self, task_id: str, role: str, content: Any, model: str | None = None) -> None:
         with self._lock:
             row = self._db.execute("SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE task_id = ?",
                                    (task_id,)).fetchone()
-            self._db.execute("INSERT INTO messages (task_id, seq, role, content_json) VALUES (?, ?, ?, ?)",
-                             (task_id, row[0], role, json.dumps(content)))
+            self._db.execute("INSERT INTO messages (task_id, seq, role, content_json, model) VALUES (?, ?, ?, ?, ?)",
+                             (task_id, row[0], role, json.dumps(content), model))
             self._db.commit()
 
     def load_messages(self, task_id: str) -> list[dict]:
-        rows = self._all("SELECT role, content_json FROM messages WHERE task_id = ? ORDER BY seq", (task_id,))
-        return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
+        rows = self._all("SELECT role, content_json, model FROM messages WHERE task_id = ? ORDER BY seq", (task_id,))
+        out = []
+        for r in rows:
+            m = {"role": r["role"], "content": json.loads(r["content_json"])}
+            if r["model"]:
+                m["model"] = r["model"]
+            out.append(m)
+        return out
 
     # -- events ----------------------------------------------------------
     def append_event(self, task_id: str, type_: str, data: dict) -> dict:

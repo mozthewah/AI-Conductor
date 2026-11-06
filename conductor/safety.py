@@ -114,6 +114,7 @@ SAFE_SUBCOMMANDS = [
     ("git", "status"), ("git", "log"), ("git", "diff"), ("git", "show"), ("git", "branch"), ("git", "remote"),
     ("git", "rev-parse"), ("git", "ls-files"), ("git", "blame"), ("pip", "list"), ("pip", "show"),
     ("pip", "freeze"), ("pip3", "list"), ("npm", "ls"), ("npm", "list"), ("npm", "view"), ("npm", "outdated"),
+    ("go", "version"), ("go", "env"), ("go", "list"), ("go", "vet"), ("docker", "ps"), ("docker", "images"),
 ]
 SECRET_PATHS = re.compile(r"(~|\$HOME|/home/[^/\s]+|/root)/\.(ssh|aws|gnupg|config/gh|netrc|docker/config)"
                           r"|/etc/(shadow|sudoers)|\bid_(rsa|ed25519)\b")
@@ -152,8 +153,30 @@ def _outside(path: str, workspace: Path) -> bool:
     return False
 
 
+GH_READ = {"list", "view", "status", "diff", "checks", "search", "browse"}
+
+
+def _classify_gh(toks: list[str], seg: str) -> tuple[str, str, bool]:
+    """GitHub CLI: looking is safe, cloning is low, changing anything on GitHub is high."""
+    group = toks[1] if len(toks) > 1 else ""
+    action = toks[2] if len(toks) > 2 else ""
+    if group in ("auth", "status", "search", "--version", "version") and action in ("", "status", "repos", "issues", "prs", "code", "commits"):
+        return "safe", "Reads from GitHub.", True
+    if group == "api":
+        if re.search(r"(-X|--method)\s*(POST|PUT|PATCH|DELETE)|\s-(f|F)\s|--field|--raw-field|--input", seg):
+            return "high", "It changes something on GitHub through the API.", True
+        return "safe", "Reads from the GitHub API.", True
+    if action in GH_READ:
+        return "safe", "Reads from GitHub.", True
+    if group == "repo" and action == "clone":
+        return "low", "Downloads a repo.", True
+    return "high", f"It changes something on GitHub ({group} {action}).".replace(" )", ")"), True
+
+
 def _classify_segment(seg: str, toks: list[str], workspace: Path) -> tuple[str, str, bool]:
     exe = Path(toks[0]).name
+    if exe == "gh":
+        return _classify_gh(toks, seg)
     sub = toks[1] if len(toks) > 1 else ""
     args = toks[1:]
     outside_args = [a for a in args if not a.startswith("-") and ("/" in a or a.startswith("~"))

@@ -41,6 +41,7 @@ class ModelInfo:
     structured: bool = False
     tier: str = "strong"
     notes: str = ""
+    canonical: str = ""  # OpenRouter's permanent dated id (what benchmark feeds use)
 
     @property
     def is_claude(self) -> bool:
@@ -130,6 +131,7 @@ def parse_openrouter(entry: dict) -> ModelInfo | None:
             tools="tools" in params, vision="image" in mods,
             reasoning="reasoning" in params, structured="structured_outputs" in params,
             tier=tier_for(pout),
+            canonical=str(entry.get("canonical_slug") or ""),
         )
     except (KeyError, TypeError, ValueError):
         return None

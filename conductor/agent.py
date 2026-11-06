@@ -53,6 +53,7 @@ class Conductor:
                                            openrouter_key=settings.openrouter_key, max_tokens=settings.max_tokens)
         self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
                                      fetch=settings.fetch_catalog).load()
+        self.benchmarks.remap(self.catalog.models)
         self.router = Router(self)
         self.credits = CreditMonitor(key=settings.openrouter_key, management_key=settings.openrouter_management_key,
                                      low=settings.credit_low, fetch=settings.fetch_catalog)

@@ -193,3 +193,21 @@ def test_benchmark_parsing_and_percentiles(tmp_path):
     # a great coder with no design scores isn't treated as a great designer
     b.signals = {"design": {"a/x": 1300, "a/y": 1200}, "coding": {"a/c": 90, "a/x": 50, "a/y": 40}}
     assert b.prior("a/c", "ui_design", ["a/x", "a/y", "a/c"]) < b.prior("a/x", "ui_design", ["a/x", "a/y", "a/c"])
+
+
+def test_benchmark_ids_are_mapped_to_roster_ids(tmp_path):
+    from conductor.models import ModelInfo as MI
+    b = Benchmarks(tmp_path)
+    b.signals = parse([
+        {"source": "artificial-analysis", "model_permaslug": "anthropic/claude-opus-5.5-20260921", "coding_index": 74},
+        {"source": "artificial-analysis", "model_permaslug": "qwen/qwen3.8-max-20260902", "coding_index": 60},
+        {"source": "design-arena", "model_permaslug": "google/gemini-4-argon-20261013", "elo": 1380},
+        {"source": "design-arena", "model_permaslug": "someone/unmapped-model", "elo": 1000},
+    ])
+    models = {"anthropic/claude-opus-5.5": MI("anthropic/claude-opus-5.5", "openrouter", canonical="anthropic/claude-opus-5.5-20260921"),
+              "qwen/qwen3.8-max-0902": MI("qwen/qwen3.8-max-0902", "openrouter", canonical="qwen/qwen3.8-max-20260902"),
+              "google/gemini-4-argon": MI("google/gemini-4-argon", "openrouter")}  # no canonical: date-strip fallback
+    assert b.remap(models) == 3
+    assert b.summary("anthropic/claude-opus-5.5") == {"coding": 74.0}
+    assert b.summary("qwen/qwen3.8-max-0902") == {"coding": 60.0}
+    assert b.summary("google/gemini-4-argon") == {"design": 1380.0}

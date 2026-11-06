@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -24,6 +25,7 @@ from pathlib import Path
 log = logging.getLogger("conductor.benchmarks")
 
 URL = "https://openrouter.ai/api/v1/benchmarks"
+DATE_SUFFIX = re.compile(r"-(\d{8}|\d{4}-\d{2}-\d{2})$")
 TTL = 24 * 3600
 
 # Which signals speak to which skill (weights).
@@ -140,6 +142,27 @@ class Benchmarks:
                 total += w * 0.5
             wsum += w
         return total / wsum if wsum and known else None
+
+    def remap(self, models: dict) -> int:
+        """Benchmark feeds name models by permanent dated ids (e.g. "...-20260921"); the catalog and
+        roster use short ids. Translate via the catalog's canonical slugs (date-stripping as a
+        fallback) so scores land on the models we actually route to. Returns how many were mapped."""
+        alias: dict[str, str] = {}
+        for mid, m in models.items():
+            alias[mid] = mid
+            canon = getattr(m, "canonical", "") or ""
+            if canon:
+                alias.setdefault(canon, mid)
+                alias.setdefault(DATE_SUFFIX.sub("", canon), mid)
+        mapped = 0
+        for sig, scores in self.signals.items():
+            for key, score in list(scores.items()):
+                target = (alias.get(key) or alias.get(DATE_SUFFIX.sub("", key))
+                          or alias.get(key.split(":")[0]))
+                if target and target != key:
+                    scores[target] = max(scores.get(target, score), score)
+                    mapped += 1
+        return mapped
 
     def status(self) -> dict:
         models = {m for sig in self.signals.values() for m in sig}

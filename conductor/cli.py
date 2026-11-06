@@ -162,11 +162,16 @@ def doctor(args) -> None:
     if cache.exists():
         cache.unlink()  # force a fresh fetch so we see the real result
     b = Benchmarks(s.data_dir, key=s.openrouter_key).load()
+    b.remap(cat.models)
     st = b.status()
     if st["models"]:
         covered = [m.id for m in roster if b.summary(m.id)]
-        ok(f"Benchmarks: {st['models']} models across {', '.join(st['signals'])}; "
-           f"{len(covered)}/{len(roster)} roster models covered")
+        missing = [m.id for m in roster if not b.summary(m.id)]
+        (ok if len(covered) >= len(roster) * 0.6 else bad)(
+            f"Benchmarks: {st['models']} models across {', '.join(st['signals'])}; "
+            f"{len(covered)}/{len(roster)} roster models covered")
+        for mid in missing:
+            print(f"      no benchmark data for {mid} (it'll be judged by its price tier until it has results)")
     else:
         bad(f"Benchmarks unavailable: {st['error']}")
     if s.browser:

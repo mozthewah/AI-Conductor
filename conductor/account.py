@@ -56,8 +56,10 @@ def provider_slug(tag: str) -> str:
 
 class Account:
     def __init__(self, data_dir: Path, key: str = "", management_key: str = "", fetch: bool = True,
-                 mode: str = "auto"):
+                 mode: str = "auto", key_name: str = ""):
         self.path = Path(data_dir) / "account.json"
+        self.key_name = key_name.strip()
+        self.failed: dict[str, str] = {}  # model -> why a BYOK request failed (this session)
         self.key, self.management_key, self.fetch = key, management_key, fetch
         self.mode = mode if mode in ("auto", "prefer", "off") else "auto"
         self.data: dict = {"checked": 0.0, "byok": [], "key": None, "guardrail": None, "activity": [],
@@ -98,21 +100,51 @@ class Account:
                 return out
 
     def _own_key(self, keys: list[dict]) -> dict | None:
-        """Which of the account's API keys is the one Conductor runs on."""
+        """Which of the account's API keys is the one Conductor runs on.
+
+        Tried in order: CONDUCTOR_KEY_NAME, the key's SHA-256 hash, the masked label (in whatever form
+        the list shows it: same prefix and suffix as the real key), then matching usage and limit
+        against what the key reports about itself."""
         if not self.key:
             return None
+        if self.key_name:
+            for k in keys:
+                if self.key_name in (k.get("name"), k.get("label")):
+                    return k
         digest = hashlib.sha256(self.key.encode()).hexdigest()
         for k in keys:
             if k.get("hash") == digest:
                 return k
-        try:  # fall back to the masked label OpenRouter shows for the current key
-            label = (self._get("/key", self.key).get("data") or {}).get("label")
+        body = self.key.removeprefix("sk-or-v1-")
+
+        def masked(k: dict) -> bool:
+            for v in (k.get("label"), k.get("name")):
+                if not isinstance(v, str) or "..." not in v and "…" not in v:
+                    continue
+                left, _, right = v.replace("…", "...").partition("...")
+                left = left.removeprefix("sk-or-v1-")
+                if left and right and body.startswith(left) and body.endswith(right) and len(left + right) >= 4:
+                    return True
+            return False
+        hits = [k for k in keys if masked(k)]
+        if len(hits) == 1:
+            return hits[0]
+        try:
+            me = self._get("/key", self.key).get("data") or {}
         except Exception:
-            label = None
-        if label:
+            me = {}
+        self.data["key_label"] = me.get("label")
+        if me.get("label"):
             for k in keys:
-                if label in (k.get("label"), k.get("name")):
+                if me["label"] in (k.get("label"), k.get("name")):
                     return k
+        if me:  # same spend and limit as the key reports about itself (spend can tick up between calls)
+            close = [k for k in (hits or keys)
+                     if abs(float(k.get("usage") or 0) - float(me.get("usage") or 0)) < 0.02
+                     and k.get("limit") == me.get("limit")
+                     and abs(float(k.get("usage_daily") or 0) - float(me.get("usage_daily") or 0)) < 0.02]
+            if len(close) == 1:
+                return close[0]
         return None
 
     def refresh_sync(self, roster_ids: list[str] | None = None, force: bool = False) -> dict:
@@ -134,6 +166,7 @@ class Account:
                     "usage_weekly", "usage_monthly", "byok_usage", "byok_usage_monthly", "include_byok_in_limit",
                     "disabled", "expires_at")}
                 d["key_count"] = len(keys)
+                d["key_names"] = [k.get("name") or k.get("label") for k in keys][:20]
             except Exception as e:
                 errors["keys"] = _err(e)
             try:
@@ -219,7 +252,7 @@ class Account:
 
     def byok_for(self, model_id: str, canonical: str = "") -> list[str]:
         """Your providers (with a usable key) that serve this model."""
-        if self.mode == "off":
+        if self.mode == "off" or model_id in self.failed:
             return []
         served = set(self.data.get("endpoints", {}).get(model_id) or [])
         out = []

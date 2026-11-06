@@ -10,11 +10,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import scheduler
+import os
+import secrets
+from urllib.parse import parse_qs, urlencode
+
+from . import access, scheduler, updater
 from .agent import Conductor
 from .config import Settings
 
@@ -65,6 +69,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         state["c"].audit.write("system.start", "system", model=s.model, approval=state["c"].policy.threshold,
                                compose=s.compose, budget=s.router_budget, port=s.port, workspace=str(s.workspace),
                                providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key})
+        state["token"] = access.load_token(s.data_dir)  # passcode for other devices on your network
         state["c"].refresh_account()  # BYOK keys, guardrails, activity (background; cached 30 min)
         sched = asyncio.create_task(scheduler.run_forever(state["c"])) if run_scheduler else None
         yield
@@ -82,7 +87,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         return state["c"]
 
     # Routine polling the page does every few seconds; logging it would bury everything else.
-    quiet_gets = re.compile(r"^/api/(tasks|tasks/[\w-]+|credits|account|config|models|leaderboard|safety|schedules|skills|memories|files)$")
+    quiet_gets = re.compile(r"^/api/(tasks|tasks/[\w-]+|credits|account|access|audit|update|config|models|leaderboard|safety|schedules|skills|memories|files)$")
 
     @app.middleware("http")
     async def audit_requests(request: Request, call_next):
@@ -103,10 +108,173 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         response = await call_next(request)
         if not (request.method == "GET" and quiet_gets.match(path)):
             state["c"].audit.write("http.request", "user", None, method=request.method, path=path,
-                                   query=str(request.url.query) or None, status=response.status_code,
+                                   query=urlencode([(k, v) for k, v in request.query_params.multi_items()
+                                                    if k != "key"]) or None, status=response.status_code,
                                    ms=int((time.time() - started) * 1000), body=body,
                                    client=request.client.host if request.client else None)
         return response
+
+    # ---------------------------------------------------------------- access from other devices
+    failures: dict[str, list[float]] = {}
+
+    def _signed_in(resp: Response, token: str) -> Response:
+        resp.set_cookie(access.COOKIE, token, max_age=access.COOKIE_AGE, httponly=True, samesite="lax")
+        return resp
+
+    def _too_many(ip: str) -> bool:
+        recent = [t for t in failures.get(ip, []) if time.time() - t < 600]
+        failures[ip] = recent
+        return len(recent) >= 10
+
+    @app.middleware("http")
+    async def access_control(request: Request, call_next):
+        """This computer: always allowed. Other devices: need the passcode once (then a cookie)."""
+        if "c" not in state:
+            return await call_next(request)
+        path = request.url.path
+        ip = request.client.host if request.client else ""
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            src = request.headers.get("origin") or request.headers.get("referer")
+            if not access.same_origin(src, request.headers.get("host")):
+                state["c"].audit.write("auth.cross_site_blocked", "system", None, path=path, origin=src, client=ip)
+                return JSONResponse({"detail": "Blocked: request came from another site."}, status_code=403)
+        if access.is_local(ip) or path in ("/login", "/manifest.webmanifest"):
+            return await call_next(request)
+        token = state["token"]
+        key = request.query_params.get("key")
+        if key is not None:
+            if not _too_many(ip) and secrets.compare_digest(key, token):
+                state["c"].audit.write("auth.signed_in", "user", None, client=ip, how="link",
+                                       device=request.headers.get("user-agent", "")[:120])
+                rest = {k: v for k, v in request.query_params.items() if k != "key"}
+                return _signed_in(RedirectResponse(path + ("?" + urlencode(rest) if rest else ""), 303), token)
+            failures.setdefault(ip, []).append(time.time())
+        if secrets.compare_digest(request.cookies.get(access.COOKIE, ""), token) or \
+                secrets.compare_digest(request.headers.get("authorization", "").removeprefix("Bearer "), token):
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "Sign in first (access passcode)."}, status_code=401)
+        state["c"].audit.write("auth.sign_in_needed", "system", None, path=path, client=ip)
+        return RedirectResponse("/login?" + urlencode({"next": path}), 303)
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_form(next: str = "/"):
+        return access.login_page(next)
+
+    @app.post("/login")
+    async def login(request: Request):
+        ip = request.client.host if request.client else ""
+        form = parse_qs((await request.body()).decode("utf-8", "replace"))
+        code = (form.get("passcode") or [""])[0].strip().lower()
+        nxt = (form.get("next") or ["/"])[0]
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = "/"
+        if _too_many(ip):
+            c().audit.write("auth.locked_out", "system", None, client=ip)
+            return HTMLResponse(access.login_page(nxt, "Too many wrong tries. Wait 10 minutes."), status_code=429)
+        if secrets.compare_digest(code, state["token"].lower()):
+            c().audit.write("auth.signed_in", "user", None, client=ip, how="passcode",
+                            device=request.headers.get("user-agent", "")[:120])
+            return _signed_in(RedirectResponse(nxt, 303), state["token"])
+        failures.setdefault(ip, []).append(time.time())
+        c().audit.write("auth.wrong_passcode", "user", None, client=ip)
+        return HTMLResponse(access.login_page(nxt, "That passcode isn't right."), status_code=401)
+
+    @app.get("/logout")
+    async def logout():
+        resp = RedirectResponse("/login", 303)
+        resp.delete_cookie(access.COOKIE)
+        return resp
+
+    def _local_only(request: Request) -> None:
+        if not access.is_local(request.client.host if request.client else ""):
+            raise HTTPException(403, "Only from the computer running Conductor.")
+
+    @app.get("/api/access")
+    async def access_info(request: Request):
+        """The passcode, phone links, and a QR code - shown only on the computer itself."""
+        _local_only(request)
+        port = c().settings.port
+        host = os.environ.get("CONDUCTOR_HOST", "127.0.0.1")
+        lan = not access.is_local(host)
+        links = [f"http://{a}:{port}/?key={state['token']}" for a in access.lan_addresses()] if lan else []
+        return {"token": state["token"], "on_network": lan, "host": host, "port": port, "links": links,
+                "qr": access.qr_svg(links[0]) if links else None}
+
+    @app.post("/api/access/reset")
+    async def access_reset(request: Request):
+        _local_only(request)
+        state["token"] = access.reset_token(c().settings.data_dir)
+        c().audit.write("auth.passcode_changed", "user", None)
+        return await access_info(request)
+
+    # ---------------------------------------------------------------- audit log on the web
+    @app.get("/api/audit")
+    async def audit_entries(days: int = 1, kind: str = "", task: str = "", actor: str = "", q: str = "",
+                            limit: int = 300, before: str = ""):
+        rows = c().audit.read(days=max(1, min(days, 31)))
+        q = q.lower().strip()
+        out = []
+        for r in reversed(rows):  # newest first
+            if before and str(r.get("ts", "")) >= before:
+                continue
+            if kind and not str(r.get("kind", "")).startswith(kind):
+                continue
+            if task and not str(r.get("task", "")).startswith(task):
+                continue
+            if actor and r.get("actor") != actor:
+                continue
+            if q and q not in json.dumps(r, ensure_ascii=False).lower():
+                continue
+            out.append(r)
+            if len(out) >= max(1, min(limit, 1000)):
+                break
+        files = sorted(p.name for p in c().audit.dir.glob("audit-*.jsonl")) if c().audit.dir.exists() else []
+        return {"entries": out, "more": len(out) >= limit, "files": files, "dir": str(c().audit.dir),
+                "enabled": c().audit.enabled}
+
+    @app.get("/api/audit/file/{name}")
+    async def audit_file(name: str):
+        if not re.fullmatch(r"audit-\d{4}-\d{2}-\d{2}\.jsonl", name) or not (c().audit.dir / name).is_file():
+            raise HTTPException(404)
+        return FileResponse(c().audit.dir / name, media_type="application/x-ndjson", filename=name)
+
+    # ---------------------------------------------------------------- self-update
+    @app.get("/api/update")
+    async def update_status(fetch: bool = True):
+        st = await asyncio.to_thread(updater.status, fetch)
+        st["running_tasks"] = len(c()._running)
+        return st
+
+    @app.post("/api/update")
+    async def update_now(request: Request):
+        body = json.loads(await request.body() or b"{}")
+        running = len(c()._running)
+        if running and not body.get("force"):
+            raise HTTPException(409, f"{running} task(s) are running; updating will stop them.")
+        c().audit.write("system.update_started", "user", None, running_tasks=running)
+        result = await asyncio.to_thread(updater.update)
+        c().audit.write("system.update", "system", None, ok=result.get("ok"), updated=result.get("updated"),
+                        from_=result.get("from"), to=result.get("to"), error=result.get("error"))
+        if result.get("ok") and (result.get("updated") or body.get("restart")):
+            async def later():
+                await asyncio.sleep(0.8)  # let this response reach the page first
+                c().audit.write("system.restart", "system", None, reason="update")
+                try:
+                    await c().shutdown()
+                except Exception:
+                    pass
+                updater.restart()
+            asyncio.get_running_loop().create_task(later())
+            result["restarting"] = True
+        return result
+
+    @app.get("/manifest.webmanifest")
+    async def manifest():
+        return JSONResponse({"name": "Conductor", "short_name": "Conductor", "start_url": "/", "display": "standalone",
+                             "background_color": "#141412", "theme_color": "#146b6b",
+                             "icons": [{"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml"}]},
+                            media_type="application/manifest+json")
 
     @app.post("/api/audit/ui")
     async def audit_ui(request: Request):
@@ -419,7 +587,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/t/{task_id}", response_class=HTMLResponse)
     @app.get("/{page}", response_class=HTMLResponse)
     def index(task_id: str | None = None, page: str | None = None):
-        if page and page not in ("memory", "skills", "schedules", "files", "models", "safety"):
+        if page and page not in ("memory", "skills", "schedules", "files", "models", "safety", "audit"):
             raise HTTPException(404)
         return (WEB / "index.html").read_text()
 

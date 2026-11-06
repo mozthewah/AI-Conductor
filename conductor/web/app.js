@@ -65,6 +65,7 @@ async function api(path, opts = {}) {
     headers: opts.body ? { "Content-Type": "application/json" } : {},
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  if (res.status === 401) { location.href = "/login?next=" + encodeURIComponent(location.pathname); throw new Error("Sign in first"); }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).detail || msg; } catch {}
@@ -189,6 +190,7 @@ function route() {
   if (p === "/files") return showFiles();
   if (p === "/models") return showModels();
   if (p === "/safety") return showSafety();
+  if (p === "/audit") return showAudit();
   return showHome();
 }
 
@@ -1204,6 +1206,7 @@ const LEVEL_HELP = {
 
 async function showSafety() {
   const data = await api("/api/safety");
+  const phoneSlot = h("div");
   const levelPicker = (name, value, label, hint) => {
     const wrap = h("div", { class: "card", style: "margin-bottom:12px" }, h("div", { class: "title" }, icon("shield"), label),
       h("div", { class: "sev-reason", style: "margin-bottom:10px" }, hint));
@@ -1223,6 +1226,7 @@ async function showSafety() {
     h("div", { class: "grow" }, h("code", {}, r.key), h("div", { class: "meta" }, `${r.tool === "run_shell" ? "shell" : r.tool} · up to ${r.max_level} risk · added ${ago(r.created)}`)),
     h("button", { class: "icon-btn", title: "Forget", onclick: async () => { await api(`/api/safety/rules/${i}`, { method: "DELETE" }); showSafety(); } }, icon("trash")))));
   page("Safety", "Every shell command and browser action is rated by risk. Choose what runs without asking you.",
+    phoneSlot,
     levelPicker("threshold", data.threshold, "While you're around", "Actions up to this level run automatically. Riskier ones wait for your OK."),
     levelPicker("unattended", data.unattended, "Scheduled runs (nobody to ask)", "Actions above this level are declined, and the task works around them."),
     h("h2", { class: "section" }, "The levels"),
@@ -1230,6 +1234,123 @@ async function showSafety() {
       h("tr", {}, h("td", {}, h("span", { class: `sev sev-${lvl}` }, lvl)), h("td", {}, what), h("td", { style: "white-space:normal;color:var(--ink-2)" }, ex)))))),
     h("p", { class: "sev-reason" }, "Commands the rules don't recognize are rated by the router's small model, which explains its reasoning. If it can't decide, you're asked."),
     h("h2", { class: "section" }, "Always-allowed"), rules);
+  phoneAccess().then((box) => { if (box) phoneSlot.replaceWith(box); });
+}
+
+// Shown only on the computer running Conductor (the API refuses other devices).
+async function phoneAccess() {
+  let a;
+  try { a = await api("/api/access"); } catch { return null; }
+  const box = h("div");
+  const render = (a) => {
+    box.replaceChildren();
+    if (!a.on_network) {
+      box.append(h("div", { class: "card", style: "margin-bottom:16px" }, h("div", { class: "title" }, icon("globe"), "Only this computer can reach Conductor right now"),
+        h("div", { class: "sev-reason" }, "Restart it with ", h("code", {}, "conductor serve --lan"), " (or set ", h("code", {}, "CONDUCTOR_HOST=0.0.0.0"),
+          " in .env) to open it to other devices on your Wi-Fi. They'll need this passcode once: ", h("code", {}, a.token))));
+      return;
+    }
+    box.append(h("div", { class: "card phone-card", style: "margin-bottom:16px" },
+      a.qr ? h("div", { class: "qr", html: a.qr }) : null,
+      h("div", { class: "grow" },
+        h("div", { class: "title" }, icon("globe"), "Scan with your phone's camera"),
+        h("div", { class: "sev-reason" }, "It opens Conductor and signs that device in. Phones and tablets on the same Wi-Fi only. Add it to your home screen to use it like an app."),
+        ...a.links.map((l) => h("div", { class: "meta" }, h("a", { href: l, class: "mono" }, l.replace(/\?key=.*/, "")))),
+        h("div", { class: "meta" }, "Passcode: ", h("code", {}, a.token)),
+        h("button", { class: "btn", onclick: async () => {
+          if (!confirm("Make a new passcode? Every phone and tablet will have to sign in again.")) return;
+          render(await api("/api/access/reset", { method: "POST" }));
+        } }, "New passcode (sign out all devices)"))));
+  };
+  render(a);
+  return box;
+}
+
+// ------------------------------------------------------------------ audit log
+const AUDIT_GROUPS = {
+  "": "Everything", "ui.": "Clicks & views", "http.": "Requests", "task.": "Tasks & messages", "route.": "Routing",
+  "model.": "Model calls", "tool.": "Tools", "file.": "Files changed", "safety.": "Approvals", "ask.": "Questions",
+  "compose.": "Teamwork", "credits.": "Credits", "auth.": "Sign-ins", "system.": "Start/stop",
+};
+function auditLine(r) {
+  const k = r.kind || "";
+  if (k === "http.request") return `${r.method} ${r.path}${r.query ? "?" + r.query : ""} → ${r.status} (${r.ms} ms)`;
+  if (k.startsWith("ui.")) return `${r.label || ""}${r.value != null ? " → " + r.value : ""}${r.page && r.page !== r.label ? "  ·  " + r.page : ""}`;
+  if (k === "tool.result") return `${r.name} ${r.ok ? "ok" : "failed"}${r.ms != null ? ` (${r.ms} ms)` : ""}${r.ok ? "" : ": " + (r.preview || "")}`;
+  if (k === "model.call") return `${shortModel(r.model)} · ${r.tokens_in ?? "?"} in / ${r.tokens_out ?? "?"} out · ${fmtCost(r.cost_usd)} · ${r.ms} ms`;
+  if (k === "route.decided") return `${r.name || shortModel(r.model)} (${r.skill || r.category || ""}${r.difficulty ? ", " + r.difficulty : ""})`;
+  if (k === "route.model_changed") return `${r.from_name || shortModel(r.from)} → ${r.name || shortModel(r.to)}: ${r.reason || ""}`;
+  if (k.startsWith("auth.")) return `${r.client || ""}${r.how ? " via " + r.how : ""}${r.device ? " · " + r.device : ""}${r.path ? " · " + r.path : ""}`;
+  return r.summary || r.text || r.label || r.reason || r.question || r.title || r.path || r.error || r.answer || "";
+}
+async function showAudit() {
+  const list = h("div", { class: "audit-list" });
+  const q = h("input", { placeholder: "Search the log…", type: "search" });
+  const group = h("select", { title: "Show" }, Object.entries(AUDIT_GROUPS).map(([v, l]) => h("option", { value: v }, l)));
+  const days = h("select", { title: "Range" }, [["1", "Today"], ["3", "3 days"], ["7", "7 days"], ["31", "30 days"]].map(([v, l]) => h("option", { value: v }, l)));
+  const live = h("input", { type: "checkbox", checked: true, title: "Live" });
+  const more = h("button", { class: "btn", hidden: true }, "Older entries");
+  let shown = [];
+  const raw = h("textarea", { class: "audit-raw", readonly: true, hidden: true, spellcheck: "false" });
+  const rawText = () => shown.map((r) => JSON.stringify(r)).join("\n");
+  const copyBtn = h("button", { class: "btn", title: "Copy the entries shown, one JSON object per line" }, "Copy");
+  copyBtn.onclick = async () => {
+    const ok = await copyText(rawText());
+    copyBtn.textContent = ok ? `Copied ${shown.length}` : "Couldn't copy - use Raw";
+    setTimeout(() => { copyBtn.textContent = "Copy"; }, 2000);
+  };
+  const rawBtn = h("button", { class: "btn", title: "Show the entries as raw JSON lines" }, "Raw");
+  rawBtn.onclick = () => {
+    raw.hidden = !raw.hidden; list.hidden = !raw.hidden;
+    rawBtn.textContent = raw.hidden ? "Raw" : "List";
+    raw.value = rawText();
+  };
+  const files = h("div", { class: "meta" });
+  let taskFilter = "";
+  const taskChip = h("button", { class: "btn", hidden: true, onclick: () => { taskFilter = ""; load(); } });
+  let lastTs = "";
+  const row = (r) => {
+    const t = new Date(r.ts);
+    const details = h("pre", { class: "audit-json", hidden: true }, JSON.stringify(r, null, 2));
+    return h("div", { class: `audit-row actor-${r.actor}`, onclick: (e) => { if (e.target.closest("a, .audit-task")) return; details.hidden = !details.hidden; } },
+      h("span", { class: "audit-time", title: r.ts }, t.toLocaleDateString() === new Date().toLocaleDateString()
+        ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        : t.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })),
+      h("span", { class: "audit-actor" }, r.actor),
+      h("span", { class: "audit-kind" + (r.ok === false || /error|denied|blocked|wrong|locked/.test(r.kind) ? " bad" : "") }, r.kind),
+      h("span", { class: "audit-text" }, auditLine(r)),
+      r.task ? h("span", { class: "audit-task", title: "Only this task", onclick: () => { taskFilter = r.task; load(); } }, r.task) : null,
+      details);
+  };
+  const params = (before) => new URLSearchParams({ days: days.value, kind: group.value, task: taskFilter, q: q.value, limit: "200", ...(before ? { before } : {}) });
+  const load = async () => {
+    const d = await api(`/api/audit?${params()}`);
+    taskChip.hidden = !taskFilter; taskChip.textContent = `Task ${taskFilter} ✕`;
+    shown = d.entries;
+    raw.value = rawText();
+    list.replaceChildren(...(d.entries.length ? d.entries.map(row) : [h("div", { class: "empty" }, d.enabled ? "Nothing matches." : "The audit log is off (CONDUCTOR_AUDIT=off).")]));
+    lastTs = d.entries.length ? d.entries[d.entries.length - 1].ts : "";
+    more.hidden = !d.more;
+    files.replaceChildren("Full daily files: ", ...d.files.slice(-10).reverse().flatMap((f, i) => [i ? " · " : "", h("a", { href: `/api/audit/file/${f}`, download: f }, f.replace(/audit-|\.jsonl/g, ""))]));
+  };
+  more.onclick = async () => {
+    const d = await api(`/api/audit?${params(lastTs)}`);
+    list.append(...d.entries.map(row));
+    shown = shown.concat(d.entries);
+    raw.value = rawText();
+    lastTs = d.entries.length ? d.entries[d.entries.length - 1].ts : lastTs;
+    more.hidden = !d.more;
+  };
+  q.addEventListener("input", () => { clearTimeout(q.t); q.t = setTimeout(load, 250); });
+  group.addEventListener("change", load); days.addEventListener("change", load);
+  page("Audit log", "Everything Conductor did, and everything you did in it, newest first. Tap an entry for its details.",
+    h("div", { class: "toolbar audit-tools" }, q, group, days, h("label", { class: "live" }, live, "Live"), copyBtn, rawBtn, taskChip),
+    list, raw, more, files);
+  await load();
+  const timer = setInterval(() => {
+    if (!document.body.contains(list)) return clearInterval(timer);
+    if (live.checked && raw.hidden && !document.hidden && !q.value && window.scrollY < 200) load();
+  }, 5000);
 }
 
 // ------------------------------------------------------------------ credits
@@ -1278,4 +1399,66 @@ applyTheme();
   refreshTasks();
   refreshCredits();
   route();
+})();
+
+
+// ------------------------------------------------------------------ copying (works over plain-HTTP Wi-Fi too)
+async function copyText(text) {
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch {}
+  const ta = h("textarea", { readonly: true, style: "position:fixed;top:0;left:0;opacity:0;" });
+  ta.value = text;
+  document.body.append(ta);
+  ta.select(); ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch {}
+  ta.remove();
+  return ok;
+}
+
+// ------------------------------------------------------------------ update Conductor (git pull + restart)
+(function updater() {
+  const btn = $("#updateBtn");
+  if (!btn) return;
+  const label = (t) => { btn.replaceChildren(icon("arrowDown"), t); };
+  label("Check for updates");
+  let st = null;
+  const waitForRestart = async () => {
+    label("Restarting…");
+    for (let i = 0; i < 90; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { const r = await fetch("/api/config", { cache: "no-store" }); if (r.ok) { location.reload(); return; } } catch {}
+    }
+    label("Didn't come back - check the computer");
+  };
+  btn.addEventListener("click", async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      if (!st || !st.behind) {
+        label("Checking…");
+        st = await api("/api/update");
+        if (!st.can_update) { alert(st.error); label("Check for updates"); return; }
+        if (!st.behind) {
+          label(`Up to date · ${st.commit}`);
+          if (st.error) alert(st.error);
+          st = null;
+          return;
+        }
+        label(`Update: ${st.behind} new · tap to install`);
+        return;
+      }
+      const changes = st.changes.slice(0, 8).map((c) => "• " + c.replace(/^\S+ /, "")).join("\n");
+      const running = st.running_tasks ? `\n\n${st.running_tasks} running task(s) will stop. Send them a message afterwards to continue.` : "";
+      if (!confirm(`Update Conductor (${st.behind} new change${st.behind > 1 ? "s" : ""}) and restart?\n\n${changes}${running}`)) return;
+      label("Updating…");
+      const r = await api("/api/update", { method: "POST", body: { force: true } });
+      if (!r.ok) { alert(`${r.error}\n\n${r.log}`); label("Update failed - tap to retry"); st = null; return; }
+      if (r.restarting) return await waitForRestart();
+      label("Up to date"); st = null;
+    } catch (e) {
+      alert(`Update failed: ${e.message}`); label("Check for updates"); st = null;
+    } finally {
+      btn.disabled = false;
+    }
+  });
 })();

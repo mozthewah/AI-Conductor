@@ -50,6 +50,7 @@ class Settings:
     anthropic_key: bool = False
     openrouter_key: str = ""
     openrouter_management_key: str = ""  # optional: lets Conductor see the account balance
+    key_name: str = ""                    # name of OPENROUTER_API_KEY on openrouter.ai, if auto-matching fails
     credit_low: float = 2.0               # USD; below this, warn and lean on cheaper models
     byok: str = "auto"                    # auto: lean on your own provider keys when credits run low/out;
                                           # prefer: also favour them while credits are fine; off: ignore
@@ -115,6 +116,7 @@ class Settings:
             anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
             openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),
             openrouter_management_key=os.environ.get("OPENROUTER_MANAGEMENT_KEY", ""),
+            key_name=os.environ.get("CONDUCTOR_KEY_NAME", ""),
             credit_low=float(os.environ.get("CONDUCTOR_CREDIT_LOW", cls.credit_low)),
             byok=os.environ.get("CONDUCTOR_BYOK", cls.byok).lower(),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),

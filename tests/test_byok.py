@@ -196,3 +196,41 @@ def test_account_and_models_endpoints(tmp_path):
     assert [x["model"] for x in a["byok_suggestions"]] == ["openai/gpt-new"]
     assert roster[GPT.id]["byok"] == ["openai"] and roster[FAST.id]["blocked"]
     assert credits["byok"] == ["openai"]
+
+
+class BedrockSaysNo(FakeLLM):
+    """The first BYOK model isn't enabled on the provider account; the next one works."""
+
+    async def turn(self, **kw):
+        if kw.get("providers") and kw["model"].id == GPT.id:
+            self.calls.append({"model": kw["model"].id, "providers": kw["providers"], "failed": True})
+            raise RuntimeError("AccessDeniedException: model not enabled for this account")
+        return await super().turn(**kw)
+
+
+async def test_byok_model_that_fails_is_skipped_for_another(tmp_path):
+    c = conductor(tmp_path)
+    second = ModelInfo("openai/gpt-mini", "openrouter", "GPT Mini", 0.5, 2, tier="strong")
+    c.catalog.models[second.id] = second
+    c.catalog.set_roster([FRONTIER.id, GPT.id, FAST.id, second.id])
+    c.account.data["endpoints"][second.id] = ["openai"]
+    c.credits.state["out"] = True
+    c.llm = BedrockSaysNo([[text("done")]], label=L("coding", "hard"))
+    tid = c.start_task("refactor")
+    await asyncio.wait_for(c.wait(tid), 5)
+    t = c.store.get_task(tid)
+    assert t["status"] == "done" and t["model"] == second.id
+    assert GPT.id in c.account.failed and c.account.byok_for(GPT.id) == []
+
+
+def test_key_matched_by_masked_label_or_name(tmp_path):
+    a = Account(tmp_path, key="sk-or-v1-d28abcdef0123456789f64", management_key="m")
+    keys = [{"hash": "x", "name": "Laptop", "label": "sk-or-v1-111...222"},
+            {"hash": "y", "name": "Conductor", "label": "sk-or-v1-d28...f64"}]
+    assert a._own_key(keys)["name"] == "Conductor"
+    b = Account(tmp_path, key="sk-or-v1-zzz", management_key="m", key_name="Laptop")
+    assert b._own_key(keys)["name"] == "Laptop"
+    c = Account(tmp_path, key="sk-or-v1-qqq999", management_key="m")
+    c._get = lambda path, key, **p: {"data": {"label": "nope", "usage": 1.0, "limit": 5, "usage_daily": 0.5}}
+    keys2 = [{"name": "A", "usage": 3.0, "limit": 5}, {"name": "B", "usage": 1.01, "limit": 5, "usage_daily": 0.5}]
+    assert c._own_key(keys2)["name"] == "B"

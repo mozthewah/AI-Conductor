@@ -15,15 +15,65 @@ DIM, BOLD, CYAN, YELLOW, RED, GREEN, RESET = (
     if sys.stdout.isatty() else ("",) * 7)
 
 
+def _stay_awake():
+    """Hold off sleep/suspend while serving (systemd-inhibit). Returns the holder process, or None."""
+    import shutil
+    import subprocess
+    exe = shutil.which("systemd-inhibit")
+    if not exe:
+        print(f"{YELLOW}  Can't keep the computer awake: systemd-inhibit isn't available.{RESET}")
+        return None
+    try:
+        proc = subprocess.Popen([exe, "--what=sleep:idle", "--who=Conductor", "--mode=block",
+                                 "--why=Serving Conductor to your other devices", "sleep", "infinity"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            proc.wait(timeout=0.5)  # still running = the inhibitor took hold
+            err = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+            print(f"{YELLOW}  Couldn't keep the computer awake: {err or 'systemd-inhibit exited'}{RESET}")
+            return None
+        except subprocess.TimeoutExpired:
+            return proc
+    except OSError as e:
+        print(f"{YELLOW}  Couldn't keep the computer awake: {e}{RESET}")
+        return None
+
+
 def serve(args) -> None:
     import uvicorn
 
+    from . import access
     from .server import create_app
 
+    host = "0.0.0.0" if getattr(args, "lan", False) else args.host
     os.environ["CONDUCTOR_PORT"] = str(args.port)  # so tools know not to take this port
-    print(f"{BOLD}AI Conductor{RESET} -> http://{args.host}:{args.port}")
+    os.environ["CONDUCTOR_HOST"] = host
+    print(f"{BOLD}AI Conductor{RESET} -> http://127.0.0.1:{args.port}")
+    if not access.is_local(host):
+        s = Settings.from_env()
+        s.ensure_dirs()
+        token = access.load_token(s.data_dir)
+        addrs = access.lan_addresses()
+        print(f"  On your other devices (same Wi-Fi): " + ", ".join(f"http://{a}:{args.port}" for a in addrs))
+        print(f"  Passcode for them: {BOLD}{token}{RESET}  (also on the Safety page; this computer never needs it)")
+        link = access.device_link(token, args.port)
+        art = access.qr_terminal(link) if link else None
+        if art:
+            print("  Or scan this with your phone's camera to open it already signed in:\n" + art)
+        print(f"{DIM}  If your phone can't connect, the firewall may be blocking port {args.port} "
+              f"(e.g. `sudo ufw allow {args.port}/tcp`).{RESET}")
+    awake = _stay_awake() if (getattr(args, "stay_awake", False) or os.environ.get("CONDUCTOR_STAY_AWAKE", "").lower()
+                              in ("1", "on", "true", "yes")) else None
+    if awake:
+        from . import updater
+        updater.on_restart(awake.terminate)  # the update button restarts the process; don't leave it behind
+        print(f"{DIM}  Keeping this computer awake while Conductor runs (closing a laptop lid may still sleep it).{RESET}")
     # A short graceful window closes open live-update streams instead of dumping tracebacks on Ctrl+C.
-    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning", timeout_graceful_shutdown=2)
+    try:
+        uvicorn.run(create_app(), host=host, port=args.port, log_level="warning", timeout_graceful_shutdown=2)
+    finally:
+        if awake:
+            awake.terminate()
 
 
 async def _ainput(prompt: str) -> str:
@@ -178,7 +228,8 @@ def doctor(args) -> None:
         bad(f"Benchmarks unavailable: {st['error']}")
     if s.openrouter_management_key:
         from .account import Account
-        acct = Account(s.data_dir, key=s.openrouter_key, management_key=s.openrouter_management_key, mode=s.byok)
+        acct = Account(s.data_dir, key=s.openrouter_key, management_key=s.openrouter_management_key, mode=s.byok,
+                       key_name=s.key_name)
         acct.note_catalog(cat)
         acct.refresh_sync([m.id for m in roster if m.provider == "openrouter"], force=True)
         summ = acct.summary(cat)
@@ -188,6 +239,10 @@ def doctor(args) -> None:
         (ok if k else bad)(f"Management key sees {summ.get('key_count') or 0} API key(s)"
                            + (f"; Conductor runs on '{k.get('name') or k.get('label')}'" if k else
                               "; couldn't match OPENROUTER_API_KEY to one of them"))
+        if not k:
+            names = ", ".join(repr(n) for n in acct.data.get("key_names") or [] if n)
+            print(f"      Set CONDUCTOR_KEY_NAME in .env to its name on openrouter.ai/settings/keys"
+                  f"{' (one of: ' + names + ')' if names else ''}. Only needed for per-key spend and BYOK key filters.")
         if summ["byok"]:
             ok(f"BYOK keys: {', '.join(b['provider'] for b in summ['byok'])}"
                + (f" (mode {s.byok})" if s.byok != "auto" else ""))
@@ -254,11 +309,17 @@ def audit(args) -> None:
 
 
 def main() -> None:
+    from pathlib import Path
+
+    from .config import _load_dotenv
+    _load_dotenv(Path(".env"))  # so CONDUCTOR_HOST / CONDUCTOR_PORT in .env apply to the defaults below
     p = argparse.ArgumentParser(prog="conductor", description="Your self-hosted AI conductor.")
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("serve", help="run the web app")
     s.add_argument("--host", default=os.environ.get("CONDUCTOR_HOST", "127.0.0.1"))
     s.add_argument("--port", type=int, default=int(os.environ.get("CONDUCTOR_PORT", "8765")))
+    s.add_argument("--lan", action="store_true", help="reachable from other devices on your network (passcode-protected)")
+    s.add_argument("--stay-awake", action="store_true", help="keep the computer from sleeping while serving")
     sub.add_parser("doctor", help="check keys, models, benchmarks, and the browser")
     au = sub.add_parser("audit", help="show the local audit log")
     au.add_argument("-n", "--lines", type=int, default=50, help="how many entries (default 50)")
@@ -278,7 +339,8 @@ def main() -> None:
         doctor(args)
     else:
         if args.cmd is None:
-            args.host, args.port = os.environ.get("CONDUCTOR_HOST", "127.0.0.1"), 8765
+            args.host, args.port = os.environ.get("CONDUCTOR_HOST", "127.0.0.1"), int(os.environ.get("CONDUCTOR_PORT", "8765"))
+            args.lan = args.stay_awake = False
         serve(args)
 
 

@@ -146,6 +146,11 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_BROWSER` | `on` | Local Chromium browser tool |
 | `OPENROUTER_MANAGEMENT_KEY` | – | Optional, read-only use: balance, BYOK keys, guardrails, 30-day spend (see [The management key](#the-management-key-byok-guardrails-spend)) |
 | `CONDUCTOR_BYOK` | `auto` | `auto`: lean on your own provider keys when credits run low or out; `prefer`: always; `off` |
+| `CONDUCTOR_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from other devices (same as `serve --lan`) |
+| `CONDUCTOR_PORT` | `8765` | Web server port |
+| `CONDUCTOR_ACCESS_TOKEN` | auto | Passcode for other devices (default: generated into `data/access_token`) |
+| `CONDUCTOR_STAY_AWAKE` | `off` | Keep the computer from sleeping while serving (same as `serve --stay-awake`) |
+| `CONDUCTOR_KEY_NAME` | – | Name of your OpenRouter API key, if `doctor` can't match it automatically |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -322,6 +327,56 @@ All of this shows on the Models page under **Your OpenRouter account** (with a R
 refreshed every 30 minutes. Which providers serve each model is read with your normal key, and
 re-checked every 6 hours.
 
+## Use it from your phone (or any device on your Wi-Fi)
+
+```bash
+conductor serve --lan --stay-awake
+```
+
+- `--lan` opens it to other devices on your network (same as `CONDUCTOR_HOST=0.0.0.0` in `.env`). The
+  terminal prints the address, a passcode, and a **QR code**: scan it with your phone's camera and
+  it opens Conductor already signed in. The same QR code and passcode are at the top of the
+  **Safety** page on the computer.
+- **Passcode:** other devices enter it once, then stay signed in for a year. The computer
+  itself never needs it. It's kept in `data/access_token` (or set `CONDUCTOR_ACCESS_TOKEN`).
+  **New passcode** on the Safety page signs every device out. Ten wrong tries lock that device out
+  for 10 minutes, and requests sent from other websites are refused.
+- **Add to home screen** in your phone's browser to open it like an app.
+- `--stay-awake` (or `CONDUCTOR_STAY_AWAKE=on`) stops the computer from sleeping while Conductor runs
+  (via `systemd-inhibit`). Closing a laptop lid can still suspend it, depending on your settings.
+- If your phone can't connect, your firewall is probably blocking the port:
+  `sudo ufw allow 8765/tcp` (or your distro's equivalent).
+- It's plain HTTP, meant for your home network only. Don't forward the port to the internet.
+  For access away from home, use a VPN such as Tailscale or WireGuard.
+- Sign-ins, wrong passcodes, and blocked requests all show in the audit log, with the device's
+  address.
+
+To have it start on its own at login, a systemd user service works:
+
+```ini
+# ~/.config/systemd/user/conductor.service
+[Unit]
+Description=AI Conductor
+[Service]
+WorkingDirectory=%h/Documents/AI-Conductor
+ExecStart=%h/Documents/AI-Conductor/.venv/bin/conductor serve --lan --stay-awake
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
+Then run `systemctl --user enable --now conductor`. Use `journalctl --user -u conductor` to see its
+output, including the passcode.
+
+## Updating
+
+The sidebar has an **update** button (on your phone too). The first tap checks git for new commits on the
+branch you're on. The second tap runs `git pull --ff-only`, reinstalls if `pyproject.toml` changed, and
+restarts Conductor with the same command line. The page reloads when it's back. If tasks are running, it
+warns you first; they stop, and you can send them a message afterwards to continue. If you've edited
+files locally in a way that conflicts, the pull stops and nothing changes. Updates show in the audit log.
+From the terminal it's just `git pull` (plus `pip install -e .` if dependencies changed), then restart.
+
 ## Audit log
 
 Everything Conductor does is written locally, one JSON object per line, to
@@ -339,6 +394,12 @@ Each entry has a millisecond timestamp, who did it (`user` / `model` / `system`)
 is kept to a short preview: what you typed into a prompt is logged as its length (`"<412 chars>"`), long
 text is trimmed to 300 characters, and anything that looks like an API key or token is redacted. The
 page's routine background polling isn't logged, so the file stays readable.
+
+It's also on the web, under **Audit log** in the sidebar (works on your phone too). You can search,
+filter by kind (clicks, requests, model calls, tools, approvals, sign-ins...) and time range, and tap a
+task id to see just that task. Tap an entry to see all its fields, and download each day's full file.
+It updates live. **Copy** copies the entries shown as raw JSON lines, and **Raw** shows them as text you
+can select. Both work from a phone over plain HTTP.
 
 ```bash
 conductor audit                  # last 50 entries

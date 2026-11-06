@@ -64,7 +64,7 @@ class Conductor:
                                      low=settings.credit_low, fetch=settings.fetch_catalog)
         self.account = Account(settings.data_dir, key=settings.openrouter_key,
                                management_key=settings.openrouter_management_key, fetch=settings.fetch_catalog,
-                               mode=settings.byok)
+                               mode=settings.byok, key_name=settings.key_name)
         self.account.note_catalog(self.catalog)
         self._account_refresh: asyncio.Task | None = None
         self._byok_note_pending: set[str] = set()
@@ -361,7 +361,16 @@ class Conductor:
                 except Exception as call_err:
                     self.audit.write("model.error", "system", task_id, model=model.id,
                                      error=f"{type(call_err).__name__}: {call_err}",
-                                     ms=int((time.time() - started_call) * 1000))
+                                     ms=int((time.time() - started_call) * 1000), byok_only=byok_only or None)
+                    if byok_only:  # e.g. the model isn't enabled on your provider account: try another, or pause
+                        self.account.failed[model.id] = str(call_err)[:200]
+                        await self.emit(self._root(task_id)["id"], "status", {
+                            "text": f"{model.name or model.id} didn't work on your own {', '.join(byok_only)} key "
+                                    f"({str(call_err)[:120]}); trying another."})
+                        if not await self._switch_to_byok(task_id, "Credits are used up."):
+                            await self._pause_for_credits(task_id, CreditError("out", "Credits are used up, and "
+                                                                               "none of your own provider keys worked for this."))
+                        continue
                     raise
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks, model=model.id)

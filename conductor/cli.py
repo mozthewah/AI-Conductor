@@ -262,6 +262,22 @@ def doctor(args) -> None:
                     bad(f"Roster model {b['model']} is blocked by it ({b['why']}); the router will skip it")
     else:
         print("  OPENROUTER_MANAGEMENT_KEY not set (optional: balance, BYOK, guardrails, 30-day spend)")
+    import shutil
+    from .compression import Compressor, proxy_url
+    hr = Compressor(s.headroom, s.workspace)
+    hr_cli = shutil.which("headroom")
+    if s.headroom == "off":
+        print("  Headroom compression is off (CONDUCTOR_HEADROOM=off)")
+    elif hr.available:
+        ok(f"Headroom {hr.version or ''} is active: bulky tool output is compressed before models see it".replace("  ", " "))
+    elif hr_cli:
+        bad(f"The `headroom` command is installed ({hr_cli}) but Conductor's Python can't use it. "
+            f"Run: {sys.executable} -m pip install headroom-ai")
+    else:
+        print("  Headroom not installed (optional, saves tokens): pip install -e \".[headroom]\"")
+    if s.headroom_proxy != "off":
+        hp = proxy_url(s.headroom_proxy)
+        print(f"  Headroom proxy: {'running at ' + hp + ' (the Claude Code fallback goes through it)' if hp else 'not running (optional)'}")
     from .claude_cli import find as find_claude
     if s.claude_cli == "off":
         print("  Claude Code fallback is off (CONDUCTOR_CLAUDE_CLI=off)")

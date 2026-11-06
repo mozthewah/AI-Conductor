@@ -14,3 +14,9 @@ def _no_retry_waits(monkeypatch):
 def _no_real_claude_cli(monkeypatch):
     """Never launch the real `claude` CLI from tests (it may be installed on the machine)."""
     monkeypatch.setattr("conductor.claude_cli.find", lambda path="": None)
+
+
+@pytest.fixture(autouse=True)
+def _no_headroom_proxy_probe(monkeypatch):
+    """Don't look for a real Headroom proxy on this machine during tests."""
+    monkeypatch.setattr("conductor.agent.proxy_url", lambda *a, **k: None)

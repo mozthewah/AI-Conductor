@@ -107,8 +107,11 @@ class ClaudeCLI:
         return cmd
 
     async def run(self, key: str, *, prompt: str, model: str, system: str, cwd: str, on_event: OnEvent,
-                  hook_url: str | None = None, resume: str | None = None, max_turns: int = 60) -> CLIResult:
+                  hook_url: str | None = None, resume: str | None = None, max_turns: int = 60,
+                  base_url: str | None = None) -> CLIResult:
         env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
+        if base_url:  # e.g. Headroom's local proxy, which compresses what Claude Code sends
+            env["ANTHROPIC_BASE_URL"] = base_url
         started = time.time()
         out = CLIResult(model=model)
         proc = await asyncio.create_subprocess_exec(

@@ -26,9 +26,13 @@ args = sys.argv[1:]
 prompt = sys.stdin.read()
 log = os.environ["FAKE_CLAUDE_LOG"]
 with open(log, "a") as f:
-    f.write(json.dumps({"args": args, "prompt": prompt, "has_api_key": "ANTHROPIC_API_KEY" in os.environ}) + "\n")
+    f.write(json.dumps({"args": args, "prompt": prompt, "has_api_key": "ANTHROPIC_API_KEY" in os.environ,
+                        "base_url": os.environ.get("ANTHROPIC_BASE_URL")}) + "\n")
 say = lambda o: print(json.dumps(o), flush=True)
 say({"type": "system", "subtype": "init", "session_id": "sess-1", "model": "claude-opus-5-5"})
+if os.environ.get("FAKE_CLAUDE_MODE") == "proxyfail" and os.environ.get("ANTHROPIC_BASE_URL"):
+    say({"type": "result", "subtype": "success", "is_error": True, "result": "API Error: Connection refused", "session_id": "sess-1"})
+    sys.exit(1)
 if os.environ.get("FAKE_CLAUDE_MODE") == "limit":
     say({"type": "result", "subtype": "success", "is_error": True, "result": "Claude AI usage limit reached|1900000000", "session_id": "sess-1"})
     sys.exit(1)
@@ -174,3 +178,24 @@ async def test_composer_out_of_credits_hands_the_rest_to_claude_code(tmp_path, m
     esc = [e["data"] for e in c.store.load_events(tid) if e["type"] == "escalated"][-1]
     assert esc["direction"] == "cli" and "finish the rest" in esc["reason"]
     assert len(calls(log)) == 1
+
+
+async def test_headroom_proxy_is_used_and_dropped_if_it_breaks(tmp_path, monkeypatch):
+    log = install_fake(tmp_path, monkeypatch, mode="proxyfail")
+    monkeypatch.setattr("conductor.agent.proxy_url", lambda *a, **k: "http://127.0.0.1:8787")
+    c = make(tmp_path, OutOfCredits([], label=L()))
+    tid = c.start_task("build the thing")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert c.store.get_task(tid)["answer"] == "Done via Claude Code."
+    first, second = calls(log)[:2]
+    assert first["base_url"] == "http://127.0.0.1:8787" and second["base_url"] is None
+    assert c._hr_proxy_failed
+
+
+async def test_headroom_proxy_used_when_it_works(tmp_path, monkeypatch):
+    log = install_fake(tmp_path, monkeypatch)
+    monkeypatch.setattr("conductor.agent.proxy_url", lambda *a, **k: "http://127.0.0.1:8787")
+    c = make(tmp_path, OutOfCredits([], label=L()))
+    tid = c.start_task("build the thing")
+    await asyncio.wait_for(c.wait(tid), 10)
+    assert [x["base_url"] for x in calls(log)] == ["http://127.0.0.1:8787"]

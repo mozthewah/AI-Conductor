@@ -25,6 +25,7 @@ from .audit import EVENT_KINDS, AuditLog
 from .benchmarks import Benchmarks
 from .account import Account
 from .claude_cli import ClaudeCLI, model_alias
+from .compression import Compressor, proxy_url
 from .credits import CreditError, CreditMonitor
 from .models import Catalog
 from .router import SKILLS, Router
@@ -80,6 +81,8 @@ class Conductor:
         self.cli_runs: dict[str, str] = {}   # hook token -> task id, while Claude Code runs a task
         self._cli_limited_until = 0.0         # subscription usage limit reached: don't retry until then
         self.server_url: str | None = None    # set by the web server; Claude Code's safety hook calls it
+        self.compressor = Compressor(settings.headroom, settings.workspace)
+        self._hr_proxy_failed = False         # Claude Code through Headroom's proxy didn't work: go direct
         self._warned_low: set[str] = set()
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
@@ -463,6 +466,13 @@ class Conductor:
 
                 truncated = stop == "max_tokens"
                 results = list(await asyncio.gather(*[self._run_tool(ctx, b, truncated) for b in tool_uses]))
+                if self.compressor.available:  # shrink bulky output once, before it joins the transcript
+                    first = messages[0]["content"] if messages else ""
+                    results, shrunk = await asyncio.to_thread(
+                        self.compressor.compress_results, task_id,
+                        first if isinstance(first, str) else text_of(first), blocks, results, model.id)
+                    for st in shrunk:
+                        self.audit.write("tool.compressed", "system", task_id, **st)
 
                 # Signs the model is struggling: the same call over and over, or turn after turn of errors.
                 stuck = None
@@ -928,16 +938,27 @@ class Conductor:
                   "runs there), and stop any background servers you start once you're done. Some actions may "
                   "be declined by the user's safety settings; if so, find another way or say what you need.")
         started = time.time()
+        base = None if self._hr_proxy_failed else await asyncio.to_thread(proxy_url, self.settings.headroom_proxy)
+        prompt = self._cli_prompt(task, messages, bool(resume))
+        hook = f"{self.server_url}/api/cli/hook/{token}" if self.server_url else None
         try:
-            res = await self.cli.run(task_id, prompt=self._cli_prompt(task, messages, bool(resume)), model=alias,
-                                     system=system, cwd=str(self.settings.workspace), on_event=on_event,
-                                     hook_url=f"{self.server_url}/api/cli/hook/{token}" if self.server_url else None,
-                                     resume=resume, max_turns=self.settings.max_steps)
+            res = await self.cli.run(task_id, prompt=prompt, model=alias, system=system,
+                                     cwd=str(self.settings.workspace), on_event=on_event, hook_url=hook,
+                                     resume=resume, max_turns=self.settings.max_steps, base_url=base)
+            if base and res.is_error and not res.limited and not res.turns:
+                # Through Headroom's proxy it failed before doing anything: go direct from now on.
+                self._hr_proxy_failed = True
+                await self.emit(task_id, "status", {"text": "Claude Code didn't work through Headroom's proxy; "
+                                                           "running it directly instead."})
+                res = await self.cli.run(task_id, prompt=prompt, model=alias, system=system,
+                                         cwd=str(self.settings.workspace), on_event=on_event, hook_url=hook,
+                                         resume=resume, max_turns=self.settings.max_steps)
         except FileNotFoundError:
             return None
         finally:
             self.cli_runs.pop(token, None)
         self.audit.write("model.call", "system", task_id, model=f"claude-code/{res.model or alias}", via="claude_cli",
+                         headroom_proxy=bool(base and not self._hr_proxy_failed),
                          ok=not res.is_error, turns=res.turns, ms=int((time.time() - started) * 1000),
                          error=res.error or None, cost_usd=0.0)
         if res.limited:

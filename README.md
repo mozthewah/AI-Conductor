@@ -153,6 +153,8 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_KEY_NAME` | – | Name of your OpenRouter API key, if `doctor` can't match it automatically |
 | `CONDUCTOR_CLAUDE_CLI` | `fallback` | Hand work to Claude Code on your subscription: `fallback`, `prefer`, `off` |
 | `CONDUCTOR_CLAUDE_PATH` | – | Path to the `claude` CLI if it isn't on PATH |
+| `CONDUCTOR_HEADROOM` | `auto` | Compress bulky tool output with Headroom when it's installed (`auto`, `on`, `off`) |
+| `CONDUCTOR_HEADROOM_PROXY` | `auto` | Send the Claude Code fallback through Headroom's proxy if it's running (`auto`, `off`, or a URL) |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -354,6 +356,26 @@ Conductor can hand work to it, and that runs on your subscription instead of Ope
   if you hit one, Conductor stops using Claude Code for 30 minutes and falls back to pausing.
 - `conductor doctor` shows whether it found the CLI. It's the CLI's documented headless mode
   (`claude -p`) running on your own machine for your own work.
+
+## Saving tokens with Headroom
+
+If [Headroom](https://docs.headroomlabs.ai) (`headroom-ai`) is installed in Conductor's environment
+(`pip install -e ".[headroom]"`), Conductor uses it to shrink bulky tool output before any model sees it:
+
+- **What:** shell output, process logs, page text from the browser, and file listings over about 2,000
+  characters. Logs keep their errors and stack traces; JSON keeps its structure. In testing, an 800-line
+  log went from ~14k tokens to under 100 with the error line intact.
+- **Not:** file contents read for editing (the model needs those exact), errors, or small outputs.
+- **Nothing is lost:** the full original is saved under `.conductor/full/` in the workspace, and the
+  model is told where, so it can read it if it needs everything.
+- **Cache-safe:** each result is compressed once, when it arrives, and the compressed version is what's
+  stored and re-sent. Earlier turns never change, so the provider's prompt cache keeps hitting.
+  (Re-compressing history on every call is what breaks caches; Conductor never does that.)
+- **Claude Code fallback:** if Headroom's proxy is running (`headroom proxy`, port 8787), Claude Code is
+  pointed at it. If a run fails through the proxy before doing anything, Conductor goes direct instead.
+- **Privacy:** Headroom's anonymous usage beacon is switched off unless you set `HEADROOM_BEACON`.
+- Each compression shows in the audit log as `tool.compressed` with the tokens saved.
+  `CONDUCTOR_HEADROOM=off` turns it off; `conductor doctor` shows whether it's active.
 
 ## Use it from your phone (or any device on your Wi-Fi)
 

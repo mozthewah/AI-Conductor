@@ -207,9 +207,30 @@ def doctor(args) -> None:
         except Exception as e:
             bad(f"OpenRouter rejected or couldn't check the key: {e}")
     s.ensure_dirs()
-    cat = Catalog(s.data_dir, has_openrouter=bool(s.openrouter_key), has_anthropic=s.anthropic_key).load()
+    cat = Catalog(s.data_dir, has_openrouter=bool(s.openrouter_key), has_anthropic=s.anthropic_key,
+                  **s.catalog_kwargs()).load()
     roster = cat.roster()
     (ok if roster else bad)(f"Model catalog: {len(cat.models)} models, {len(roster)} in your roster")
+    if s.local_url:
+        for st in cat.local_status:
+            if st["models"]:
+                names = ", ".join(st["models"][:8]) + (f" (+{len(st['models']) - 8} more)" if len(st["models"]) > 8 else "")
+                ok(f"Model server {st['url']} ({st['api']}): {names}")
+                no_tools = [m.id for m in cat.models.values() if m.provider == "local" and m.base_url == st["url"]
+                            and not m.tools]
+                if no_tools:
+                    print(f"    can't call tools (left out of the roster): {', '.join(no_tools)}")
+            else:
+                bad(f"Model server {st['url']} ({st['api']}): {st['error'] or 'no chat models found'}")
+        if not (s.openrouter_key or s.anthropic_key):
+            print("    No cloud keys: your own models are the whole roster.")
+        else:
+            print("    Add local models to the roster on the Models page (they're free; OpenRouter-out fallback either way).")
+    else:
+        from . import local as local_models
+        for st in local_models.find_running():
+            print(f"  A model server is running at {st['url']} ({st['api']}, {len(st['models'])} models). "
+                  f"Set CONDUCTOR_LOCAL_URL={st['url']} to use it.")
     cache = s.data_dir / "benchmarks.json"
     if cache.exists():
         cache.unlink()  # force a fresh fetch so we see the real result

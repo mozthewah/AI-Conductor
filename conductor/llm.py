@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Protocol
 import asyncio
 import contextvars
 import time
+import uuid
 
 import anthropic
 import httpx2
@@ -64,6 +65,8 @@ RETRY_DELAYS = [2, 5, 12, 25]  # seconds; network drops and provider hiccups are
 
 def is_transient(exc: Exception) -> bool:
     """Worth retrying: the connection dropped, or the provider had a momentary problem."""
+    if isinstance(exc, LocalServerError):  # 503 = Ollama/LM Studio still loading the model
+        return exc.status in (408, 425, 429, 500, 502, 503, 504)
     if isinstance(exc, StreamError):
         return exc.etype in TRANSIENT_STREAM_ERRORS or "upstream" in str(exc).lower()
     if isinstance(exc, (httpx2.TransportError, anthropic.APIConnectionError)):
@@ -86,6 +89,7 @@ class MessagesLLM:
         self._openrouter = anthropic.AsyncAnthropic(
             auth_token=openrouter_key, base_url=OPENROUTER_BASE_URL, default_headers=OPENROUTER_HEADERS, **extra,
         ) if openrouter_key else None
+        self.local = LocalChat(http_client)  # your own model servers (Ollama, OpenAI- or Anthropic-compatible)
         self.limiter = AdaptiveLimiter()  # parallel OpenRouter calls; narrows when the in-flight budget bites
         self.audit = None  # set by the Conductor; logs the small one-shot calls (routing, checks, reflection)
 
@@ -139,6 +143,8 @@ class MessagesLLM:
     async def turn(self, *, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
                    on_event: OnEvent, effort: str = "high", web: bool = True,
                    session_id: str | None = None, providers: list[str] | None = None) -> dict:
+        if model.provider == "local":
+            return await self._local_turn(model, system, messages, tools, on_event)
         client = self._client(model)
         kw = self._request(model, system, messages, tools, effort, web, session_id, providers)
         retries = 0
@@ -195,6 +201,27 @@ class MessagesLLM:
                     raise
                 await on_event("status", {"text": "Retrying a garbled tool call..."})
 
+    async def _local_turn(self, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
+                          on_event: OnEvent) -> dict:
+        if not model.base_url:
+            raise RuntimeError(f"{model.id} isn't on any of your model servers right now (CONDUCTOR_LOCAL_URL). "
+                               "Is the server running? Models: Refresh local models, or pick another model.")
+        drops = retries = 0
+        max_tokens = min(self.max_tokens, model.max_output or self.max_tokens)
+        while True:
+            try:
+                return await self.local.turn(model, system, messages, tools, on_event, max_tokens)
+            except (LocalServerError, StreamError, httpx2.TransportError, ConnectionError, TimeoutError) as e:
+                if not is_transient(e) or drops >= len(RETRY_DELAYS):
+                    raise
+                drops = await self._retry_after_drop(e, drops, on_event)
+            except ValueError:  # garbled tool-call JSON (small models do this): ask again
+                retries += 1
+                if retries > 2:
+                    raise
+                await on_event("turn_reset", {})
+                await on_event("status", {"text": "Retrying a garbled tool call..."})
+
     async def _retry_after_drop(self, exc: Exception, drops: int, on_event: OnEvent) -> int:
         delay = RETRY_DELAYS[drops]
         what = "The connection dropped" if isinstance(exc, (httpx2.TransportError, anthropic.APIConnectionError,
@@ -233,6 +260,8 @@ class MessagesLLM:
     # ------------------------------------------------------------------ one-shot text (small chores)
     async def quick(self, *, model: ModelInfo, system: str, prompt: str, max_tokens: int = 400) -> str:
         """A single short reply with no tools: titles, suggestions and other small chores."""
+        if model.provider == "local":
+            return await self.local.complete(model, system, prompt, max_tokens)
         client = self._client(model)
         started = time.time()
         try:
@@ -255,6 +284,11 @@ class MessagesLLM:
     # ------------------------------------------------------------------ one-shot JSON
     async def structured(self, *, model: ModelInfo, system: str, prompt: str, schema: dict,
                          effort: str = "low") -> dict:
+        if model.provider == "local":
+            text = await self.local.complete(
+                model, system, f"{prompt}\n\nReply with only a JSON object matching this schema:\n{json.dumps(schema)}",
+                min(4000, model.max_output or 4000), schema=schema)
+            return parse_json_loose(text)
         client = self._client(model)
         kw: dict[str, Any] = {"model": model.id, "max_tokens": min(16000, model.max_output or 16000),
                               "system": system, "messages": [{"role": "user", "content": prompt}]}
@@ -571,3 +605,190 @@ def tool_spec(name: str, description: str, properties: dict[str, Any], required:
         "eager_input_streaming": True,
         "input_schema": {"type": "object", "properties": properties, "required": required},
     }
+
+
+# ------------------------------------------------------------------ your own model servers (local.py)
+class LocalServerError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"Your model server answered {status}: {message}")
+        self.status = status
+
+
+class LocalChat:
+    """Streams a turn from Ollama (/api/chat), an OpenAI-compatible server (/v1/chat/completions) or an
+    Anthropic-compatible one (/v1/messages), and returns it in Conductor's block format.
+
+    Only CONDUCTOR_LOCAL_KEY is ever sent; never Anthropic or OpenRouter credentials."""
+
+    def __init__(self, http_client=None):
+        self._http = http_client
+
+    def client(self):
+        if self._http is None:  # local models can be slow to load: generous read timeout
+            self._http = httpx2.AsyncClient(timeout=httpx2.Timeout(connect=10, read=900, write=60, pool=10))
+        return self._http
+
+    @staticmethod
+    def _headers(model: ModelInfo) -> dict:
+        h = {"Content-Type": "application/json"}
+        if model.api_key:
+            h["Authorization"] = f"Bearer {model.api_key}"
+            h["x-api-key"] = model.api_key
+        if model.api == "anthropic":
+            h["anthropic-version"] = "2023-06-01"
+        return h
+
+    def body(self, model: ModelInfo, system: str, messages: list[dict], tools: list[dict], max_tokens: int,
+             stream: bool = True, schema: dict | None = None) -> tuple[str, dict]:
+        from . import local
+        name = model.remote_id or model.id.removeprefix("local/").split("@")[0]
+        if model.api == "anthropic":
+            kw: dict[str, Any] = {"model": name, "max_tokens": max_tokens, "stream": stream,
+                                  "messages": adapt_messages(messages, model, plain=True)}
+            if system:
+                kw["system"] = system
+            if tools:
+                kw["tools"] = [{k: v for k, v in t.items() if k in ("name", "description", "input_schema")}
+                               for t in tools if "input_schema" in t]
+            return f"{model.base_url}/v1/messages", kw
+        msgs = local.to_openai(system, messages, model.vision)
+        if model.api == "ollama":
+            kw = {"model": name, "messages": local.to_ollama(msgs), "stream": stream,
+                  "options": {"num_ctx": model.context, "num_predict": max_tokens}}
+            if tools:
+                kw["tools"] = local.openai_tools(tools)
+            if model.reasoning:
+                kw["think"] = True
+            if schema:
+                kw["format"] = schema
+            return f"{model.base_url}/api/chat", kw
+        kw = {"model": name, "messages": msgs, "stream": stream, "max_tokens": max_tokens}
+        if stream:
+            kw["stream_options"] = {"include_usage": True}
+        if tools:
+            kw["tools"] = local.openai_tools(tools)
+        return f"{model.base_url}/v1/chat/completions", kw
+
+    async def turn(self, model: ModelInfo, system: str, messages: list[dict], tools: list[dict],
+                   on_event: OnEvent, max_tokens: int) -> dict:
+        url, kw = self.body(model, system, messages, tools, max_tokens)
+        if model.api == "anthropic":
+            acc = Accumulator(on_event)
+            async for kind, data in self._lines(url, kw, model):
+                if kind == "sse" and data:
+                    await acc.feed(data.get("type"), data)
+            result = acc.result()
+            result["content"] = [b for b in result["content"] if b.get("type") in ("text", "tool_use")] or [
+                {"type": "text", "text": ""}]
+        else:
+            result = await self._chat(url, kw, model, on_event)
+        result["model"] = model.id
+        result["usage"]["cost"] = 0.0
+        return result
+
+    async def _lines(self, url: str, kw: dict, model: ModelInfo):
+        async with self.client().stream("POST", url, json=kw, headers=self._headers(model)) as r:
+            if r.status_code >= 400:
+                raw = (await r.aread()).decode(errors="replace")
+                try:
+                    j = json.loads(raw)
+                    err = j.get("error")
+                    msg = (err.get("message") if isinstance(err, dict) else err) or raw
+                except ValueError:
+                    msg = raw
+                raise LocalServerError(r.status_code, str(msg)[:400])
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line or line.startswith(":") or line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        return
+                    yield "sse", json.loads(payload)
+                else:  # Ollama: one JSON object per line
+                    yield "ndjson", json.loads(line)
+
+    async def _chat(self, url: str, kw: dict, model: ModelInfo, on_event: OnEvent) -> dict:
+        from .local import parse_args
+        text, calls, stop, usage = "", {}, None, {"input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+        started = False
+        thinking_tag = False  # some servers stream <think>...</think> inside the text
+        async for _, d in self._lines(url, kw, model):
+            if "error" in d and not d.get("choices") and not d.get("message"):
+                err = d["error"]
+                raise StreamError(str(err.get("message") if isinstance(err, dict) else err), "api_error")
+            if model.api == "ollama":
+                msg = d.get("message") or {}
+                piece, reasoning = msg.get("content") or "", msg.get("thinking") or ""
+                for c in msg.get("tool_calls") or []:
+                    fn = c.get("function") or {}
+                    calls[len(calls)] = {"id": c.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                                         "name": fn.get("name", ""), "args": fn.get("arguments") or {}}
+                if d.get("done"):
+                    stop = {"length": "max_tokens"}.get(d.get("done_reason"), "end_turn")
+                    usage["input_tokens"] = d.get("prompt_eval_count") or 0
+                    usage["output_tokens"] = d.get("eval_count") or 0
+            else:
+                if d.get("usage"):
+                    usage["input_tokens"] = d["usage"].get("prompt_tokens") or usage["input_tokens"]
+                    usage["output_tokens"] = d["usage"].get("completion_tokens") or usage["output_tokens"]
+                choice = (d.get("choices") or [{}])[0]
+                delta = choice.get("delta") or choice.get("message") or {}
+                piece = delta.get("content") or ""
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                for c in delta.get("tool_calls") or []:
+                    slot = calls.setdefault(c.get("index", len(calls)), {"id": "", "name": "", "args": ""})
+                    fn = c.get("function") or {}
+                    slot["id"] = c.get("id") or slot["id"]
+                    slot["name"] += fn.get("name") or ""
+                    a = fn.get("arguments")
+                    if isinstance(a, dict):
+                        slot["args"] = a
+                    elif a:
+                        slot["args"] = (slot["args"] if isinstance(slot["args"], str) else "") + a
+                if choice.get("finish_reason"):
+                    stop = {"length": "max_tokens", "tool_calls": "tool_use"}.get(choice["finish_reason"], "end_turn")
+            if piece and ("<think>" in piece or thinking_tag):
+                before, _, after = piece.partition("<think>") if "<think>" in piece else ("", "", piece)
+                inner, closed, rest = after.partition("</think>")
+                thinking_tag = not closed
+                reasoning, piece = reasoning + inner, before + rest
+            if reasoning:
+                await on_event("progress_delta", {"index": 0, "text": reasoning})
+            if piece:
+                if not started:
+                    started = True
+                    await on_event("text_start", {"index": 0})
+                text += piece
+                await on_event("text_delta", {"index": 0, "text": piece})
+        content: list[dict] = [{"type": "text", "text": text.strip()}] if text.strip() else []
+        for i in sorted(calls):
+            c = calls[i]
+            if not c["name"]:
+                continue
+            block = {"type": "tool_use", "id": c["id"] or f"call_{uuid.uuid4().hex[:12]}", "name": c["name"],
+                     "input": parse_args(c["args"])}  # ValueError -> the turn is retried
+            await on_event("tool_start", {"index": len(content), "name": block["name"], "id": block["id"]})
+            content.append(block)
+        if any(b["type"] == "tool_use" for b in content):
+            stop = "tool_use"
+        return {"content": content or [{"type": "text", "text": ""}], "stop_reason": stop or "end_turn",
+                "stop_details": None, "model": model.id, "usage": usage}
+
+    async def complete(self, model: ModelInfo, system: str, prompt: str, max_tokens: int,
+                       schema: dict | None = None) -> str:
+        """One short non-streaming reply (titles, routing, checks)."""
+        msgs = [{"role": "user", "content": prompt}]
+        url, kw = self.body(model, system, msgs, [], max_tokens, stream=False, schema=schema)
+        r = await self.client().post(url, json=kw, headers=self._headers(model))
+        if r.status_code >= 400:
+            raise LocalServerError(r.status_code, r.text[:400])
+        d = r.json()
+        if model.api == "anthropic":
+            return "".join(b.get("text", "") for b in d.get("content") or [] if b.get("type") == "text")
+        if model.api == "ollama":
+            text = (d.get("message") or {}).get("content") or ""
+        else:
+            text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()

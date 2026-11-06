@@ -49,6 +49,7 @@ const ICONS = {
   arrowDown: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   bulb: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
   thought: '<path d="M7 18a4 4 0 0 1-.6-8A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1 .5 8z"/><circle cx="5" cy="21" r="1"/>',
 };
 const icon = (name) => svg(ICONS[name] || ICONS.sparkle);
@@ -1129,6 +1130,7 @@ async function showFiles() {
 
 async function showModels() {
   const rosterEl = h("div");
+  const localEl = h("div");
   const lbEl = h("div");
   const results = h("div", { class: "search-results" });
   const q = h("input", { placeholder: "Search OpenRouter models to add (e.g. “llama”, “mistral”)…" });
@@ -1136,15 +1138,16 @@ async function showModels() {
     const data = await api("/api/models");
     state.roster = data.roster;
     rosterEl.replaceChildren();
-    if (!data.roster.length) rosterEl.append(h("div", { class: "empty" }, "No models available. Add OPENROUTER_API_KEY to .env and restart."));
+    if (!data.roster.length) rosterEl.append(h("div", { class: "empty" }, "No models available. Add OPENROUTER_API_KEY to .env (or point CONDUCTOR_LOCAL_URL at Ollama / LM Studio) and restart."));
+    localEl.replaceChildren(localModelsView(data.local, loadRoster));
     for (const m of data.roster) {
       const st = m.stats;
       rosterEl.append(h("div", { class: "list-item" },
         h("span", { class: `kind tier-${m.tier}` }, m.tier),
         h("div", { class: "grow" },
           h("div", { style: "font-weight:600" }, m.name || m.id, h("small", { class: "mono" }, " ", m.id)),
-          h("div", { class: "meta" }, `${fmtCost(m.price_in)} in / ${fmtCost(m.price_out)} out per 1M tokens · ${Math.round(m.context / 1000)}k context`,
-            m.vision ? " · sees images" : "", m.reasoning ? " · reasons" : "", m.provider === "anthropic" ? " · direct" : " · via OpenRouter"),
+          h("div", { class: "meta" }, m.is_local ? `Free · ${Math.round(m.context / 1000)}k context` : `${fmtCost(m.price_in)} in / ${fmtCost(m.price_out)} out per 1M tokens · ${Math.round(m.context / 1000)}k context`,
+            m.vision ? " · sees images" : "", m.reasoning ? " · reasons" : "", m.is_local ? ` · your ${m.api} server` : m.provider === "anthropic" ? " · direct" : " · via OpenRouter"),
           st ? h("div", { class: "meta" }, `${st.runs} task(s) · 👍 ${st.up || 0} 👎 ${st.down || 0} · avg ${fmtCost(st.avg_cost)} · ${fmtSecs(st.avg_seconds || 0)}`) : null,
           (m.byok && m.byok.length) || m.blocked ? h("div", { class: "meta" },
             m.byok && m.byok.length ? h("span", { class: "chip-byok", title: "Served by a provider you have your own key for: costs only a ~5% fee in credits, and keeps working when credits run out" }, icon("key"), ` your ${m.byok.join(", ")} key`) : null,
@@ -1208,6 +1211,7 @@ async function showModels() {
         "Thumbs up/down on results teach it, and about 1 in 10 tasks it tries a less-proven model to keep learning. " +
         "Use “Try another model” on any task to compare side by side.")),
     h("h2", { class: "section" }, "Your OpenRouter account"), acctEl,
+    h("h2", { class: "section" }, "Your own models"), localEl,
     h("h2", { class: "section" }, "Scoreboard"), lbEl,
     h("h2", { class: "section" }, "Roster"),
     h("div", { class: "toolbar" }, q, h("button", { class: "btn", onclick: async () => {
@@ -1565,6 +1569,57 @@ function importChecklist(memories, skills, onImport) {
   return h("div", {}, rows.length + skillRows.length ? h("div", { class: "toolbar" }, all, go) : null, box);
 }
 
+function localModelsView(local, reload) {
+  const box = h("div", { class: "card", style: "margin-bottom:8px" });
+  if (!local || !local.configured) {
+    box.append(h("div", { class: "title" }, icon("server"), "Run models on your own hardware"),
+      h("div", { class: "sev-reason" }, "Point CONDUCTOR_LOCAL_URL in .env at Ollama (http://127.0.0.1:11434), LM Studio (http://127.0.0.1:1234), llama.cpp, vLLM, or any server that speaks /v1/chat/completions or /v1/messages, then restart. Several servers: separate them with commas. The Setup page can find a running one for you."));
+    return box;
+  }
+  box.append(h("div", { class: "title" }, icon("server"), "Your model servers"),
+    ...local.servers.map((sv) => h("div", { class: "file-row" },
+      h("span", {}, h("b", {}, sv.api), " ", h("small", { class: "mono" }, sv.url)),
+      h("small", {}, sv.models.length ? `${sv.models.length} model(s)` : `not answering: ${sv.error || "no chat models"}`))),
+    local.default ? h("div", { class: "meta" }, `When OpenRouter credits run out and nothing else can take a task, ${local.default} carries on (free).`) : null,
+    ...(local.available || []).map((m) => h("div", { class: "file-row" },
+      h("span", {}, m.remote_id || m.name, h("small", { class: "mono" }, " ", m.id)),
+      h("small", {}, `${Math.round(m.context / 1000)}k${m.tools ? "" : " · no tool calling"}`),
+      m.tools ? h("button", { class: "btn", onclick: async () => { await api("/api/models/roster", { method: "POST", body: { model: m.id } }); reload(); } }, "Add") : h("small", {}, "chat only"))),
+    h("div", { class: "toolbar" }, h("button", { class: "btn", onclick: async (e) => {
+      e.target.disabled = true; e.target.textContent = "Looking…";
+      try { await api("/api/models/local/refresh", { method: "POST" }); } finally { reload(); }
+    } }, "Refresh local models")));
+  return box;
+}
+
+function localServerSetup(st, saved) {
+  const url = h("input", { placeholder: "http://127.0.0.1:11434  (or openai=http://host:1234, anthropic=http://host:18000)", value: (st.local_models && typeof st.local_models.url === "string") ? st.local_models.url : "" });
+  const key = h("input", { type: "password", placeholder: "Server key (optional)", autocomplete: "off" });
+  const out = h("div");
+  const show = (found, err) => {
+    out.replaceChildren(...found.map((r) => h("div", { class: "file-row" },
+      h("span", {}, h("b", {}, r.api), " ", h("small", { class: "mono" }, r.url), ` · ${r.models.slice(0, 6).join(", ")}${r.models.length > 6 ? "…" : ""}`),
+      h("button", { class: "btn", onclick: () => { url.value = r.api === "auto" ? r.url : `${r.api}=${r.url}`; } }, "Use"))));
+    if (!found.length) out.append(h("small", { class: "meta" }, err || "Nothing found."));
+  };
+  return h("div", { class: "card" }, h("div", { class: "title" }, icon("server"), "Your own model server (optional)"),
+    h("div", { class: "sev-reason" }, "Ollama, LM Studio, llama.cpp, vLLM or anything speaking /v1/chat/completions or /v1/messages. Free, private, and the fallback when OpenRouter credits run out. Several servers: separate with commas."),
+    h("div", { class: "toolbar" }, url),
+    h("div", { class: "toolbar" }, key,
+      h("button", { class: "btn", onclick: async () => {
+        out.replaceChildren(h("small", { class: "meta" }, "Looking…"));
+        const r = await api("/api/setup/local/probe", { method: "POST", body: { url: url.value.trim(), key: key.value.trim() } });
+        show(r.found, r.result && r.result.error);
+      } }, "Find / test"),
+      h("button", { class: "btn primary", onclick: async () => {
+        const values = { CONDUCTOR_LOCAL_URL: url.value.trim() };
+        if (key.value.trim()) values.CONDUCTOR_LOCAL_KEY = key.value.trim();
+        if (!values.CONDUCTOR_LOCAL_URL) return;
+        await api("/api/setup/keys", { method: "POST", body: { values } });
+        key.value = ""; saved();
+      } }, "Save")), out);
+}
+
 async function showSetup() {
   const st = await api("/api/setup");
   const tick = (ok, label, hint) => h("div", { class: "setup-check" + (ok ? " ok" : "") }, icon(ok ? "check" : "x"),
@@ -1577,6 +1632,7 @@ async function showSetup() {
     tick(st.claude_code, "Claude Code fallback (optional)", st.claude_code ? "Found: Claude tasks can continue on your Claude subscription." : "Install Claude Code and sign in to use your Claude subscription when credits run short."),
     tick(st.copilot, "GitHub Copilot fallback (optional)", st.copilot ? "Found: tasks can continue on your Copilot subscription." : "npm install -g @github/copilot, then `copilot` and /login."),
     tick(st.headroom, "Headroom token savings (optional)", st.headroom ? "Active." : "pip install -e \".[headroom]\" in Conductor's folder."),
+    tick(st.local_models && st.local_models.count, "Your own model server (optional)", st.local_models && st.local_models.count ? `${st.local_models.count} local model(s) ready (free).` : "Ollama, LM Studio, llama.cpp, vLLM… Set it up below on the computer."),
     tick(st.on_network, "Phone access (optional)", st.on_network ? "On: see the Safety page for the QR code." : "Start with `conductor serve --lan` to use it from your phone."));
 
   // 2. Keys (computer only)
@@ -1602,7 +1658,8 @@ async function showSetup() {
           Object.values(fields).forEach((el) => { el.value = ""; });
           restartRow.hidden = false;
         } }, "Save keys")),
-      h("p", { class: "meta" }, "Keys are written to Conductor's .env on this computer and never shown again."));
+      h("p", { class: "meta" }, "Keys are written to Conductor's .env on this computer and never shown again."),
+      localServerSetup(st, () => { restartRow.hidden = false; }));
   } else {
     keyBox.append(h("p", { class: "meta" }, "Keys can only be added on the computer running Conductor."));
   }

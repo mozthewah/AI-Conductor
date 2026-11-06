@@ -29,7 +29,7 @@ TIERS = ["fast", "strong", "frontier"]
 @dataclass
 class ModelInfo:
     id: str
-    provider: str  # "anthropic" | "openrouter"
+    provider: str  # "anthropic" | "openrouter" | "local"
     name: str = ""
     price_in: float = 0.0   # USD per million input tokens
     price_out: float = 0.0  # USD per million output tokens
@@ -42,6 +42,11 @@ class ModelInfo:
     tier: str = "strong"
     notes: str = ""
     canonical: str = ""  # OpenRouter's permanent dated id (what benchmark feeds use)
+    # Your own model servers (provider "local"): where it runs, which API it speaks, its name there.
+    base_url: str = ""
+    api: str = ""        # ollama | openai | anthropic
+    remote_id: str = ""
+    api_key: str = ""    # CONDUCTOR_LOCAL_KEY (never sent to the browser)
 
     @property
     def is_claude(self) -> bool:
@@ -52,7 +57,9 @@ class ModelInfo:
         return (fresh * self.price_in + cache_read * self.price_in * 0.1 + output_tokens * self.price_out) / 1e6
 
     def to_dict(self) -> dict:
-        return {**asdict(self), "is_claude": self.is_claude}
+        d = asdict(self)
+        d.pop("api_key", None)
+        return {**d, "is_claude": self.is_claude, "is_local": self.provider == "local"}
 
 
 def tier_for(price_out: float) -> str:
@@ -145,6 +152,16 @@ class Catalog:
     fetch: bool = True
     models: dict[str, ModelInfo] = field(default_factory=dict)
     fetched_at: float = 0.0
+    local_url: str = ""        # CONDUCTOR_LOCAL_URL (see local.py)
+    local_api: str = "auto"
+    local_key: str = ""
+    local_models: list[str] = field(default_factory=list)
+    local_context: int = 0
+    local_status: list[dict] = field(default_factory=list)
+
+    @property
+    def local_ids(self) -> list[str]:
+        return [m.id for m in self.models.values() if m.provider == "local"]
 
     @property
     def cache_path(self) -> Path:
@@ -160,7 +177,22 @@ class Catalog:
             self.models.update(ANTHROPIC_DIRECT)
         if self.has_openrouter:
             self.models.update(self._openrouter_models())
+        if self.local_url:
+            self.load_local()
         return self
+
+    def load_local(self) -> list[dict]:
+        """(Re)discover your own model servers' models."""
+        from . import local
+        for mid in self.local_ids:
+            self.models.pop(mid, None)
+        eps = local.parse_endpoints(self.local_url, self.local_api, self.local_key)
+        found, self.local_status = local.to_models(eps, self.local_context, self.local_models)
+        for st in self.local_status:
+            if st["error"] and not st["models"]:
+                log.warning("local model server %s didn't answer (%s)", st["url"], st["error"])
+        self.models.update(found)
+        return self.local_status
 
     def _openrouter_models(self) -> dict[str, ModelInfo]:
         raw: list[dict] | None = None
@@ -201,6 +233,8 @@ class Catalog:
             roster += [m for m in DEFAULT_OPENROUTER_ROSTER if m in self.models]
         if self.has_anthropic and not self.has_openrouter:
             roster += ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+        if not roster:  # no cloud keys: your own models are the roster
+            roster = [i for i in self.local_ids if self.models[i].tools]
         return roster
 
     def roster(self) -> list[ModelInfo]:
@@ -212,7 +246,8 @@ class Catalog:
                 ids = None
         if ids is None:
             ids = self.default_roster()
-        return [self.models[i] for i in ids if i in self.models and self.models[i].tools]
+        out = [self.models[i] for i in ids if i in self.models and self.models[i].tools]
+        return out or [self.models[i] for i in self.default_roster() if i in self.models]
 
     def set_roster(self, ids: list[str]) -> None:
         self.roster_path.write_text(json.dumps(list(dict.fromkeys(ids)), indent=2))
@@ -229,6 +264,9 @@ class Catalog:
         if model_id in self.models:
             return self.models[model_id]
         # Unknown id: guess the provider so a typo'd or brand-new model still gets a clear API error.
+        if model_id.startswith("local/"):  # its server is down right now: fail clearly at call time
+            return ModelInfo(model_id, "local", model_id, remote_id=model_id[6:].split("@")[0],
+                             notes="not found on your model server")
         provider = "openrouter" if "/" in model_id else "anthropic"
         return ModelInfo(model_id, provider, model_id, notes="not in catalog")
 

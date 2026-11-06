@@ -62,6 +62,8 @@ def model_name(model_id: str, override: str = "") -> str:
 def serves(model_id: str) -> bool:
     """Model families Copilot carries."""
     m = (model_id or "").lower()
+    if m.startswith("local/"):  # your own server's gpt-oss / gemma: never Copilot
+        return False
     return any(k in m for k in ("anthropic/", "claude", "openai/", "gpt", "google/", "gemini"))
 
 

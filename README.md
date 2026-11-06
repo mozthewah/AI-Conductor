@@ -159,6 +159,11 @@ tools, images, or reasoning) refreshes from OpenRouter daily and is cached in `d
 | `CONDUCTOR_FREE_MODELS` | `auto` | OpenRouter free models for chat titles and follow-up suggestions (`auto`, `off`, or a `:free` model id) |
 | `CONDUCTOR_HEADROOM` | `auto` | Compress bulky tool output with Headroom when it's installed (`auto`, `on`, `off`) |
 | `CONDUCTOR_HEADROOM_PROXY` | `auto` | Headroom's proxy for the Claude Code fallback: `auto` (Conductor runs it), `connect` (you run it), `off`, or a URL |
+| `CONDUCTOR_LOCAL_URL` | – | Your own model server(s): Ollama, OpenAI-compatible or Anthropic-compatible (see [Your own models](#your-own-models-ollama-lm-studio-llamacpp-vllm)) |
+| `CONDUCTOR_LOCAL_API` | `auto` | `auto`, `ollama`, `openai` or `anthropic`, for URLs without a `kind=` prefix |
+| `CONDUCTOR_LOCAL_KEY` | – | Key for your model server, if it wants one (sent only to it) |
+| `CONDUCTOR_LOCAL_MODELS` | – | Comma-separated: only these models (or name them if the server can't list its models) |
+| `CONDUCTOR_LOCAL_CONTEXT` | – | Context window to use; on Ollama, what Conductor asks for (default: the model's, up to 32k) |
 | `CONDUCTOR_AUDIT` | `on` | Local audit log in `data/logs/` (see [Audit log](#audit-log)) |
 | `CONDUCTOR_DATA_DIR` | `./data` | Database and skills |
 | `CONDUCTOR_WORKSPACE` | `./workspace` | The only directory its file tools and shell work in |
@@ -421,6 +426,35 @@ Conductor tries the best-looking free text models in turn, rests one for 15 minu
 (free models are rate-limited), and if none work it uses the cheap router model, or skips the chore when
 credits are out. Some free providers log or train on prompts, so only short snippets go to them.
 `CONDUCTOR_FREE_MODELS=off` turns this off; set it to a specific `...:free` model id to always use that one.
+
+## Your own models (Ollama, LM Studio, llama.cpp, vLLM)
+
+Point `CONDUCTOR_LOCAL_URL` at one or more servers (comma-separated); prefix one with `ollama=`, `openai=`
+or `anthropic=` to skip auto-detection:
+
+```bash
+CONDUCTOR_LOCAL_URL=http://127.0.0.1:11434                                   # Ollama
+CONDUCTOR_LOCAL_URL=http://127.0.0.1:11434, openai=http://comm-laptop:1234/v1  # Ollama + LM Studio elsewhere
+CONDUCTOR_LOCAL_URL=anthropic=http://127.0.0.1:18000                         # speaks /v1/messages
+```
+
+- **Ollama** is spoken to through its native `/api/chat`, not its `/v1` shim, because only the native API lets
+  Conductor set the context window (`num_ctx`). Ollama's default is small enough to silently cut off
+  Conductor's instructions and tool list; Conductor asks for the model's own window, up to 32k
+  (`CONDUCTOR_LOCAL_CONTEXT` to change it; bigger needs more memory). Tool calling, vision and thinking
+  are read from `ollama show`; embedding models and models that can't call tools are left out of the roster.
+- **OpenAI-compatible** (`/v1/chat/completions`): LM Studio, llama.cpp's `llama-server`, vLLM, LocalAI, Jan…
+  Streaming, tool calls (including arguments split across chunks) and `<think>` / `reasoning_content` are
+  handled; reasoning shows as progress, not in the answer.
+- **Anthropic-compatible** (`/v1/messages`): sent only the core fields (no caching, thinking settings or hosted tools).
+
+Models show up as `local/<name>` and cost nothing. With **no cloud keys**, they're the whole roster, the router
+model and the default. **With cloud keys**, add the ones you want on the Models page ("Your own models"); either
+way, when OpenRouter credits run out and neither your own provider keys nor a subscription (Claude Code,
+Copilot) can take a task, it carries on on your strongest local model instead of pausing. Copilot never
+takes local models. Requests to your servers carry only `CONDUCTOR_LOCAL_KEY`, never your Anthropic or
+OpenRouter keys. The Setup page can find a server running on the usual ports and test a URL;
+`conductor doctor` lists what each server has. After `ollama pull`, use "Refresh local models".
 
 ## Saving tokens with Headroom
 

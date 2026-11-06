@@ -69,7 +69,8 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         s = state["c"].settings
         state["c"].audit.write("system.start", "system", model=s.model, approval=state["c"].policy.threshold,
                                compose=s.compose, budget=s.router_budget, port=s.port, workspace=str(s.workspace),
-                               providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key})
+                               providers={"openrouter": bool(s.openrouter_key), "anthropic": s.anthropic_key,
+                                          "local": len(state["c"].catalog.local_ids)})
         state["token"] = access.load_token(s.data_dir)  # passcode for other devices on your network
         state["c"].server_url = f"http://127.0.0.1:{s.port}"  # Claude Code's safety hook calls back here
         state["c"].refresh_account()  # BYOK keys, guardrails, activity (background; cached 30 min)
@@ -317,7 +318,24 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             "on_network": not access.is_local(os.environ.get("CONDUCTOR_HOST", "127.0.0.1")),
             "memories": len(cx.store.list_memories(limit=2000)), "skills": len(cx.skills.list()),
             "sources": sources, "paste_prompt": onboarding.PASTE_PROMPT,
+            "local_models": {"url": st.local_url if local else bool(st.local_url),
+                             "servers": [{**x, "url": x["url"] if local else ""} for x in cx.catalog.local_status],
+                             "count": len(cx.catalog.local_ids)},
         }
+
+    @app.post("/api/setup/local/probe")
+    async def setup_local_probe(request: Request):
+        """Check a model server URL (or look for one on the usual ports). From the computer only:
+        this makes Conductor send requests to the address you give it."""
+        if not _local(request):
+            raise HTTPException(403, "Model servers can only be checked on the computer running Conductor.")
+        from . import local as local_models
+        body = json.loads(await request.body() or b"{}")
+        url = str(body.get("url") or "").strip()
+        if not url:
+            return {"found": await asyncio.to_thread(local_models.find_running)}
+        r = await asyncio.to_thread(local_models.probe, url, str(body.get("api") or "auto"), str(body.get("key") or ""))
+        return {"found": [r] if r["ok"] else [], "result": r}
 
     @app.post("/api/setup/preview")
     async def setup_preview(request: Request):
@@ -359,7 +377,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             raise HTTPException(403, "Keys can only be changed on the computer running Conductor.")
         body = json.loads(await request.body() or b"{}")
         values = {k: str(v).strip() for k, v in (body.get("values") or {}).items()
-                  if k in onboarding.KEY_NAMES and str(v).strip()}
+                  if k in onboarding.SETUP_FIELDS and str(v).strip() and not re.search(r"[\r\n]", str(v))}
         if body.get("from_source"):
             found = onboarding.source_keys(str(body["from_source"]))
             values.update({k: found[k] for k in body.get("keys") or [] if k in found})
@@ -444,8 +462,9 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         return {"model": s.model, "effort": s.effort, "approval": c().policy.threshold, "learning": s.learning,
                 "web_tools": s.web_tools, "tools": sorted(c().tools), "workspace": str(s.workspace),
                 "budget": s.router_budget, "router_model": s.default_router_model,
-                "providers": {"anthropic": s.anthropic_key, "openrouter": bool(s.openrouter_key)},
-                "credentials_hint": s.anthropic_key or bool(s.openrouter_key)}
+                "providers": {"anthropic": s.anthropic_key, "openrouter": bool(s.openrouter_key),
+                              "local": bool(c().catalog.local_ids)},
+                "credentials_hint": s.anthropic_key or bool(s.openrouter_key) or bool(c().catalog.local_ids)}
 
     @app.get("/api/tasks")
     def list_tasks():
@@ -597,7 +616,25 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
             "benchmarks_fetched_at": c().benchmarks.fetched_at,
             "benchmarks": c().benchmarks.status(),
             "catalog_size": len(c().catalog.models), "catalog_fetched_at": c().catalog.fetched_at,
+            "local": _local_models(),
         }
+
+    def _local_models() -> dict:
+        cat = c().catalog
+        in_roster = {m.id for m in cat.roster()}
+        return {"configured": bool(cat.local_url), "servers": cat.local_status,
+                "default": c().settings.local_default,
+                "available": [cat.models[i].to_dict() for i in cat.local_ids if i not in in_roster]}
+
+    @app.post("/api/models/local/refresh")
+    async def refresh_local():
+        """Look for new models on your own model servers (after `ollama pull`, loading one in LM Studio...)."""
+        await asyncio.to_thread(c().catalog.load_local)
+        c()._pick_local_default()
+        c().audit.write("models.local_refresh", "user", None,
+                        servers=[{k: v for k, v in st.items() if k != "models"} | {"models": len(st["models"])}
+                                 for st in c().catalog.local_status])
+        return _local_models()
 
     @app.get("/api/models/search")
     def search_models(q: str = ""):

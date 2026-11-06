@@ -35,7 +35,7 @@ class Chores:
 
     @property
     def enabled(self) -> bool:
-        return self.mode != "off" and bool(self.c.settings.openrouter_key) and hasattr(self.c.llm, "quick")
+        return self.mode != "off" and bool(self.c.settings.openrouter_key or self.c.settings.local_default) and hasattr(self.c.llm, "quick")
 
     def candidates(self) -> list[str]:
         if self.mode not in ("auto", "on", "off") and ":" in self.mode:

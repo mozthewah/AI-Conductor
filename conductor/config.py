@@ -78,6 +78,12 @@ class Settings:
     web_tools: bool = True
     browser: bool = True
     fetch_catalog: bool = True
+    local_url: str = ""          # your own model server(s): Ollama, OpenAI- or Anthropic-compatible (see local.py)
+    local_api: str = "auto"      # auto | ollama | openai | anthropic (for URLs without a "kind=" prefix)
+    local_key: str = ""          # sent only to your own servers
+    local_models: str = ""       # comma-separated: limit to these (or name them when the server can't list)
+    local_context: int = 0       # context window to use/ask for (0: the model's, up to 32k on Ollama)
+    local_default: str = ""      # set at startup: the local model to use when there are no cloud keys
     port: int = 8765  # Conductor's own web server (tools must not take this port)
     audit: bool = True  # write data/logs/audit-YYYY-MM-DD.jsonl
 
@@ -85,12 +91,21 @@ class Settings:
     def default_router_model(self) -> str:
         if self.router_model:
             return self.router_model
+        if self.local_default and not (self.openrouter_key or self.anthropic_key):
+            return self.local_default
         return "anthropic/claude-haiku-5.5" if self.openrouter_key else "claude-haiku-5-5"
 
     @property
     def fallback_model(self) -> str:
         """Used when routing is off or fails."""
+        if self.local_default and not (self.openrouter_key or self.anthropic_key):
+            return self.local_default
         return "anthropic/claude-opus-5.5" if self.openrouter_key and not self.anthropic_key else "claude-opus-5-5"
+
+    def catalog_kwargs(self) -> dict:
+        return {"local_url": self.local_url, "local_api": self.local_api, "local_key": self.local_key,
+                "local_context": self.local_context,
+                "local_models": [m.strip() for m in self.local_models.split(",") if m.strip()]}
 
     @property
     def db_path(self) -> Path:
@@ -148,6 +163,11 @@ class Settings:
             web_tools=_flag("CONDUCTOR_WEB_TOOLS", True),
             browser=_flag("CONDUCTOR_BROWSER", True),
             port=int(os.environ.get("CONDUCTOR_PORT", "8765")),
+            local_url=os.environ.get("CONDUCTOR_LOCAL_URL", ""),
+            local_api=os.environ.get("CONDUCTOR_LOCAL_API", "auto").lower(),
+            local_key=os.environ.get("CONDUCTOR_LOCAL_KEY", ""),
+            local_models=os.environ.get("CONDUCTOR_LOCAL_MODELS", ""),
+            local_context=int(os.environ.get("CONDUCTOR_LOCAL_CONTEXT", "0") or 0),
             audit=_flag("CONDUCTOR_AUDIT", True),
         )
         s.data_dir = s.data_dir.resolve()

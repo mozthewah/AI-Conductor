@@ -22,6 +22,8 @@ from pathlib import Path
 HOME = Path.home()
 MAX_ITEMS = 300
 KEY_NAMES = ("OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_KEY", "ANTHROPIC_API_KEY")
+# What the Setup page may write to .env: the keys above plus your own model server (local.py).
+SETUP_FIELDS = KEY_NAMES + ("CONDUCTOR_LOCAL_URL", "CONDUCTOR_LOCAL_KEY")
 
 # name -> (folder, memory/instruction files (globs, relative), skill roots (relative))
 AGENTS = {

@@ -61,7 +61,9 @@ class Conductor:
         self.audit = AuditLog(settings.data_dir / "logs", enabled=settings.audit)
         self.skills = SkillLibrary(settings.skills_dir)
         self.catalog = Catalog(settings.data_dir, has_openrouter=bool(settings.openrouter_key),
-                               has_anthropic=settings.anthropic_key, fetch=settings.fetch_catalog).load()
+                               has_anthropic=settings.anthropic_key, fetch=settings.fetch_catalog,
+                               **settings.catalog_kwargs()).load()
+        self._pick_local_default()
         self.llm: LLM = llm or MessagesLLM(anthropic_enabled=settings.anthropic_key,
                                            openrouter_key=settings.openrouter_key, max_tokens=settings.max_tokens)
         self.benchmarks = Benchmarks(settings.data_dir, key=settings.openrouter_key,
@@ -109,6 +111,17 @@ class Conductor:
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         self._running: dict[str, asyncio.Task] = {}
         self._pending: dict[str, tuple[str, asyncio.Future, dict]] = {}
+
+    def _pick_local_default(self) -> None:
+        """With no cloud keys, your own models do everything: the strongest one is the fallback and router."""
+        s = self.settings
+        if s.model.startswith("local/"):
+            s.local_default = s.model
+            return
+        local = [self.catalog.models[i] for i in self.catalog.local_ids if self.catalog.models[i].tools]
+        if local:
+            size = lambda m: float((re.search(r"([\d.]+)\s*B", m.notes) or [0, 0])[1] or 0)
+            s.local_default = max(local, key=lambda m: (size(m), m.context)).id
 
     # ------------------------------------------------------------------ events
     async def emit(self, task_id: str, type_: str, data: dict) -> None:
@@ -475,7 +488,7 @@ class Conductor:
                                      error=f"{type(call_err).__name__}: {call_err}",
                                      ms=int((time.time() - started_call) * 1000), byok_only=byok_only or None)
                     from .llm import is_transient
-                    if not byok_only and is_transient(call_err) and model.provider == "openrouter":
+                    if not byok_only and is_transient(call_err) and model.provider in ("openrouter", "local"):
                         why = f"{model.name or model.id} kept failing at the provider."
                         if self._sub_first(model) and (ans := await self._run_subscription(task_id, model, messages, hands_off, why)) is not None:
                             answer = ans
@@ -884,7 +897,7 @@ class Conductor:
 
     def _sub_first(self, model) -> bool:
         """Models a subscription carries go there before BYOK / cheaper-model switches."""
-        return model.is_claude or copilot_serves(model.id)
+        return model.provider != "local" and (model.is_claude or copilot_serves(model.id))
 
     def _sub_ready(self, task_id: str, model) -> bool:
         return ((model.is_claude and self._cli_ready(task_id))
@@ -926,19 +939,46 @@ class Conductor:
         if not d.model or d.model in tried or d.by == "fallback" and d.model == model.id:
             return False
         info = self.catalog.get(d.model)
-        why = (f"{model.name or model.id} kept failing at the provider ({str(err)[:140]}), even after retries, "
+        where = "your model server" if model.provider == "local" else "the provider"
+        why = (f"{model.name or model.id} kept failing at {where} ({str(err)[:140]}), even after retries, "
                f"so {info.name or info.id} is taking over.")
-        history.append({"from": model.id, "to": info.id, "reason": why, "by": "provider_error", "at": time.time(),
+        await self._move_sideways(task_id, model, info, why, "provider_error")
+        return True
+
+    async def _move_sideways(self, task_id: str, model, info, why: str, by: str) -> None:
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        history = list(route.get("escalations") or [])
+        history.append({"from": model.id, "to": info.id, "reason": why, "by": by, "at": time.time(),
                         "direction": "sideways"})
         route.update({"escalations": history, "model": info.id, "name": info.name or info.id})
         self.store.update_task(task_id, model=info.id, route=route)
         self.store.set_run_model(task_id, info.id)
         payload = {"task_id": task_id, "from": model.id, "from_name": model.name or model.id, "to": info.id,
-                   "name": info.name or info.id, "reason": why, "by": "provider_error", "direction": "sideways"}
+                   "name": info.name or info.id, "reason": why, "by": by, "direction": "sideways"}
         await self.emit(task_id, "escalated", payload)
         root = self._root(task_id)["id"]
         if root != task_id:
             await self.emit(root, "escalated", payload)
+
+    async def _switch_to_local(self, task_id: str, model, reason: str) -> bool:
+        """Credits are out and nothing else can take the work: carry on with your own model server
+        (free) instead of pausing. True if the task can go on."""
+        if model.provider == "local":
+            return False
+        mine = {m.id for m in self.router.usable_roster() if m.provider == "local"}
+        target = ""
+        if mine:
+            route = dict(self.store.get_task(task_id).get("route") or {})
+            d = self.router.pick(skill=route.get("skill", "other"), domain=route.get("domain", "general"),
+                                 difficulty=route.get("difficulty", "medium"), budget="best", only=mine)
+            target = d.model if d.model in mine else ""
+        target = target or self.settings.local_default
+        info = self.catalog.models.get(target)
+        if not info or not info.base_url:
+            return False
+        why = f"{reason}, so {info.name or info.id} on your own model server is taking over (free)."
+        await self._move_sideways(task_id, model, info, why, "local")
         return True
 
     def _byok_only(self, model) -> list[str]:
@@ -1263,7 +1303,7 @@ class Conductor:
         route = dict(task.get("route") or {})
         fits = set()
         for m in self.router.usable_roster():
-            if m.id == model.id or m.provider != "openrouter":
+            if m.id == model.id or m.provider not in ("openrouter", "local"):
                 continue
             cost = m.cost(int(tokens_in), 4096)
             credit_cost = self.account.credit_cost(m.id, cost, m.canonical)
@@ -1294,9 +1334,14 @@ class Conductor:
         return True
 
     async def _pause_for_credits(self, task_id: str, err: CreditError, need: float | None = None) -> None:
-        """Out of credits: park this task (and show it on the main task) until credits are back."""
-        self.credits.mark_out()
+        """Out of credits: park this task (and show it on the main task) until credits are back -
+        unless your own model server can carry on with it."""
         task = self.store.get_task(task_id)
+        current = self.catalog.get(task.get("model") or self.settings.fallback_model)
+        short = "OpenRouter credits are used up" if err.kind == "out" else "OpenRouter credits can't cover the next step"
+        if await self._switch_to_local(task_id, current, short):
+            return
+        self.credits.mark_out()
         root = self._root(task_id)
         st = self.credits.status()
         if need is None and st["available"] is not None:

@@ -85,7 +85,16 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .hint { font-size: 12.5px; color: var(--ink-3); }
 .send { width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--accent); color: #fff; display: grid; place-items: center; }
 .send:disabled { opacity: .35; cursor: default; }
-.send.stop { background: var(--ink); }
+.composer-actions { display: flex; align-items: center; gap: 8px; }
+.stop-btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 999px; padding: 6px 12px 6px 10px; font-size: 13px; font-weight: 500; }
+.stop-btn[hidden] { display: none; }
+.stop-btn svg { width: 14px; height: 14px; }
+.stop-btn:hover { border-color: var(--bad); color: var(--bad); }
+.card.midtask { border-color: var(--accent); box-shadow: none; }
+.card.midtask .title svg { color: var(--accent); }
+.midtask-text { font: 400 16px/1.4 var(--serif); white-space: pre-wrap; }
+.queued-badge.seen { color: var(--accent-ink); background: var(--accent-soft); }
+.queued-badge { display: inline-block; margin-left: 10px; font: 500 11.5px var(--sans); color: var(--warn); background: var(--warn-soft); border-radius: 999px; padding: 2px 9px; vertical-align: middle; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-width: 720px; margin-top: 18px; }
 .chip { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 7px 13px; font-size: 13.5px; color: var(--ink-2); }
 .chip:hover { border-color: var(--accent); color: var(--ink); }

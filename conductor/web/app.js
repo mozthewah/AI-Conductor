@@ -179,13 +179,17 @@ async function refreshTasks() {
 setInterval(refreshTasks, 4000);
 
 // ------------------------------------------------------------------ composer
-function composer({ placeholder, onSubmit, autofocus, big, extra }) {
+function composer({ placeholder, runningPlaceholder, onSubmit, autofocus, big, extra }) {
   const ta = h("textarea", { rows: big ? 3 : 1, placeholder });
-  const btn = h("button", { class: "send", disabled: true, "aria-label": "Send" }, icon("send"));
+  const btn = h("button", { class: "send", type: "submit", disabled: true, "aria-label": "Send" }, icon("send"));
+  // Stop is its own button, so Enter can never cancel a running task by accident.
+  const stopBtn = h("button", { class: "stop-btn", type: "button", hidden: true, title: "Stop the task",
+    onclick: () => wrap.onStop && wrap.onStop() }, icon("stop"), "Stop");
+  const hint = h("span", { class: "hint" }, "Enter to send · Shift+Enter for a new line");
   const wrap = h("form", { class: "composer" }, ta,
-    h("div", { class: "composer-row" }, h("div", { class: "composer-left" }, extra || null, h("span", { class: "hint" }, "Enter to send · Shift+Enter for a new line")), btn));
+    h("div", { class: "composer-row" }, h("div", { class: "composer-left" }, extra || null, hint),
+      h("div", { class: "composer-actions" }, stopBtn, btn)));
   const submit = async () => {
-    if (btn.classList.contains("stop")) return wrap.onStop && wrap.onStop();
     const text = ta.value.trim();
     if (!text) return;
     btn.disabled = true;
@@ -193,16 +197,15 @@ function composer({ placeholder, onSubmit, autofocus, big, extra }) {
     catch (e) { alert(e.message); }
     btn.disabled = !ta.value.trim();
   };
-  ta.addEventListener("input", () => { if (!btn.classList.contains("stop")) btn.disabled = !ta.value.trim(); });
+  ta.addEventListener("input", () => { btn.disabled = !ta.value.trim(); });
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
   });
   wrap.addEventListener("submit", (e) => { e.preventDefault(); submit(); });
   wrap.setRunning = (running) => {
-    btn.classList.toggle("stop", running);
-    btn.replaceChildren(icon(running ? "stop" : "send"));
-    btn.disabled = running ? false : !ta.value.trim();
-    btn.setAttribute("aria-label", running ? "Stop" : "Send");
+    stopBtn.hidden = !running;
+    ta.placeholder = running && runningPlaceholder ? runningPlaceholder : placeholder;
+    hint.textContent = running ? "It'll see your message at its next step" : "Enter to send · Shift+Enter for a new line";
   };
   wrap.textarea = ta;
   autosize(ta);
@@ -301,7 +304,11 @@ async function showTask(id) {
 
   const comp = composer({
     placeholder: "Follow up, redirect, or ask for changes…",
-    onSubmit: async (text) => { await api(`/api/tasks/${id}/messages`, { method: "POST", body: { prompt: text } }); setStatus("running"); },
+    runningPlaceholder: "Add something while it works, e.g. “use Postgres instead” or “skip the tests”…",
+    onSubmit: async (text) => {
+      const r = await api(`/api/tasks/${id}/messages`, { method: "POST", body: { prompt: text } });
+      if (r.status === "started") setStatus("running");
+    },
   });
   comp.onStop = () => api(`/api/tasks/${id}/cancel`, { method: "POST" });
 
@@ -537,6 +544,14 @@ async function showTask(id) {
     const d = ev.data || {};
     switch (ev.type) {
       case "user":
+        if (d.queued) {  // said mid-task: show it in the running timeline, where it happened
+          const badge = h("span", { class: "queued-badge" }, "queued · it'll see this at its next step");
+          addAct(h("div", { class: "card midtask" }, h("div", { class: "title" }, icon("chat"), "You, while it worked", badge),
+            h("div", { class: "midtask-text" }, d.text)));
+          (v.queued = v.queued || []).push(badge);
+          scroll(true);
+          break;
+        }
         inner.querySelectorAll(".feedback-bar").forEach((b) => b.remove());
         newExchange(d.text);
         if (v.replayed) setStatus("running");
@@ -779,6 +794,11 @@ async function showTask(id) {
       }
       case "feedback":
         feedback = d.value;
+        break;
+      case "user_delivered":
+        for (let i = 0; i < (d.count || 1) && v.queued && v.queued.length; i++) {
+          const b = v.queued.shift(); b.textContent = "seen"; b.classList.add("seen");
+        }
         break;
       case "replayed":
         v.replayed = true;

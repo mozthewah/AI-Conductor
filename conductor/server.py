@@ -150,11 +150,9 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.post("/api/tasks/{task_id}/messages")
     async def follow_up(task_id: str, body: Prompt):
         task_or_404(task_id)
-        try:
-            c().send_message(task_id, body.prompt)
-        except RuntimeError as e:
-            raise HTTPException(409, str(e))
-        return {"ok": True}
+        if not body.prompt.strip():
+            raise HTTPException(400, "Empty message")
+        return {"ok": True, "status": c().send_message(task_id, body.prompt)}
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def cancel(task_id: str):

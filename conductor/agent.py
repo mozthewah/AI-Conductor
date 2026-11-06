@@ -55,6 +55,7 @@ class Conductor:
         self._judged: dict[str, Assessment] = {}
         self._escalate_next: dict[str, tuple[str, str, str | None]] = {}  # task -> (reason, by, target)
         self._blocked: dict[str, dict] = {}  # task -> {"what", "needs"} reported by a specialist
+        self._inbox: dict[str, list[str]] = {}  # task -> messages the user sent while it was running
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -133,12 +134,35 @@ class Conductor:
             self.store.append_event(task_id, "feedback", {"value": value})
         return ok
 
-    def send_message(self, task_id: str, prompt: str) -> None:
-        if task_id in self._running:
-            raise RuntimeError("That task is still running - wait for it or cancel it first.")
+    def send_message(self, task_id: str, prompt: str) -> str:
+        """Start a follow-up, or - if the task is mid-run - queue it for the model's next step."""
         if not self.store.get_task(task_id):
             raise KeyError(task_id)
+        if task_id in self._running:
+            waiting = self.pending_requests(task_id)
+            question = next((r for r in waiting if r["kind"] == "question"), None)
+            if question:  # it asked you something; typing in the main box answers it
+                self.resolve_request(question["id"], True, prompt)
+                return "answered"
+            for r in waiting:  # typing instead of approving = "no, do this instead"
+                if r["kind"] == "approval":
+                    self.resolve_request(r["id"], False)
+            self._inbox.setdefault(task_id, []).append(prompt)
+            asyncio.get_running_loop().create_task(self.emit(task_id, "user", {"text": prompt, "queued": True}))
+            return "queued"
         self._launch(task_id, prompt)
+        return "started"
+
+    def _drain_inbox(self, task_id: str) -> list[str]:
+        return self._inbox.pop(task_id, [])
+
+    async def _deliver(self, task_id: str, msgs: list[str]) -> dict:
+        """Mid-task messages become a text block the model sees at its next step."""
+        await self.emit(task_id, "user_delivered", {"count": len(msgs)})
+        body = "\n\n".join(msgs)
+        return {"type": "text", "text": (
+            f"[The user sent this while you were working - take it into account now, and adjust your plan "
+            f"if it changes anything:]\n{body}")}
 
     def is_running(self, task_id: str) -> bool:
         return task_id in self._running
@@ -204,6 +228,9 @@ class Conductor:
         try:
             answer = await self.run(task_id, prompt, depth=0,
                                     route={"pinned": model, "budget": self.settings.router_budget, "by": by})
+            # Messages that arrived as the run was wrapping up: pick them up now.
+            while task_id in self._inbox and self.store.get_task(task_id)["status"] == "done":
+                answer = await self.run(task_id, "\n\n".join(self._drain_inbox(task_id)), depth=0, announce=False)
         finally:
             t = self.store.get_task(task_id)
             if t:
@@ -215,11 +242,13 @@ class Conductor:
             except Exception as e:  # learning is best-effort
                 log.warning("reflection failed: %s", e)
                 await self.emit(task_id, "status", {"text": f"Skipped learning step ({describe_api_error(e)})"})
+        while task_id in self._inbox:  # sent during reflection
+            answer = await self.run(task_id, "\n\n".join(self._drain_inbox(task_id)), depth=0, announce=False)
         return answer
 
     # ------------------------------------------------------------------ the loop
     async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None,
-                  effort: str | None = None) -> str:
+                  effort: str | None = None, announce: bool = True) -> str:
         effort = effort or (self.settings.effort if depth == 0 else self.settings.subagent_effort)
         messages = self.store.load_messages(task_id)
 
@@ -232,7 +261,10 @@ class Conductor:
         content.append({"type": "text", "text": prompt})
         self._append(task_id, messages, "user", content)
         self.store.update_task(task_id, status="running")
-        await self.emit(task_id, "user", {"text": prompt})
+        if announce:
+            await self.emit(task_id, "user", {"text": prompt})
+        else:
+            await self.emit(task_id, "user_delivered", {"count": 1})
         if not self.store.get_task(task_id).get("model"):
             if route is not None:
                 await self._route(task_id, prompt, **route)
@@ -283,6 +315,10 @@ class Conductor:
                     break
 
                 tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+                if not tool_uses and depth == 0 and task_id in self._inbox and stop in ("end_turn", "stop_sequence"):
+                    # It was about to finish, but the user just said something: keep going.
+                    self._append(task_id, messages, "user", [await self._deliver(task_id, self._drain_inbox(task_id))])
+                    continue
                 if not tool_uses:
                     answer = text_of(blocks)
                     if stop == "max_tokens":
@@ -331,6 +367,8 @@ class Conductor:
                     elif self.settings.auto_escalate and task_id not in self._escalate_next \
                             and self.stronger_model(self.store.get_task(task_id)):
                         self._escalate_next[task_id] = ("It kept hedging after being nudged to ask for help.", "auto", None)
+                if depth == 0 and task_id in self._inbox:
+                    results.append(await self._deliver(task_id, self._drain_inbox(task_id)))
                 tool_turns += 1
                 if depth > 0 and self.settings.check_every and tool_turns % self.settings.check_every == 0 \
                         and task_id not in self._blocked:

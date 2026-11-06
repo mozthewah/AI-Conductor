@@ -68,12 +68,15 @@ def test_new_model_gets_a_clean_view_of_earlier_turns():
 
 async def test_repeating_itself_triggers_a_stronger_model(tmp_path):
     same = lambda: [tool_use("list_files", path=".")]
-    c = make(tmp_path, [same(), same(), same(), [text("Different approach worked.")]], L("research", "medium"))
+    c = make(tmp_path, [same() for _ in range(6)] + [[text("Different approach worked.")]], L("research", "medium"))
     tid = c.start_task("look around", model=STRONG.id)
     await c.wait(tid)
     models = [cl["model"] for cl in c.llm.calls]
-    assert models[:3] == [STRONG.id] * 3 and models[3] == FRONTIER.id
-    note = c.llm.calls[3]["messages"][-1]["content"][-1]
+    # first time stuck: step back (same model); stuck again: move up
+    step_back = c.llm.calls[3]["messages"][-1]["content"][-1]
+    assert "Move backwards" in step_back["text"] and models[3] == STRONG.id
+    assert models[:6] == [STRONG.id] * 6 and models[6] == FRONTIER.id
+    note = c.llm.calls[6]["messages"][-1]["content"][-1]
     assert note["type"] == "text" and "taking over this task from Strong" in note["text"]
 
 

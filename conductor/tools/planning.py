@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from . import Tool, ToolContext, ToolError
 
-STATUSES = ["pending", "in_progress", "done", "skipped"]
+STATUSES = ["pending", "in_progress", "blocked", "done", "skipped"]
 
 
 async def update_plan(ctx: ToolContext, args: dict) -> str:

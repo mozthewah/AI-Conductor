@@ -54,6 +54,7 @@ class Conductor:
         self.policy = Policy(settings.data_dir, settings.approval, settings.unattended_approval)
         self._judged: dict[str, Assessment] = {}
         self._escalate_next: dict[str, tuple[str, str, str | None]] = {}  # task -> (reason, by, target)
+        self._blocked: dict[str, dict] = {}  # task -> {"what", "needs"} reported by a specialist
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -98,7 +99,8 @@ class Conductor:
         )
 
     def tool_list(self, depth: int) -> list[Tool]:
-        return [t for t in self.tools.values() if depth == 0 or not t.top_level_only]
+        return [t for t in self.tools.values()
+                if not (t.top_level_only and depth > 0) and not (t.delegates and depth >= self.settings.max_depth)]
 
     def tool_specs(self, depth: int) -> list[dict]:
         return [t.spec() for t in self.tool_list(depth)]
@@ -247,6 +249,8 @@ class Conductor:
         failing_turns = 0
         hedgy_turns = 0
         nudged_at: int | None = None
+        stuck_count = 0
+        tool_turns = 0
         try:
             for _ in range(self.settings.max_steps):
                 turn = len(messages)
@@ -301,10 +305,16 @@ class Conductor:
                 failing_turns = failing_turns + 1 if results and all(r.get("is_error") for r in results) else 0
                 if failing_turns >= 3:
                     stuck = "three steps in a row failed"
-                if stuck and self.settings.auto_escalate and task_id not in self._escalate_next:
-                    self._escalate_next[task_id] = (f"The model seemed stuck: {stuck}.", "auto", None)
+                if stuck:
+                    stuck_count += 1
                     seen_calls.clear()
                     failing_turns = 0
+                    if stuck_count == 1:  # first, move backwards: rethink, reroute, or park it
+                        results.append({"type": "text", "text": prompts.STEP_BACK.format(why=stuck)})
+                        await self.emit(task_id, "status", {"text": f"Stuck ({stuck}); told it to step back and rethink."})
+                    elif self.settings.auto_escalate and task_id not in self._escalate_next:
+                        self._escalate_next[task_id] = (f"The model seemed stuck: {stuck}, even after stepping back.",
+                                                        "auto", None)
 
                 # Hedging ("hm... actually... wait") means it's out of its depth: nudge it to ask its
                 # big brother; if it keeps hedging after the nudge, hand the task up automatically.
@@ -321,7 +331,20 @@ class Conductor:
                     elif self.settings.auto_escalate and task_id not in self._escalate_next \
                             and self.stronger_model(self.store.get_task(task_id)):
                         self._escalate_next[task_id] = ("It kept hedging after being nudged to ask for help.", "auto", None)
+                tool_turns += 1
+                if depth > 0 and self.settings.check_every and tool_turns % self.settings.check_every == 0 \
+                        and task_id not in self._blocked:
+                    steer = await self._supervise(task_id, messages, blocks)
+                    if steer:
+                        results.append({"type": "text", "text": steer})
                 self._append(task_id, messages, "user", results)
+                if task_id in self._blocked:
+                    b = self._blocked.pop(task_id)
+                    answer = (f"BLOCKED: {b['what']}\nNeeds: {b['needs']}\n\nProgress so far:\n"
+                              f"{text_of(blocks) or '(see the workspace and transcript)'}")
+                    self.store.update_task(task_id, status="blocked", answer=answer)
+                    await self.emit(task_id, "blocked", b)
+                    return answer
             else:
                 answer = (text_of(messages[-1]["content"]) if messages[-1]["role"] == "assistant" else "")
                 answer += f"\n\n_(Stopped after {self.settings.max_steps} steps.)_"
@@ -454,6 +477,38 @@ class Conductor:
             await self.emit(self._root(task_id)["id"], "escalated", payload)
         return new
 
+    async def _supervise(self, task_id: str, messages: list[dict], last_blocks: list[dict]) -> str | None:
+        """The composer's eye on a specialist: a cheap model checks recent work against the brief."""
+        first = messages[0]["content"] if messages else ""
+        brief = first if isinstance(first, str) else " ".join(b.get("text", "") for b in first if b.get("type") == "text")
+        actions = []
+        for m in messages[-16:]:
+            if m["role"] != "assistant" or not isinstance(m["content"], list):
+                continue
+            for b in m["content"]:
+                if b.get("type") == "tool_use":
+                    actions.append(f"- {b['name']}: {json.dumps(b.get('input', {}))[:220]}")
+                elif b.get("type") == "text" and b.get("text"):
+                    actions.append(f"- said: {b['text'][:220]}")
+        try:
+            out = await self.llm.structured(
+                model=self.catalog.get(self.settings.default_router_model), system=prompts.SUPERVISE_SYSTEM,
+                prompt=prompts.SUPERVISE_PROMPT.format(brief=clip(brief, 6000), actions="\n".join(actions[-14:])),
+                schema=prompts.SUPERVISE_SCHEMA, effort="low")
+        except Exception as e:
+            log.warning("supervision check failed: %s", e)
+            return None
+        if out.get("on_track", True) is not False:
+            return None
+        task = self.store.get_task(task_id)
+        payload = {"task_id": task_id, "title": task["title"], "part_id": (task.get("route") or {}).get("part_id"),
+                   "issue": out.get("issue", ""), "steer": out.get("steer", "")}
+        await self.emit(task_id, "steer", payload)
+        if task.get("parent_id"):
+            await self.emit(task["parent_id"], "steer", payload)
+        return prompts.STEER_NOTE.format(issue=out.get("issue", "drifting from the brief"),
+                                         steer=out.get("steer", "Return to your brief."))
+
     def _handoff_note(self, task_id: str, messages: list[dict]) -> None:
         """Tell the incoming model who it is and why it's here (as a user-side note; history is append-only)."""
         route = self.store.get_task(task_id).get("route") or {}
@@ -516,7 +571,7 @@ class Conductor:
         if truncated:
             return result("Your tool call was cut off at the output limit. Retry with smaller input "
                           "(e.g. write a large file in parts with append).", True)
-        if tool is None or (ctx.depth > 0 and tool.top_level_only):
+        if tool is None or tool not in self.tool_list(ctx.depth):
             return result(f"Unknown tool '{name}'.", True)
         problem = tool.validate(args)
         if problem:
@@ -554,6 +609,13 @@ class Conductor:
                 out.append(t)
         return out
 
+    def depth_of(self, task_id: str) -> int:
+        depth, task = 0, self.store.get_task(task_id)
+        while task and task.get("parent_id"):
+            depth += 1
+            task = self.store.get_task(task["parent_id"])
+        return depth
+
     async def run_part(self, parent_id: str, part: dict, brief: str) -> dict:
         """Hire the best model for one part, run it, and report back to the conductor."""
         skill, domain = part.get("skill", "other"), part.get("domain", "general")
@@ -570,7 +632,7 @@ class Conductor:
                                                 "title": part["title"], "skill": skill, "domain": domain,
                                                 "model": t["model"], "name": t["route"].get("name"),
                                                 "reason": t["route"].get("reason")})
-            answer = await self.run(child, brief, depth=1, effort=effort)
+            answer = await self.run(child, brief, depth=self.depth_of(child), effort=effort)
         finally:
             t = self.store.get_task(child)
             self.store.finish_run(child, t["status"], t["cost_usd"], time.time() - started)
@@ -587,7 +649,7 @@ class Conductor:
         await self.emit(parent_id, "part", {"action": "revising", "part_id": t["route"].get("part_id"),
                                             "task_id": task_id, "model": t["model"], "notes": clip(notes, 400)})
         answer = await self.run(task_id, f"The conductor reviewed your work and wants changes:\n\n{notes}",
-                                depth=1, effort=self.settings.effort)
+                                depth=self.depth_of(task_id), effort=self.settings.effort)
         t = self.store.get_task(task_id)
         self.store.finish_run(task_id, t["status"], t["cost_usd"] - cost_before, time.time() - started)
         await self.emit(parent_id, "part", {"action": "finished", "part_id": t["route"].get("part_id"),

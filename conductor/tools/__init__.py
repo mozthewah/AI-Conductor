@@ -59,7 +59,8 @@ class Tool:
     required: list[str]
     handler: Handler
     risky: bool = False          # can change things outside the model's head (shell, browser)
-    top_level_only: bool = False  # hidden from specialists (assign, review, schedule...)
+    top_level_only: bool = False  # only for the top-level task
+    delegates: bool = False       # hands work to other models; limited by settings.max_depth
     summarize: Callable[[dict], str] | None = None
     extra: dict = field(default_factory=dict)
 

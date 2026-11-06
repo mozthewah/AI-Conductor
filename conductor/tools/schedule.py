@@ -53,10 +53,10 @@ TOOLS = [
          {"prompt": {"type": "string"},
           "every_minutes": {"type": "integer", "description": "Repeat interval; 1440 = daily, 10080 = weekly"},
           "start_at": {"type": "string", "description": "ISO 8601 local time of first run"}},
-         ["prompt"], schedule_task, top_level_only=True,
+         ["prompt"], schedule_task, 
          summarize=lambda a: "Scheduled a task"),
-    Tool("list_schedules", "List scheduled tasks.", {}, [], list_schedules, top_level_only=True,
+    Tool("list_schedules", "List scheduled tasks.", {}, [], list_schedules, 
          summarize=lambda a: "Checked schedules"),
     Tool("cancel_schedule", "Cancel a scheduled task by id.", {"id": {"type": "string"}}, ["id"],
-         cancel_schedule, top_level_only=True, summarize=lambda a: f"Cancelled {a.get('id')}"),
+         cancel_schedule,  summarize=lambda a: f"Cancelled {a.get('id')}"),
 ]

@@ -150,6 +150,11 @@ async def review(ctx: ToolContext, args: dict) -> str:
             f"Review it again:\n\n{clip(res['answer'], 15_000)}")
 
 
+async def report_blocked(ctx: ToolContext, args: dict) -> str:
+    ctx.conductor._blocked[ctx.task_id] = {"what": args["what"], "needs": args["needs"]}
+    return "Reported to the composer. Stop here; you'll be resumed once it's resolved."
+
+
 async def ask_user(ctx: ToolContext, args: dict) -> str:
     reply = await ctx.conductor.ask_user(ctx.task_id, args["question"], args.get("options") or [])
     if reply is None:
@@ -190,7 +195,8 @@ TOOLS = [
         },
         required=["parts"],
         handler=assign,
-        top_level_only=True,
+        delegates=True,
+        
         summarize=lambda a: f"Assigned {len(a.get('parts', []))} part(s) to specialists",
     ),
     Tool(
@@ -208,8 +214,22 @@ TOOLS = [
         },
         required=["part", "verdict"],
         handler=review,
-        top_level_only=True,
+        delegates=True,
+        
         summarize=lambda a: f"Reviewed {a.get('part')}: {a.get('verdict')}",
+    ),
+    Tool(
+        name="report_blocked",
+        description=(
+            "Tell the composer you can't continue without something only it or the user can give: a "
+            "decision, access, credentials, or missing information. Your run pauses and the composer "
+            "resumes you with an answer. First do everything you can that isn't blocked."
+        ),
+        properties={"what": {"type": "string", "description": "What's blocked and why"},
+                    "needs": {"type": "string", "description": "Exactly what would unblock you"}},
+        required=["what", "needs"],
+        handler=report_blocked,
+        summarize=lambda a: f"Blocked: {a.get('what', '')[:60]}",
     ),
     Tool(
         name="ask_user",
@@ -223,7 +243,7 @@ TOOLS = [
                                 "description": "Optional quick-reply choices"}},
         required=["question"],
         handler=ask_user,
-        top_level_only=True,
+        
         summarize=lambda a: "Asked you a question",
     ),
 ]

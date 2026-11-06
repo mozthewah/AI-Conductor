@@ -86,7 +86,7 @@ async def test_design_then_code_each_by_its_best_model(tmp_path):
     parts = {p["route"]["part_id"]: p for p in c.part_tasks(tid)}
     assert parts["design"]["model"] == GEM.id      # best at design
     assert parts["code"]["model"] == OPUS.id       # best at code
-    order = [cl["model"] for cl in c.llm.calls if "on a team run by Conductor" in cl["system"]]
+    order = [cl["model"] for cl in c.llm.calls if "on a team run by a composer" in cl["system"]]
     assert order == [GEM.id, OPUS.id]              # code waited for the design
     assert c.store.get_run(parts["design"]["id"])["review"] == pytest.approx(0.9)
     assert c.store.get_run(parts["code"]["id"])["mode"] == "part"
@@ -163,8 +163,8 @@ async def test_assign_rejects_bad_plans(tmp_path):
     assert res["is_error"] and "circular" in res["content"]
 
 
-async def test_simple_requests_skip_the_conductor(tmp_path):
-    label = {"skill": "ui_design", "domain": "general", "difficulty": "medium", "needs_vision": False,
+async def test_quick_questions_skip_the_composer(tmp_path):
+    label = {"skill": "ui_design", "domain": "general", "difficulty": "easy", "needs_vision": False,
              "parts": [{"skill": "ui_design", "domain": "general"}], "summary": ""}
     c = make(tmp_path, lambda *a: [text("here's a palette")], label)
     tid = c.start_task("suggest a color palette")
@@ -190,3 +190,6 @@ def test_benchmark_parsing_and_percentiles(tmp_path):
     assert b.prior("a/x", "coding", ["a/x", "a/y"]) > b.prior("a/y", "coding", ["a/x", "a/y"])
     assert b.prior("a/x", "ui_design", ["a/x", "a/y"]) == pytest.approx(1.0)
     assert b.prior("a/z", "coding", ["a/x", "a/y"]) is None
+    # a great coder with no design scores isn't treated as a great designer
+    b.signals = {"design": {"a/x": 1300, "a/y": 1200}, "coding": {"a/c": 90, "a/x": 50, "a/y": 40}}
+    assert b.prior("a/c", "ui_design", ["a/x", "a/y", "a/c"]) < b.prior("a/x", "ui_design", ["a/x", "a/y", "a/c"])

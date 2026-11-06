@@ -257,6 +257,14 @@ main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: c
 .part-fb .fb svg { width: 14px; height: 14px; }
 .card.team { padding-bottom: 4px; }
 .dot.queued { background: var(--line); }
+.dot.blocked { background: var(--warn); }
+.pill.blocked { background: var(--warn-soft); color: var(--warn); }
+.plan-step.blocked .box { border-color: var(--warn); background: var(--warn-soft); }
+.plan-step.blocked { color: var(--warn); }
+.part-steer { font-size: 12.5px; color: var(--warn); margin-top: 2px; }
+.card.steer { border-style: dashed; box-shadow: none; }
+.card.steer .title svg { color: var(--warn); }
+.card.blocked { border-color: var(--warn); background: var(--warn-soft); }
 
 /* ---------- safety ---------- */
 .sev { display: inline-block; font: 600 10.5px var(--sans); text-transform: uppercase; letter-spacing: .05em; border-radius: 5px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }

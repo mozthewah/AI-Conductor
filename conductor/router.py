@@ -124,9 +124,16 @@ def heuristic_label(prompt: str) -> dict:
             "needs_vision": bool(re.search(r"\b(image|photo|screenshot|picture)\b", p)), "summary": "", "by": "rules"}
 
 
-def needs_conductor(label: dict) -> bool:
+def needs_conductor(label: dict, compose: str = "auto") -> bool:
+    """Does this request get a composer (who hands the work to specialists) or one direct model?"""
     kinds = {(p.get("skill"), slug(p.get("domain", ""))) for p in label.get("parts") or []}
-    return len(kinds) > 1 or label.get("difficulty") == "hard"
+    multi = len(kinds) > 1 or label.get("difficulty") == "hard"
+    if compose == "off":
+        return multi
+    if compose == "always":
+        return True
+    quick = label.get("skill") == "chat" or label.get("difficulty") == "easy"
+    return multi or not quick
 
 
 @dataclass
@@ -260,7 +267,7 @@ class Router:
         budget = budget or settings.router_budget
         auto = not pinned or pinned == "auto"
         label = await self.classify(prompt) if auto else heuristic_label(prompt)
-        conduct = needs_conductor(label)
+        conduct = needs_conductor(label, settings.compose)
         if not auto:
             m = self.catalog.get(pinned)
             tin, tout = TOKEN_ESTIMATE[label["difficulty"]]

@@ -132,7 +132,7 @@ async def test_assigned_parts_run_in_parallel(settings):
     kids = c.store.child_tasks(tid)
     assert {k["title"] for k in kids} == {"A", "B"} and all(k["status"] == "done" for k in kids)
     # specialists don't get conductor tools; core parts run at full effort, supporting at sub-agent effort
-    assert "assign" not in llm.calls[1]["tools"]
+    assert "assign" in llm.calls[1]["tools"] and "report_blocked" in llm.calls[1]["tools"]  # same toolbox, one level deeper
     assert sorted(cl["effort"] for cl in llm.calls[1:3]) == ["high", "medium"]
     final_input = llm.calls[3]["messages"][-1]["content"][0]["content"]
     assert "report for do A" in final_input and "report for do B" in final_input

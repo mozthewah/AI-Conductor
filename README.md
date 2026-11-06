@@ -48,11 +48,11 @@ conductor chat "summarize the files in my workspace"
 conductor chat --auto                 # don't ask before shell commands
 ```
 
-## The conductor: the best model for each part
+## The composer: the best model for each part
 
-Conductor doesn't use one model for everything. When a request needs several kinds of work
-(say, *design and build an app*, or *find travel deals and budget the trip*), a **conductor** model
-takes charge:
+Conductor doesn't use one model for everything. For anything beyond a quick question, the lead
+model is a **composer**. It doesn't do the work itself: it plans, hands each piece to the specialist
+model best at it, keeps them on task, and puts the result together.
 
 1. **Splits** the request into parts. Each part gets a skill (`coding`, `ui_design`,
    `architecture`, `research`, `writing`, `analysis`, `planning`, `browsing`) and a domain
@@ -64,7 +64,23 @@ takes charge:
    conversation), or **reassign** it (a different model takes over).
 4. **Integrates** the result and tells you which model did what.
 
-Simple, single-kind requests skip the conductor and go straight to the best model for that work.
+Quick questions (chat or easy one-step work) skip the composer and go straight to the best model.
+`CONDUCTOR_COMPOSE=always` composes everything; `off` composes only obviously multi-part requests.
+
+**Specialists get the same toolbox as the composer,** including handing off sub-parts of their own
+(up to `CONDUCTOR_MAX_DEPTH`, default 2 levels) and asking you questions.
+
+**Keeping specialists on task.** Every few steps (`check_every`, default 4) a cheap model compares
+a specialist's recent actions to its brief. If it's drifting, the specialist gets a steer note
+("you're off-brief: focus on X"). The steer shows in the composer's feed and the Team panel.
+
+**Moving backwards.** The first time a model seems stuck (repeating itself, failing step after
+step), it's told to step back: re-read the brief, question its assumptions, try a different route,
+or set the piece aside and work on something unblocked. Only if it's stuck again does it move up a
+model. A specialist that can't continue without a decision, access, or information calls
+`report_blocked`. The composer then gets what's needed (from you via `ask_user`, from other parts,
+or the workspace) and resumes that specialist where it stopped, while independent parts keep
+going. Plan steps can be marked *blocked* too.
 The **Team** tab shows every part, its model, and its review status, and you can 👍/👎 each part.
 
 ## Models and the router

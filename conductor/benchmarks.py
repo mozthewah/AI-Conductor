@@ -111,21 +111,27 @@ class Benchmarks:
         return self
 
     def prior(self, model_id: str, skill: str, pool: list[str]) -> float | None:
-        """Percentile (0-1) of this model among `pool` for a skill, or None if no data."""
+        """Percentile (0-1) of this model among `pool` for a skill, or None if no data.
+
+        A signal the model has no score for counts as an unknown middle (0.5) rather than being
+        skipped - otherwise a strong coder with no design scores would look like a top designer.
+        """
         weights = SKILL_SIGNALS.get(skill, SKILL_SIGNALS["other"])
-        total, wsum = 0.0, 0.0
+        total, wsum, known = 0.0, 0.0, 0
         for signal, w in weights.items():
             scores = self.signals.get(signal) or {}
-            if model_id not in scores:
-                continue
             ranked = [scores[m] for m in pool if m in scores]
             if len(ranked) < 2:
                 continue
-            below = sum(1 for s in ranked if s < scores[model_id])
-            ties = sum(1 for s in ranked if s == scores[model_id]) - 1
-            total += w * (below + 0.5 * ties) / (len(ranked) - 1)
+            if model_id in scores:
+                below = sum(1 for s in ranked if s < scores[model_id])
+                ties = sum(1 for s in ranked if s == scores[model_id]) - 1
+                total += w * (below + 0.5 * ties) / (len(ranked) - 1)
+                known += 1
+            else:
+                total += w * 0.5
             wsum += w
-        return total / wsum if wsum else None
+        return total / wsum if wsum and known else None
 
     def summary(self, model_id: str) -> dict[str, float]:
         return {sig: round(v[model_id], 1) for sig, v in self.signals.items() if model_id in v}

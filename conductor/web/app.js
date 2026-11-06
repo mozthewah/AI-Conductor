@@ -53,7 +53,7 @@ const TOOL_ICONS = {
   web_search: "search", web_fetch: "globe", browser: "globe", read_file: "file", write_file: "file",
   edit_file: "file", list_files: "file", run_shell: "term", update_plan: "list", remember: "brain",
   recall: "brain", update_memory: "brain", use_skill: "book", save_skill: "book", assign: "users", review: "check",
-  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
+  ask_user: "chat", message_user: "chat", consult_expert: "bulb", escalate: "arrowUp", find_model: "search", report_blocked: "x", schedule_task: "clock", list_schedules: "clock", cancel_schedule: "clock",
 };
 
 async function api(path, opts = {}) {
@@ -88,7 +88,7 @@ const ago = (ts) => {
   return new Date(ts * 1000).toLocaleDateString();
 };
 const STATUS_LABEL = { queued: "Queued", running: "Working", waiting: "Needs you", done: "Done",
-  error: "Error", cancelled: "Stopped" };
+  error: "Error", cancelled: "Stopped", blocked: "Blocked" };
 
 function autosize(ta) {
   const fit = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 260) + "px"; };
@@ -457,6 +457,7 @@ async function showTask(id) {
     if (!a) return { cls: "queued", text: p.depends_on && p.depends_on.length ? `waits for ${p.depends_on.join(", ")}` : "queued" };
     if (a.status === "running") return { cls: "running", text: "working" };
     if (a.status === "done") return { cls: "waiting", text: "awaiting review" };
+    if (a.status === "blocked") return { cls: "blocked", text: "blocked - waiting on the composer" };
     return { cls: a.status, text: STATUS_LABEL[a.status] || a.status };
   };
   function partRow(p, withFeedback) {
@@ -469,7 +470,8 @@ async function showTask(id) {
         h("div", { class: "part-meta" },
           a ? h("a", { "data-nav": `/t/${a.task_id}`, href: `/t/${a.task_id}` }, a.name || shortModel(a.model)) : "not started",
           p.attempts.length > 1 ? ` (after ${p.attempts.slice(0, -1).map((x) => shortModel(x.model)).join(", ")})` : "",
-          ` · ${st.text}`)));
+          ` · ${st.text}`),
+        p.steer ? h("div", { class: "part-steer" }, `↩ ${p.steer}`) : null));
     if (withFeedback && a && a.status !== "running") {
       const fb = (val, ic) => h("button", { class: "fb" + (a.feedback === val ? (val > 0 ? " on" : " on bad") : ""), title: val > 0 ? "Great work on this part" : "Poor work on this part",
         onclick: async (e) => { e.stopPropagation(); const nv = a.feedback === val ? 0 : val;
@@ -693,6 +695,21 @@ async function showTask(id) {
         }
         break;
       }
+      case "steer": {
+        if (d.task_id !== id) {
+          const part = d.part_id && v.parts[d.part_id];
+          if (part) { part.steer = d.steer; renderAgents(); }
+        }
+        addAct(h("div", { class: "card steer" }, h("div", { class: "title" }, icon("route"),
+          d.task_id === id ? "Composer check-in: back on brief" : `Kept “${d.title}” on task`),
+          h("div", { class: "sev-reason" }, `${d.issue} → ${d.steer}`)));
+        break;
+      }
+      case "blocked":
+        addBlock(h("div", { class: "card blocked" }, h("div", { class: "title" }, icon("x"), "Blocked, handed back to the composer"),
+          h("div", { class: "sev-reason" }, `${d.what}. Needs: ${d.needs}`)));
+        setStatus("blocked");
+        break;
       case "approval": {
         const el = addAct(h("span", { class: "auto-approval" + (d.allowed ? "" : " denied") }, icon("shield"),
           h("span", { class: `sev sev-${d.level}` }, d.level), d.allowed ? " Auto-allowed: " : " Declined: ",

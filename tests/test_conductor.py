@@ -12,7 +12,8 @@ from fakes import FakeLLM, progress, text, tool_use
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(data_dir=tmp_path / "data", workspace=tmp_path / "ws", approval="auto", browser=False)
+    return Settings(data_dir=tmp_path / "data", workspace=tmp_path / "ws", approval="auto", browser=False,
+                    fetch_catalog=False)
 
 
 async def run_to_end(c: Conductor, prompt: str) -> str:
@@ -29,7 +30,7 @@ async def test_simple_answer(settings):
     assert task["status"] == "done"
     assert task["answer"] == "Hello there!"
     types = [e["type"] for e in c.store.load_events(tid)]
-    assert types[:3] == ["user", "assistant_text", "done"]
+    assert types[:5] == ["user", "status", "routed", "assistant_text", "done"]
     assert "learned" in types  # reflection ran
     assert c.store.list_memories(kind="episode")
 

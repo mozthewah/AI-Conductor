@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from . import prompts
 from .config import Settings
-from .llm import INTERRUPTED_SENTINEL, LLM, ClaudeLLM, describe_api_error, text_of
+from .llm import INTERRUPTED_SENTINEL, LLM, MessagesLLM, describe_api_error, text_of
+from .models import Catalog
+from .router import Router
 from .skills import SkillLibrary
 from .store import PROFILE_KINDS, Store, new_id
 from .tools import Tool, ToolContext, ToolError, build_registry, clip
@@ -27,20 +30,17 @@ log = logging.getLogger("conductor")
 EPHEMERAL = {"text_delta", "progress_delta", "tool_start", "text_start"}
 
 
-def server_tools() -> list[dict]:
-    return [
-        {"type": "web_search_20260209", "name": "web_search"},
-        {"type": "web_fetch_20260209", "name": "web_fetch"},
-    ]
-
-
 class Conductor:
     def __init__(self, settings: Settings, llm: LLM | None = None, store: Store | None = None):
         settings.ensure_dirs()
         self.settings = settings
         self.store = store or Store(settings.db_path)
         self.skills = SkillLibrary(settings.skills_dir)
-        self.llm: LLM = llm or ClaudeLLM(settings.model, settings.effort, settings.max_tokens)
+        self.catalog = Catalog(settings.data_dir, has_openrouter=bool(settings.openrouter_key),
+                               has_anthropic=settings.anthropic_key, fetch=settings.fetch_catalog).load()
+        self.llm: LLM = llm or MessagesLLM(anthropic_enabled=settings.anthropic_key,
+                                           openrouter_key=settings.openrouter_key, max_tokens=settings.max_tokens)
+        self.router = Router(self)
         self.tools: dict[str, Tool] = {t.name: t for t in build_registry(settings)}
         self.browser_pool = None
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
@@ -87,17 +87,35 @@ class Conductor:
         return [t for t in self.tools.values() if depth == 0 or not t.top_level_only]
 
     def tool_specs(self, depth: int) -> list[dict]:
-        specs = [t.spec() for t in self.tool_list(depth)]
-        if self.settings.web_tools:
-            specs += server_tools()
-        return specs
+        return [t.spec() for t in self.tool_list(depth)]
 
     # ------------------------------------------------------------------ public API
-    def start_task(self, prompt: str, origin: str = "user") -> str:
+    def start_task(self, prompt: str, origin: str = "user", model: str | None = None,
+                   compare_of: str | None = None) -> str:
+        """model: None/"auto" = let the router choose; otherwise a model id to pin."""
         title = prompt.strip().splitlines()[0][:90] if prompt.strip() else "Untitled task"
-        task_id = self.store.create_task(title, origin=origin, system_prompt=self.build_system_prompt(prompt))
-        self._launch(task_id, prompt)
+        task_id = self.store.create_task(title, origin=origin, system_prompt=self.build_system_prompt(prompt),
+                                         compare_of=compare_of)
+        self._launch(task_id, prompt, model or self.settings.model, "compare" if compare_of else None)
         return task_id
+
+    def compare(self, task_id: str, model: str) -> str:
+        """Re-run a task's original request on another model, side by side."""
+        task = self.store.get_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        first = next((e["data"]["text"] for e in self.store.load_events(task_id) if e["type"] == "user"), None)
+        if first is None:
+            raise ValueError("That task has no request to re-run.")
+        root = task.get("compare_of") or task_id
+        return self.start_task(first, origin=task["origin"] if task["origin"] != "subagent" else "user",
+                               model=model, compare_of=root)
+
+    def feedback(self, task_id: str, value: int | None) -> bool:
+        ok = self.store.set_feedback(task_id, value)
+        if ok:
+            self.store.append_event(task_id, "feedback", {"value": value})
+        return ok
 
     def send_message(self, task_id: str, prompt: str) -> None:
         if task_id in self._running:
@@ -121,14 +139,43 @@ class Conductor:
         if t:
             await asyncio.gather(t, return_exceptions=True)
 
-    def _launch(self, task_id: str, prompt: str) -> None:
+    def _launch(self, task_id: str, prompt: str, model: str | None = None, by: str | None = None) -> None:
         self.store.update_task(task_id, status="running")
-        t = asyncio.create_task(self._run_top(task_id, prompt))
+        t = asyncio.create_task(self._run_top(task_id, prompt, model, by))
         self._running[task_id] = t
         t.add_done_callback(lambda _: self._running.pop(task_id, None))
 
-    async def _run_top(self, task_id: str, prompt: str) -> None:
-        answer = await self.run(task_id, prompt, depth=0)
+    async def _route(self, task_id: str, prompt: str, *, pinned: str | None, budget: str,
+                     by: str | None = None) -> None:
+        """Pick this task's model once; it sticks for the life of the task."""
+        if self.store.get_task(task_id).get("model"):
+            return
+        await self.emit(task_id, "status", {"text": "Choosing a model..."})
+        try:
+            decision = await self.router.route(prompt, pinned=pinned, budget=budget)
+        except Exception as e:
+            log.warning("routing failed: %s", e)
+            from .router import Decision
+            decision = Decision(self.settings.fallback_model, "other", "medium", "Router unavailable.", "fallback")
+        if by:
+            decision.by = by
+            decision.reason = "Side-by-side comparison run."
+        info = self.catalog.get(decision.model)
+        route = {**decision.to_dict(), "name": info.name or info.id}
+        self.store.update_task(task_id, model=decision.model, route=route)
+        self.store.start_run(task_id, decision.model, decision.category, decision.difficulty, decision.by)
+        await self.emit(task_id, "routed", route)
+
+    async def _run_top(self, task_id: str, prompt: str, model: str | None = None, by: str | None = None) -> None:
+        started = time.time()
+        cost_before = self.store.get_task(task_id)["cost_usd"]
+        try:
+            answer = await self.run(task_id, prompt, depth=0,
+                                    route={"pinned": model, "budget": self.settings.router_budget, "by": by})
+        finally:
+            t = self.store.get_task(task_id)
+            if t:
+                self.store.finish_run(task_id, t["status"], t["cost_usd"] - cost_before, time.time() - started)
         task = self.store.get_task(task_id)
         if task and task["status"] == "done" and self.settings.learning:
             try:
@@ -139,7 +186,7 @@ class Conductor:
         return answer
 
     # ------------------------------------------------------------------ the loop
-    async def run(self, task_id: str, prompt: str, depth: int = 0) -> str:
+    async def run(self, task_id: str, prompt: str, depth: int = 0, route: dict | None = None) -> str:
         task = self.store.get_task(task_id)
         system = task["system_prompt"]
         effort = self.settings.effort if depth == 0 else self.settings.subagent_effort
@@ -155,6 +202,9 @@ class Conductor:
         self._append(task_id, messages, "user", content)
         self.store.update_task(task_id, status="running")
         await self.emit(task_id, "user", {"text": prompt})
+        if route is not None:
+            await self._route(task_id, prompt, **route)
+        model = self.catalog.get(self.store.get_task(task_id).get("model") or self.settings.fallback_model)
 
         ctx = ToolContext(conductor=self, task_id=task_id, depth=depth)
         specs = self.tool_specs(depth)
@@ -166,12 +216,14 @@ class Conductor:
                 async def on_event(kind: str, data: dict, _turn=turn) -> None:
                     await self.emit(task_id, kind, {**data, "turn": _turn})
 
-                resp = await self.llm.turn(system=system, messages=messages, tools=specs,
-                                           on_event=on_event, effort=effort)
+                resp = await self.llm.turn(model=model, system=system, messages=messages, tools=specs,
+                                           on_event=on_event, effort=effort, web=self.settings.web_tools,
+                                           session_id=task_id)
                 blocks = resp["content"]
                 self._append(task_id, messages, "assistant", blocks)
                 usage = resp.get("usage") or {}
-                self.store.add_usage(task_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+                self.store.add_usage(task_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                                     usage.get("cost", 0.0))
                 await self._emit_blocks(task_id, turn, blocks)
 
                 stop = resp.get("stop_reason")
@@ -275,10 +327,17 @@ class Conductor:
     async def run_subagent(self, parent_id: str, title: str, instructions: str) -> str:
         child = self.store.create_task(title, parent_id=parent_id, origin="subagent",
                                        system_prompt=self.build_system_prompt(instructions, depth=1))
+        started = time.time()
         await self.emit(parent_id, "subagent", {"action": "started", "id": child, "title": title})
-        answer = await self.run(child, instructions, depth=1)
-        status = self.store.get_task(child)["status"]
-        await self.emit(parent_id, "subagent", {"action": "finished", "id": child, "title": title,
+        try:
+            answer = await self.run(child, instructions, depth=1,
+                                    route={"pinned": self.settings.subagent_model,
+                                           "budget": self.settings.subagent_budget})
+        finally:
+            t = self.store.get_task(child)
+            self.store.finish_run(child, t["status"], t["cost_usd"], time.time() - started)
+        status, model = t["status"], t.get("model")
+        await self.emit(parent_id, "subagent", {"action": "finished", "id": child, "title": title, "model": model,
                                                 "status": status, "preview": clip(answer, 400)})
         return answer
 
@@ -358,7 +417,9 @@ class Conductor:
     async def reflect(self, task_id: str) -> dict:
         await self.emit(task_id, "status", {"text": "Reflecting on what to remember..."})
         existing = self.store.list_memories(limit=100)
+        task = self.store.get_task(task_id)
         out = await self.llm.structured(
+            model=self.catalog.get(task.get("model") or self.settings.fallback_model),
             system=prompts.REFLECT_SYSTEM,
             prompt=prompts.REFLECT_PROMPT.format(
                 trace=self._trace(task_id),

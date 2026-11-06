@@ -32,7 +32,7 @@ async def _chat(settings: Settings, first: str | None) -> None:
 
     c = Conductor(settings)
     task_id: str | None = None
-    print(f"{BOLD}AI Conductor{RESET} {DIM}({settings.model}, effort {settings.effort}, "
+    print(f"{BOLD}AI Conductor{RESET} {DIM}({'auto-routing, ' + settings.router_budget + ' budget' if settings.model == 'auto' else settings.model}, effort {settings.effort}, "
           f"approval {settings.approval}) - type /new for a fresh task, /quit to exit{RESET}\n")
     pending = first
     while True:
@@ -92,6 +92,9 @@ async def _chat(settings: Settings, first: str | None) -> None:
                         opts = f" ({' / '.join(d['options'])})" if d.get("options") else ""
                         ans = (await _ainput(f"{YELLOW}  ? {d['question']}{opts}\n  > {RESET}")).strip()
                         c.resolve_request(d["id"], True, ans)
+                elif t == "routed":
+                    print(f"{DIM}  \u21c4 {d.get('name') or d['model']} ({d['category']}, {d['difficulty']}"
+                          f"{', ~$%.3f' % d['est_cost'] if d.get('est_cost') else ''}){RESET}")
                 elif t == "status":
                     print(f"{DIM}  {d['text']}{RESET}")
                 elif t == "learned":

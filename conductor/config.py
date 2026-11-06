@@ -30,7 +30,16 @@ def _flag(name: str, default: bool) -> bool:
 
 @dataclass
 class Settings:
-    model: str = "claude-opus-5-5"
+    # "auto" lets the router pick per task; or pin a model id
+    # ("claude-opus-5-5" direct, or an OpenRouter id like "openai/gpt-6.1-sol").
+    model: str = "auto"
+    subagent_model: str = "auto"
+    router_model: str = ""          # cheap classifier; default picked from available keys
+    router_budget: str = "balanced"  # frugal | balanced | best
+    subagent_budget: str = "frugal"
+    explore: float = 0.1             # chance the router tries a less-proven model
+    anthropic_key: bool = False
+    openrouter_key: str = ""
     effort: str = "high"
     subagent_effort: str = "medium"
     reflection_effort: str = "low"
@@ -42,6 +51,18 @@ class Settings:
     learning: bool = True
     web_tools: bool = True
     browser: bool = True
+    fetch_catalog: bool = True
+
+    @property
+    def default_router_model(self) -> str:
+        if self.router_model:
+            return self.router_model
+        return "anthropic/claude-haiku-5.5" if self.openrouter_key else "claude-haiku-5-5"
+
+    @property
+    def fallback_model(self) -> str:
+        """Used when routing is off or fails."""
+        return "anthropic/claude-opus-5.5" if self.openrouter_key and not self.anthropic_key else "claude-opus-5-5"
 
     @property
     def db_path(self) -> Path:
@@ -61,6 +82,13 @@ class Settings:
         _load_dotenv(Path(".env"))
         s = cls(
             model=os.environ.get("CONDUCTOR_MODEL", cls.model),
+            subagent_model=os.environ.get("CONDUCTOR_SUBAGENT_MODEL", cls.subagent_model),
+            router_model=os.environ.get("CONDUCTOR_ROUTER_MODEL", ""),
+            router_budget=os.environ.get("CONDUCTOR_BUDGET", cls.router_budget).lower(),
+            subagent_budget=os.environ.get("CONDUCTOR_SUBAGENT_BUDGET", cls.subagent_budget).lower(),
+            explore=float(os.environ.get("CONDUCTOR_EXPLORE", cls.explore)),
+            anthropic_key=bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
+            openrouter_key=os.environ.get("OPENROUTER_API_KEY", ""),
             effort=os.environ.get("CONDUCTOR_EFFORT", cls.effort),
             approval=os.environ.get("CONDUCTOR_APPROVAL", cls.approval).lower(),
             data_dir=Path(os.environ.get("CONDUCTOR_DATA_DIR", "data")),

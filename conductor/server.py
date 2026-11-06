@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,6 +21,15 @@ WEB = Path(__file__).parent / "web"
 
 class Prompt(BaseModel):
     prompt: str
+    model: str | None = None  # None/"auto" = router decides
+
+
+class ModelChoice(BaseModel):
+    model: str
+
+
+class Feedback(BaseModel):
+    value: int  # 1, -1, or 0 to clear
 
 
 class Resolve(BaseModel):
@@ -67,10 +75,11 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/api/config")
     def config():
         s = c().settings
-        has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
         return {"model": s.model, "effort": s.effort, "approval": s.approval, "learning": s.learning,
                 "web_tools": s.web_tools, "tools": sorted(c().tools), "workspace": str(s.workspace),
-                "credentials_hint": has_key}
+                "budget": s.router_budget, "router_model": s.default_router_model,
+                "providers": {"anthropic": s.anthropic_key, "openrouter": bool(s.openrouter_key)},
+                "credentials_hint": s.anthropic_key or bool(s.openrouter_key)}
 
     @app.get("/api/tasks")
     def list_tasks():
@@ -83,7 +92,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     async def create_task(body: Prompt):
         if not body.prompt.strip():
             raise HTTPException(400, "Empty prompt")
-        return {"id": c().start_task(body.prompt)}
+        return {"id": c().start_task(body.prompt, model=body.model or None)}
 
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: str):
@@ -92,7 +101,25 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
         t["running"] = c().is_running(task_id)
         t["children"] = c().store.child_tasks(task_id)
         t["pending"] = c().pending_requests(task_id)
+        t["compares"] = c().store.compares(task_id)
+        run = c().store.get_run(task_id)
+        t["feedback"] = run["feedback"] if run else None
         return t
+
+    @app.post("/api/tasks/{task_id}/compare")
+    async def compare(task_id: str, body: ModelChoice):
+        task_or_404(task_id)
+        try:
+            return {"id": c().compare(task_id, body.model)}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/tasks/{task_id}/feedback")
+    def feedback(task_id: str, body: Feedback):
+        task_or_404(task_id)
+        if not c().feedback(task_id, body.value if body.value in (1, -1) else None):
+            raise HTTPException(409, "This task hasn't been routed yet.")
+        return {"ok": True}
 
     @app.delete("/api/tasks/{task_id}")
     async def delete_task(task_id: str):
@@ -151,6 +178,46 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
 
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ---------------------------------------------------------------- models & router
+    @app.get("/api/models")
+    def models():
+        overall = {r["model"]: r for r in c().store.model_stats()}
+        return {
+            "roster": [{**m.to_dict(), "stats": overall.get(m.id)} for m in c().catalog.roster()],
+            "catalog_size": len(c().catalog.models), "catalog_fetched_at": c().catalog.fetched_at,
+        }
+
+    @app.get("/api/models/search")
+    def search_models(q: str = ""):
+        return [m.to_dict() for m in c().catalog.search(q)]
+
+    @app.post("/api/models/roster")
+    def add_model(body: ModelChoice):
+        try:
+            c().catalog.add(body.model)
+        except KeyError:
+            raise HTTPException(404, "Not in the catalog")
+        return {"ok": True}
+
+    @app.delete("/api/models/roster/{model_id:path}")
+    def remove_model(model_id: str):
+        c().catalog.remove(model_id)
+        return {"ok": True}
+
+    @app.post("/api/models/roster/reset")
+    def reset_roster():
+        c().catalog.set_roster(c().catalog.default_roster())
+        return {"ok": True}
+
+    @app.get("/api/leaderboard")
+    def leaderboard():
+        rows = c().store.model_stats()
+        for r in rows:
+            m = c().catalog.get(r["model"])
+            r["name"] = m.name or m.id
+            r["score"] = round(r["reward"] / r["runs"], 3) if r["runs"] else None
+        return rows
 
     # ---------------------------------------------------------------- memory
     @app.get("/api/memories")
@@ -236,7 +303,7 @@ def create_app(conductor: Conductor | None = None, run_scheduler: bool = True) -
     @app.get("/t/{task_id}", response_class=HTMLResponse)
     @app.get("/{page}", response_class=HTMLResponse)
     def index(task_id: str | None = None, page: str | None = None):
-        if page and page not in ("memory", "skills", "schedules", "files"):
+        if page and page not in ("memory", "skills", "schedules", "files", "models"):
             raise HTTPException(404)
         return (WEB / "index.html").read_text()
 

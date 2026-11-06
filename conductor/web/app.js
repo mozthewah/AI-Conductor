@@ -41,6 +41,9 @@ const ICONS = {
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
   sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
   shield: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/>',
+  route: '<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h8a3 3 0 0 0 0-6H8a3 3 0 0 1 0-6h8"/>',
+  up: '<path d="M7 11v9H4v-9zM7 11l4-7c1.5 0 2.5 1 2.2 2.5L12.5 10H18a2 2 0 0 1 2 2.3l-1.2 6A2 2 0 0 1 16.8 20H7"/>',
+  down: '<path d="M7 13V4H4v9zM7 13l4 7c1.5 0 2.5-1 2.2-2.5L12.5 14H18a2 2 0 0 0 2-2.3l-1.2-6A2 2 0 0 0 16.8 4H7"/>',
 };
 const icon = (name) => svg(ICONS[name] || ICONS.sparkle);
 const TOOL_ICONS = {
@@ -91,7 +94,21 @@ function autosize(ta) {
 }
 
 // ------------------------------------------------------------------ app state
-const state = { config: null, tasks: [], es: null, taskId: null };
+const state = { config: null, tasks: [], es: null, taskId: null, roster: null };
+const fmtCost = (c) => c == null ? "" : c < 0.01 ? `$${Number(c).toFixed(4)}` : `$${Number(c).toFixed(2)}`;
+const fmtSecs = (s) => s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+const shortModel = (id) => (id || "").split("/").pop();
+async function getRoster(force) {
+  if (!state.roster || force) { try { state.roster = (await api("/api/models")).roster; } catch { state.roster = []; } }
+  return state.roster;
+}
+function modelSelect(roster, { auto = true, placeholder } = {}) {
+  const sel = h("select", { class: "model-select", title: "Which model runs this task" });
+  if (placeholder) sel.append(h("option", { value: "" }, placeholder));
+  if (auto) sel.append(h("option", { value: "auto" }, "✦ Auto · router picks"));
+  for (const m of roster) sel.append(h("option", { value: m.id }, `${m.name || m.id} · ${fmtCost(m.price_in)}/${fmtCost(m.price_out)}`));
+  return sel;
+}
 const main = $("#main");
 
 function navigate(path) {
@@ -116,6 +133,7 @@ function route() {
   if (p === "/skills") return showSkills();
   if (p === "/schedules") return showSchedules();
   if (p === "/files") return showFiles();
+  if (p === "/models") return showModels();
   return showHome();
 }
 
@@ -132,18 +150,18 @@ async function refreshTasks() {
     list.append(h("div", {
       class: "task-item" + (t.id === state.taskId ? " active" : ""), title: t.title,
       onclick: () => { navigate(`/t/${t.id}`); $("#sidebar").classList.remove("open"); },
-    }, h("i", { class: `dot ${t.status}` }), h("span", {}, t.origin === "schedule" ? "⏰ " + t.title : t.title)));
+    }, h("i", { class: `dot ${t.status}` }), h("span", {}, (t.origin === "schedule" ? "⏰ " : t.compare_of ? "⇄ " : "") + t.title)));
   }
   if (!state.tasks.length) list.append(h("div", { class: "empty" }, "Your tasks will show up here."));
 }
 setInterval(refreshTasks, 4000);
 
 // ------------------------------------------------------------------ composer
-function composer({ placeholder, onSubmit, autofocus, big }) {
+function composer({ placeholder, onSubmit, autofocus, big, extra }) {
   const ta = h("textarea", { rows: big ? 3 : 1, placeholder });
   const btn = h("button", { class: "send", disabled: true, "aria-label": "Send" }, icon("send"));
   const wrap = h("form", { class: "composer" }, ta,
-    h("div", { class: "composer-row" }, h("span", { class: "hint" }, "Enter to send · Shift+Enter for a new line"), btn));
+    h("div", { class: "composer-row" }, h("div", { class: "composer-left" }, extra || null, h("span", { class: "hint" }, "Enter to send · Shift+Enter for a new line")), btn));
   const submit = async () => {
     if (btn.classList.contains("stop")) return wrap.onStop && wrap.onStop();
     const text = ta.value.trim();
@@ -180,19 +198,21 @@ const SUGGESTIONS = [
 ];
 
 async function showHome() {
-  const [mems, skills] = await Promise.all([api("/api/memories").catch(() => []), api("/api/skills").catch(() => [])]);
+  const [mems, skills, roster] = await Promise.all([api("/api/memories").catch(() => []), api("/api/skills").catch(() => []), getRoster(true)]);
+  const picker = modelSelect(roster);
+  picker.value = state.config && state.config.model !== "auto" && roster.some((m) => m.id === state.config.model) ? state.config.model : "auto";
   const page = h("div", { class: "home" });
   if (state.config && !state.config.credentials_hint) {
     page.append(h("div", { class: "banner" },
-      "No ANTHROPIC_API_KEY found in the environment. Put one in .env (or run `ant auth login`) before starting a task."));
+      "No model provider key found. Add OPENROUTER_API_KEY (and/or ANTHROPIC_API_KEY) to .env, then restart."));
   }
   const greet = new Date().getHours();
   page.append(
     h("h1", {}, greet < 12 ? "Good morning. What should we get done?" : greet < 18 ? "What should we get done?" : "Evening. What's on your list?"),
     h("p", { class: "sub" }, "I can research, browse, write, run code, split work across helpers, and I remember what I learn."),
     composer({
-      placeholder: "Describe a task, as big or small as you like…", autofocus: true, big: true,
-      onSubmit: async (text) => { const { id } = await api("/api/tasks", { method: "POST", body: { prompt: text } }); refreshTasks(); navigate(`/t/${id}`); },
+      placeholder: "Describe a task, as big or small as you like…", autofocus: true, big: true, extra: picker,
+      onSubmit: async (text) => { const { id } = await api("/api/tasks", { method: "POST", body: { prompt: text, model: picker.value } }); refreshTasks(); navigate(`/t/${id}`); },
     }),
     h("div", { class: "chips" }, SUGGESTIONS.map((s) => h("button", {
       class: "chip", onclick: () => { const ta = $(".home textarea"); ta.value = s; ta.dispatchEvent(new Event("input")); ta.focus(); },
@@ -200,7 +220,7 @@ async function showHome() {
     h("div", { class: "home-stats" },
       h("div", { class: "stat", "data-nav": "/memory" }, h("b", {}, mems.filter((m) => m.kind !== "episode").length), h("span", {}, "things I remember about you")),
       h("div", { class: "stat", "data-nav": "/skills" }, h("b", {}, skills.length), h("span", {}, "skills I've learned")),
-      h("div", { class: "stat", "data-nav": "/schedules" }, h("b", {}, "⏰"), h("span", {}, "scheduled & recurring tasks")),
+      h("div", { class: "stat", "data-nav": "/models" }, h("b", {}, roster.length), h("span", {}, "models the router can pick from")),
     ),
   );
   main.replaceChildren(page);
@@ -219,6 +239,22 @@ async function showTask(id) {
   };
   const pill = h("span", { class: `pill ${task.status}` }, STATUS_LABEL[task.status] || task.status);
   const title = h("h2", {}, task.title);
+  const modelChip = h("button", { class: "model-chip-btn", hidden: !task.model, title: (task.route && task.route.reason) || "" },
+    icon("route"), h("span", {}, task.route && task.route.name ? task.route.name : shortModel(task.model)));
+  const setModel = (r) => { modelChip.hidden = false; modelChip.lastChild.textContent = r.name || shortModel(r.model); modelChip.title = r.reason || ""; };
+  const roster = await getRoster();
+  const compareSel = modelSelect(roster.filter((m) => m.id !== task.model), { auto: false, placeholder: "⇄ Try another model…" });
+  compareSel.classList.add("compare-select");
+  compareSel.hidden = !!task.parent_id;
+  compareSel.addEventListener("change", async () => {
+    if (!compareSel.value) return;
+    try { const r = await api(`/api/tasks/${id}/compare`, { method: "POST", body: { model: compareSel.value } }); refreshTasks(); navigate(`/t/${r.id}`); }
+    catch (e) { alert(e.message); compareSel.value = ""; }
+  });
+  const compareStrip = h("div", { class: "compare-strip", hidden: (task.compares || []).length < 2 },
+    h("span", { class: "hint" }, "Side by side:"),
+    (task.compares || []).map((c) => h("a", { class: "cmp" + (c.id === id ? " active" : ""), "data-nav": `/t/${c.id}`, href: `/t/${c.id}` },
+      h("i", { class: `dot ${c.status}` }), shortModel(c.model) || "routing…", c.cost_usd ? h("small", {}, fmtCost(c.cost_usd)) : null)));
   const thread = h("div", { class: "thread" });
   const inner = h("div", { class: "thread-inner" });
   thread.append(inner);
@@ -247,14 +283,37 @@ async function showTask(id) {
   });
   comp.onStop = () => api(`/api/tasks/${id}/cancel`, { method: "POST" });
 
-  const head = h("div", { class: "task-head" }, title, pill,
+  const head = h("div", { class: "task-head" }, title, modelChip, pill, compareSel,
     h("button", { class: "icon-btn", title: "Toggle computer panel", onclick: () => computer.classList.toggle("hidden") }, icon("panel")),
     h("button", { class: "icon-btn", title: "Delete task", onclick: async () => {
       if (!confirm("Delete this task and its history?")) return;
       await api(`/api/tasks/${id}`, { method: "DELETE" }); refreshTasks(); navigate("/");
     } }, icon("trash")));
   main.replaceChildren(h("div", { class: "task-view" },
-    h("div", { class: "thread-col" }, head, thread, h("div", { class: "thread-composer" }, comp)), computer));
+    h("div", { class: "thread-col" }, head, compareStrip, thread, h("div", { class: "thread-composer" }, comp)), computer));
+  modelChip.addEventListener("click", () => { const r = inner.querySelector(".route-card"); if (r) { r.classList.add("open"); r.scrollIntoView({ behavior: "smooth", block: "center" }); } });
+
+  let feedback = task.feedback;
+  const feedbackBar = () => {
+    const bar = h("div", { class: "feedback-bar" });
+    const send = async (val) => {
+      try { await api(`/api/tasks/${id}/feedback`, { method: "POST", body: { value: val } }); feedback = val === 0 ? null : val; paint(); }
+      catch (e) { alert(e.message); }
+    };
+    const paint = () => {
+      bar.replaceChildren(
+        h("span", { class: "hint" }, "How did this go?"),
+        h("button", { class: "fb" + (feedback === 1 ? " on" : ""), title: "Good result: the router will favor this model for tasks like this", onclick: () => send(feedback === 1 ? 0 : 1) }, icon("up")),
+        h("button", { class: "fb" + (feedback === -1 ? " on bad" : ""), title: "Poor result: the router will lean elsewhere next time", onclick: () => send(feedback === -1 ? 0 : -1) }, icon("down")),
+        h("span", { class: "hint cost-line" }));
+      api(`/api/tasks/${id}`).then((t) => {
+        const c = bar.querySelector(".cost-line");
+        if (c) c.textContent = `${shortModel(t.model)} · ${fmtCost(t.cost_usd)} · ${((t.input_tokens + t.output_tokens) / 1000).toFixed(1)}k tokens`;
+      }).catch(() => {});
+    };
+    paint();
+    return bar;
+  };
 
   function setStatus(s) {
     v.status = s;
@@ -386,6 +445,7 @@ async function showTask(id) {
     const d = ev.data || {};
     switch (ev.type) {
       case "user":
+        inner.querySelectorAll(".feedback-bar").forEach((b) => b.remove());
         newExchange(d.text);
         if (v.replayed) setStatus("running");
         scroll(true);
@@ -479,7 +539,7 @@ async function showTask(id) {
         }
         if (d.action === "finished") { s.status = d.status; s.preview = d.preview; }
         s.card.replaceChildren(
-          h("div", { class: "title" }, h("i", { class: `dot ${s.status}` }), "Sub-agent · ", s.title),
+          h("div", { class: "title" }, h("i", { class: `dot ${s.status}` }), "Sub-agent · ", s.title, d.model ? h("small", { class: "sub-model" }, shortModel(d.model)) : null),
           h("div", { style: "font-size:13px;color:var(--ink-2)" }, s.preview || "Working on it…"));
         renderAgents();
         if (!v.userPickedTab && v.replayed) showTab("agents");
@@ -519,10 +579,12 @@ async function showTask(id) {
         if (d.skill) bits.push(`learned the skill “${d.skill.name}”`);
         if (d.memories && d.memories.length) bits.push(`remembered ${d.memories.map((m) => `“${m.content}”`).join(", ")}`);
         if (bits.length) addBlock(h("div", { class: "card learned" }, "✦ From this task I ", bits.join(" and "), "."));
+        v.pendingFeedback = !task.parent_id;
         break;
       }
       case "done":
         if (v.replayed) { setStatus("done"); refreshTasks(); }
+        v.pendingFeedback = !task.parent_id;
         break;
       case "error":
         addBlock(h("div", { class: "card", style: "border-color:var(--bad)" }, h("div", { class: "title", style: "color:var(--bad)" }, icon("x"), "Something went wrong"), d.text));
@@ -531,6 +593,21 @@ async function showTask(id) {
       case "cancelled":
         addAct(h("span", { style: "color:var(--ink-3)" }, "Stopped."));
         if (v.replayed) setStatus("cancelled");
+        break;
+      case "routed": {
+        setModel(d);
+        const card = h("div", { class: "route-card" });
+        const cands = (d.candidates || []).map((c) => h("div", { class: "cand" + (c.model === d.model ? " pick" : "") },
+          h("span", {}, shortModel(c.model)), h("small", {}, `quality ${Math.round(c.quality * 100)}% · ~${fmtCost(c.est_cost)} · ${c.runs} runs`)));
+        card.append(
+          h("div", { class: "route-head", onclick: () => card.classList.toggle("open") }, icon("route"),
+            h("span", {}, "Routed to ", h("b", {}, d.name || shortModel(d.model)), ` · ${d.category} · ${d.difficulty}`, d.est_cost ? ` · ~${fmtCost(d.est_cost)}` : "")),
+          h("div", { class: "route-body" }, h("div", {}, d.reason), cands.length ? h("div", { class: "cands" }, cands) : null));
+        addAct(card);
+        break;
+      }
+      case "feedback":
+        feedback = d.value;
         break;
       case "replayed":
         v.replayed = true;
@@ -548,6 +625,12 @@ async function showTask(id) {
       const ev = JSON.parse(m.data);
       if (ev.seq != null) { if (ev.seq <= lastSeq) return; lastSeq = ev.seq; }
       try { handle(ev); } catch (e) { console.error(e, ev); }
+      if (v.pendingFeedback && v.replayed) {
+        v.pendingFeedback = false;
+        inner.querySelectorAll(".feedback-bar").forEach((b) => b.remove());
+        ensureExchange().el.append(feedbackBar());
+        scroll();
+      }
     };
     es.onerror = () => { es.close(); if (state.es === es) setTimeout(connect, 1500); };
   };
@@ -649,11 +732,85 @@ async function showFiles() {
   }
 }
 
+async function showModels() {
+  const rosterEl = h("div");
+  const lbEl = h("div");
+  const results = h("div", { class: "search-results" });
+  const q = h("input", { placeholder: "Search OpenRouter models to add (e.g. “llama”, “mistral”)…" });
+  const loadRoster = async () => {
+    const data = await api("/api/models");
+    state.roster = data.roster;
+    rosterEl.replaceChildren();
+    if (!data.roster.length) rosterEl.append(h("div", { class: "empty" }, "No models available. Add OPENROUTER_API_KEY to .env and restart."));
+    for (const m of data.roster) {
+      const st = m.stats;
+      rosterEl.append(h("div", { class: "list-item" },
+        h("span", { class: `kind tier-${m.tier}` }, m.tier),
+        h("div", { class: "grow" },
+          h("div", { style: "font-weight:600" }, m.name || m.id, h("small", { class: "mono" }, " ", m.id)),
+          h("div", { class: "meta" }, `${fmtCost(m.price_in)} in / ${fmtCost(m.price_out)} out per 1M tokens · ${Math.round(m.context / 1000)}k context`,
+            m.vision ? " · sees images" : "", m.reasoning ? " · reasons" : "", m.provider === "anthropic" ? " · direct" : " · via OpenRouter"),
+          st ? h("div", { class: "meta" }, `${st.runs} task(s) · 👍 ${st.up || 0} 👎 ${st.down || 0} · avg ${fmtCost(st.avg_cost)} · ${fmtSecs(st.avg_seconds || 0)}`) : null),
+        h("button", { class: "icon-btn", title: "Remove from roster", onclick: async () => { await api(`/api/models/roster/${m.id}`, { method: "DELETE" }); loadRoster(); } }, icon("trash"))));
+    }
+  };
+  const loadLb = async () => {
+    const rows = await api("/api/leaderboard");
+    lbEl.replaceChildren();
+    if (!rows.length) { lbEl.append(h("div", { class: "empty" }, "No results yet. Finish a few tasks (and use 👍/👎) and the scoreboard fills in.")); return; }
+    for (const cat of [...new Set(rows.map((r) => r.category))]) {
+      const rs = rows.filter((r) => r.category === cat).sort((a, b) => b.score - a.score);
+      lbEl.append(h("h3", { class: "lb-cat" }, cat), h("div", { class: "md" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["Model", "Score", "Tasks", "👍", "👎", "Errors", "Avg cost", "Avg time"].map((x) => h("th", {}, x)))),
+        h("tbody", {}, rs.map((r) => h("tr", {},
+          h("td", {}, r.name),
+          h("td", {}, h("span", { class: "bar" }, h("i", { style: `width:${Math.round(r.score * 100)}%` })), ` ${Math.round(r.score * 100)}%`),
+          h("td", {}, r.runs), h("td", {}, r.up || 0), h("td", {}, r.down || 0), h("td", {}, r.errors || 0),
+          h("td", {}, fmtCost(r.avg_cost)), h("td", {}, fmtSecs(r.avg_seconds || 0))))))));
+    }
+  };
+  q.addEventListener("input", () => {
+    clearTimeout(q.t);
+    q.t = setTimeout(async () => {
+      results.replaceChildren();
+      if (!q.value.trim()) return;
+      const hits = await api(`/api/models/search?q=${encodeURIComponent(q.value)}`);
+      const have = new Set((state.roster || []).map((m) => m.id));
+      for (const m of hits.slice(0, 12)) {
+        results.append(h("div", { class: "file-row" },
+          h("span", {}, m.name || m.id, h("small", { class: "mono" }, " ", m.id)),
+          h("small", {}, `${fmtCost(m.price_in)}/${fmtCost(m.price_out)}`),
+          have.has(m.id) ? h("small", {}, "added") : h("button", { class: "btn", onclick: async () => {
+            await api("/api/models/roster", { method: "POST", body: { model: m.id } }); await loadRoster(); q.dispatchEvent(new Event("input"));
+          } }, "Add")));
+      }
+      if (!hits.length) results.append(h("div", { class: "empty" }, "No tool-capable models match."));
+    }, 250);
+  });
+  const cfg = state.config || {};
+  page("Models", "The roster the router picks from, and how each model has done on your tasks. Prices refresh from OpenRouter daily.",
+    h("div", { class: "card", style: "margin-bottom:8px" },
+      h("div", { class: "title" }, icon("route"), "How routing works"),
+      h("div", { style: "font-size:14px;color:var(--ink-2)" },
+        `For each new task, ${shortModel(cfg.router_model) || "a small model"} labels it (coding, research, writing… and how hard). ` +
+        `The router then picks the roster model with the best track record on that kind of task for you, weighed against cost (budget: ${cfg.budget || "balanced"}). ` +
+        "Thumbs up/down on results teach it, and about 1 in 10 tasks it tries a less-proven model to keep learning. " +
+        "Use “Try another model” on any task to compare side by side.")),
+    h("h2", { class: "section" }, "Scoreboard"), lbEl,
+    h("h2", { class: "section" }, "Roster"),
+    h("div", { class: "toolbar" }, q, h("button", { class: "btn", onclick: async () => {
+      if (confirm("Reset the roster to the defaults?")) { await api("/api/models/roster/reset", { method: "POST" }); loadRoster(); }
+    } }, "Reset")),
+    results, rosterEl);
+  loadRoster(); loadLb();
+}
+
 // ------------------------------------------------------------------ boot
 (async () => {
   try {
     state.config = await api("/api/config");
-    $("#modelChip").textContent = `${state.config.model} · ${state.config.effort} effort`;
+    $("#modelChip").textContent = state.config.model === "auto"
+      ? `Auto routing · ${state.config.budget} budget` : `${shortModel(state.config.model)} · ${state.config.effort} effort`;
   } catch {}
   refreshTasks();
   route();

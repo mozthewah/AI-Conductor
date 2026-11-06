@@ -69,6 +69,18 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content, kind ON memori
     VALUES ('delete', old.id, old.content, old.kind);
     INSERT INTO memories_fts(rowid, content, kind) VALUES (new.id, new.content, new.kind);
 END;
+CREATE TABLE IF NOT EXISTS runs (           -- one row per task: what the router learns from
+    task_id TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    category TEXT NOT NULL,
+    difficulty TEXT NOT NULL,
+    routed_by TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    feedback INTEGER,                    -- +1 / -1 / NULL
+    cost_usd REAL NOT NULL DEFAULT 0,
+    seconds REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY,
     prompt TEXT NOT NULL,
@@ -102,7 +114,15 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(tasks)")}
+        for name, ddl in [("model", "TEXT"), ("route_json", "TEXT NOT NULL DEFAULT '{}'"),
+                          ("compare_of", "TEXT"), ("cost_usd", "REAL NOT NULL DEFAULT 0")]:
+            if name not in cols:
+                self._db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
 
     # -- helpers ---------------------------------------------------------
     def _exec(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
@@ -121,14 +141,14 @@ class Store:
             return dict(row) if row else None
 
     # -- tasks -----------------------------------------------------------
-    def create_task(self, title: str, *, parent_id: str | None = None,
-                    origin: str = "user", system_prompt: str = "") -> str:
+    def create_task(self, title: str, *, parent_id: str | None = None, origin: str = "user",
+                    system_prompt: str = "", model: str | None = None, compare_of: str | None = None) -> str:
         tid = new_id("t_")
         now = time.time()
         self._exec(
-            "INSERT INTO tasks (id, parent_id, title, status, system_prompt, origin, created_at, updated_at)"
-            " VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
-            (tid, parent_id, title[:200], system_prompt, origin, now, now),
+            "INSERT INTO tasks (id, parent_id, title, status, system_prompt, origin, model, compare_of,"
+            " created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+            (tid, parent_id, title[:200], system_prompt, origin, model, compare_of, now, now),
         )
         return tid
 
@@ -136,12 +156,13 @@ class Store:
         t = self._one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if t:
             t["plan"] = json.loads(t.pop("plan_json"))
+            t["route"] = json.loads(t.pop("route_json") or "{}")
         return t
 
     def list_tasks(self, limit: int = 100, include_children: bool = False) -> list[dict]:
         where = "" if include_children else "WHERE parent_id IS NULL"
         rows = self._all(
-            f"SELECT id, parent_id, title, status, origin, created_at, updated_at FROM tasks {where}"
+            f"SELECT id, parent_id, title, status, origin, model, compare_of, created_at, updated_at FROM tasks {where}"
             " ORDER BY updated_at DESC LIMIT ?", (limit,))
         return rows
 
@@ -152,18 +173,54 @@ class Store:
     def update_task(self, task_id: str, **fields: Any) -> None:
         if "plan" in fields:
             fields["plan_json"] = json.dumps(fields.pop("plan"))
+        if "route" in fields:
+            fields["route_json"] = json.dumps(fields.pop("route"))
         fields["updated_at"] = time.time()
         cols = ", ".join(f"{k} = ?" for k in fields)
         self._exec(f"UPDATE tasks SET {cols} WHERE id = ?", (*fields.values(), task_id))
 
-    def add_usage(self, task_id: str, input_tokens: int, output_tokens: int) -> None:
-        self._exec("UPDATE tasks SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?",
-                   (input_tokens, output_tokens, task_id))
+    def add_usage(self, task_id: str, input_tokens: int, output_tokens: int, cost: float = 0.0) -> None:
+        self._exec("UPDATE tasks SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,"
+                   " cost_usd = cost_usd + ? WHERE id = ?", (input_tokens, output_tokens, cost, task_id))
+
+    def compares(self, task_id: str) -> list[dict]:
+        """All tasks in the same comparison group (original + retries with other models)."""
+        t = self.get_task(task_id)
+        root = (t or {}).get("compare_of") or task_id
+        return self._all("SELECT id, model, status, cost_usd FROM tasks WHERE id = ? OR compare_of = ?"
+                         " ORDER BY created_at", (root, root))
+
+    # -- router learning ---------------------------------------------------
+    def start_run(self, task_id: str, model: str, category: str, difficulty: str, routed_by: str) -> None:
+        self._exec("INSERT OR REPLACE INTO runs (task_id, model, category, difficulty, routed_by, created_at)"
+                   " VALUES (?, ?, ?, ?, ?, ?)", (task_id, model, category, difficulty, routed_by, time.time()))
+
+    def finish_run(self, task_id: str, status: str, cost: float, seconds: float) -> None:
+        self._exec("UPDATE runs SET status = ?, cost_usd = cost_usd + ?, seconds = seconds + ? WHERE task_id = ?",
+                   (status, cost, seconds, task_id))
+
+    def set_feedback(self, task_id: str, value: int | None) -> bool:
+        return self._exec("UPDATE runs SET feedback = ? WHERE task_id = ?", (value, task_id)).rowcount > 0
+
+    def get_run(self, task_id: str) -> dict | None:
+        return self._one("SELECT * FROM runs WHERE task_id = ?", (task_id,))
+
+    _REWARD = ("CASE WHEN feedback > 0 THEN 1.0 WHEN feedback < 0 THEN 0.0 WHEN status = 'done' THEN 0.7"
+               " WHEN status = 'cancelled' THEN 0.4 ELSE 0.0 END")
+
+    def model_stats(self, category: str | None = None) -> list[dict]:
+        where = "WHERE status != 'running'" + (" AND category = ?" if category else "")
+        return self._all(
+            f"SELECT model, {'category, ' if not category else ''}COUNT(*) AS runs, SUM({self._REWARD}) AS reward,"
+            " SUM(feedback > 0) AS up, SUM(feedback < 0) AS down, SUM(status = 'error') AS errors,"
+            " AVG(cost_usd) AS avg_cost, AVG(seconds) AS avg_seconds FROM runs "
+            f"{where} GROUP BY model{', category' if not category else ''} ORDER BY runs DESC",
+            (category,) if category else ())
 
     def delete_task(self, task_id: str) -> None:
         for child in self.child_tasks(task_id):
             self.delete_task(child["id"])
-        for table in ("messages", "events"):
+        for table in ("messages", "events", "runs"):
             self._exec(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
         self._exec("DELETE FROM tasks WHERE id = ?", (task_id,))
 

@@ -91,7 +91,8 @@ async def run_shell(ctx: ToolContext, args: dict) -> str:
         raise ToolError("The user declined this command. Ask them or try a different approach.")
     timeout = min(int(args.get("timeout", 120)), 900)
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    env.pop("ANTHROPIC_API_KEY", None)  # don't hand the key to arbitrary scripts
+    for secret in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY"):
+        env.pop(secret, None)  # don't hand keys to arbitrary scripts
     proc = await asyncio.create_subprocess_exec(
         "bash", "-lc", cmd, cwd=str(ctx.settings.workspace), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,

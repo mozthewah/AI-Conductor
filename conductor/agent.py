@@ -371,6 +371,10 @@ class Conductor:
                         self.credits.mark_out()
                         if byok_only or not await self._switch_to_byok(task_id, str(ce)):
                             await self._pause_for_credits(task_id, ce)
+                    elif ce.kind == "too_big":  # this call costs more than the balance, even with a small reply
+                        need = self._call_cost(model, system, messages, specs)
+                        if not await self._switch_for_budget(task_id, model, need, str(ce)):
+                            await self._pause_for_credits(task_id, ce, need=need)
                     else:  # in-flight budget still full after retries: a short breather, not a pause
                         await self.emit(task_id, "status", {"text": "Waiting for in-flight requests to settle..."})
                         await asyncio.sleep(30)
@@ -809,20 +813,70 @@ class Conductor:
         self._byok_note_pending.add(task_id)
         return True
 
-    async def _pause_for_credits(self, task_id: str, err: CreditError) -> None:
+    def _call_cost(self, model, system: str, messages: list[dict], tools: list[dict], reply: int = 4096) -> float:
+        """Roughly what OpenRouter will want on hand for one call: the whole prompt plus a small reply."""
+        chars = len(system) + len(json.dumps(messages, default=str)) + len(json.dumps(tools, default=str))
+        return model.cost(int(chars / 3.5), reply)
+
+    async def _switch_for_budget(self, task_id: str, model, need: float, reason: str) -> bool:
+        """The current model's call doesn't fit the balance: move to one whose call does (your own keys
+        first), instead of pausing. True if the task can go on."""
+        st = self.credits.status()
+        available = st.get("available")
+        if available is None:
+            return False
+        tokens_in = need / max(model.price_in, 1e-9) * 1e6 if model.price_in else 0
+        task = self.store.get_task(task_id)
+        route = dict(task.get("route") or {})
+        fits = set()
+        for m in self.router.usable_roster():
+            if m.id == model.id or m.provider != "openrouter":
+                continue
+            cost = m.cost(int(tokens_in), 4096)
+            credit_cost = self.account.credit_cost(m.id, cost, m.canonical)
+            if credit_cost < available * 0.8 and m.context >= tokens_in * 1.1:
+                fits.add(m.id)
+        if not fits:
+            return False
+        d = self.router.pick(skill=route.get("skill", "other"), domain=route.get("domain", "general"),
+                             difficulty=route.get("difficulty", "medium"), budget="frugal", only=fits)
+        if d.model not in fits:
+            return False
+        info = self.catalog.get(d.model)
+        why = (f"{model.name or model.id}'s next step needs about ${need:.2f} on hand and only ${available:.2f} is "
+               f"left, so {info.name or info.id} (fits the balance) is taking over instead of pausing.")
+        history = list(route.get("escalations") or [])
+        history.append({"from": model.id, "to": info.id, "reason": why, "by": "credits", "at": time.time(),
+                        "direction": "sideways"})
+        route.update({"escalations": history, "model": info.id, "name": info.name or info.id})
+        self.store.update_task(task_id, model=info.id, route=route)
+        self.store.set_run_model(task_id, info.id)
+        payload = {"task_id": task_id, "from": model.id, "from_name": model.name or model.id, "to": info.id,
+                   "name": info.name or info.id, "reason": why, "by": "credits", "direction": "sideways"}
+        await self.emit(task_id, "escalated", payload)
+        root = self._root(task_id)["id"]
+        if root != task_id:
+            await self.emit(root, "escalated", payload)
+        self._byok_note_pending.add(task_id)  # the incoming model gets a hand-off note before its first step
+        return True
+
+    async def _pause_for_credits(self, task_id: str, err: CreditError, need: float | None = None) -> None:
         """Out of credits: park this task (and show it on the main task) until credits are back."""
         self.credits.mark_out()
         task = self.store.get_task(task_id)
         root = self._root(task_id)
         st = self.credits.status()
+        if need is None and st["available"] is not None:
+            need = st["available"] + 0.25  # OpenRouter says no at this balance: wait for a real top-up
         payload = {"task_id": task_id, "title": task["title"], "reason": str(err), "available": st["available"],
-                   "source": st["source"], "top_up_url": st["top_up_url"], "visible": st["available"] is not None}
+                   "source": st["source"], "top_up_url": st["top_up_url"], "visible": st["available"] is not None,
+                   "need": round(need, 2) if need else None}
         self.store.update_task(task_id, status="paused")
         await self.emit(task_id, "paused", payload)
         if root["id"] != task_id:
             self.store.update_task(root["id"], status="paused")
             await self.emit(root["id"], "paused", payload)
-        how = await self.credits.wait_for_credits(poll=None if st["available"] is not None else 120)
+        how = await self.credits.wait_for_credits(poll=None if st["available"] is not None else 120, need=need)
         self.credits.state["out"] = False
         self.store.update_task(task_id, status="running")
         if root["id"] != task_id:

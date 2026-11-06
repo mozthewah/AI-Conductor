@@ -851,8 +851,8 @@ async function showTask(id) {
           h("div", { class: "title" }, icon("clock"), d.task_id === id ? "Paused: out of credits" : `“${d.title}” paused: out of credits`),
           h("div", { class: "sev-reason" }, `${d.reason} Nothing is lost; it picks up from this exact step.`),
           h("div", { class: "sev-reason" }, d.visible
-            ? "Conductor checks your balance every minute and resumes on its own once credits are back."
-            : "Conductor can't see your balance, so it will quietly retry every couple of minutes (free while you're out)."),
+            ? `It resumes on its own once your balance${d.need ? ` reaches about $${d.need.toFixed(2)}` : " goes up"} (checked now and then, less often the longer it waits), or right away if you press resume.`
+            : "Conductor can't see your balance, so it will quietly retry now and then (free while you're out)."),
           h("div", { class: "row" },
             h("a", { class: "btn primary", href: d.top_up_url, target: "_blank", rel: "noopener" }, "Add credits on OpenRouter"),
             h("button", { class: "btn", onclick: async (e) => {

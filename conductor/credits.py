@@ -63,7 +63,8 @@ def classify_402(status: int, body, headers=None, message: str = "") -> CreditEr
     if (source == "openrouter_in_flight_budget" or reason == "in_flight_budget_exhausted"
             or "in-flight" in text or "in flight" in text):
         return CreditError("in_flight", message, retry_after or 10.0)
-    if reason == "weight_exceeds_budget" or affordable is not None or "fewer max_tokens" in text:
+    if (reason == "weight_exceeds_budget" or affordable is not None or "fewer max_tokens" in text
+            or "lower max_tokens" in text or "maximum cost exceeds" in text or "prompt size" in text):
         return CreditError("too_big", message, affordable=affordable)
     return CreditError("out", message or "Out of credits.")
 
@@ -196,8 +197,11 @@ class CreditMonitor:
         self.state["out"] = False
         self._event().set()
 
-    async def wait_for_credits(self, poll: float | None = None) -> str:
-        """Block until credits look available again (polling) or the user resumes. Returns how it resumed."""
+    async def wait_for_credits(self, poll: float | None = None, need: float | None = None) -> str:
+        """Block until credits look available again (polling) or the user resumes. Returns how it resumed.
+
+        `need` is the balance the paused step actually requires (or the balance at pause time plus a
+        margin): resuming on less would only fail again and loop."""
         ev = self._event()
         ev.clear()
         poll = poll or self.check_every
@@ -210,9 +214,9 @@ class CreditMonitor:
             # Credits rarely come back on their own minutes later; check less and less often
             # (up to every 15 minutes) so a task paused overnight doesn't poll all night.
             poll = min(poll * 1.6, PAUSED_MAX_POLL)
-            st = await self.check(force=True)
+            st = await self.check(max_age=30)  # several paused parts share one look at the balance
             if st["available"] is None:
                 return "probe"  # can't see the balance: retrying the step is free (rejected before any model runs)
-            if st["available"] > max(0.05, self.low_threshold / 4):
+            if st["available"] > max(0.05, self.low_threshold / 4, need or 0.0):
                 self.state["out"] = False
                 return "credits"
